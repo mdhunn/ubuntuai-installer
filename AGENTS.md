@@ -94,7 +94,7 @@ Install copies `usr/` into `PREFIX`. Keep runtime paths working from a source tr
 
 ## Definition of done
 
-- `make test` passes.
+- `make test` passes. That includes `tests/test_installer_ocd.py` and `tests/test_config_ocd.py`.
 - `ubuntuai-validate` was run on the real machine for plumbing changes.
 - GUI changes were opened, not only imported, when a display is available.
 - Docs that name a command still match the CLI.

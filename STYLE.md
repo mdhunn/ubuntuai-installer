@@ -55,7 +55,7 @@ No custom theme. No bundled icon font. One SVG app icon.
 
 ## Tests
 
-`unittest` only. Tests inject fake `lspci` text and temp dirs. They do not run apt. They do not require a display. They do not hard-code a login. `pwd.getpwuid(os.getuid())` is the process user.
+`unittest` only. Tests inject fake `lspci` text and temp dirs. They do not run apt. They do not require a display. They do not hard-code a login. `pwd.getpwuid(os.getuid())` is the process user. Installer catalog and plan contract tests live in `tests/test_installer_ocd.py`. Config app contract tests live in `tests/test_config_ocd.py`.
 
 A hardware test may skip when XDNA is absent. It must not fake a pass.
 
