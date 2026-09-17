@@ -9,10 +9,11 @@ import sys
 from pathlib import Path
 
 from apply import ApplyError, build_plan, execute_plan, format_failure, format_plan
-from catalog import load_workflows, recommended_ids
+from catalog import expand_selection, load_workflows, recommended_ids
 from configstore import add_scan_folder
 from configstore import load as load_config
 from configstore import remove_scan_folder
+from configstore import record_installed
 from configstore import save as save_config
 from configstore import saved_scan_folders
 from probe import probe
@@ -115,6 +116,7 @@ def cmd_plan(user: str, selected: tuple[str, ...], dry_run: bool) -> int:
     except ApplyError as exc:
         print(format_failure(exc), file=sys.stderr)
         return 1
+    record_installed(user, expand_selection(selected, load_workflows(), hw))
     for line in log:
         print(line)
     print()
@@ -151,6 +153,19 @@ def cmd_validate(user: str, as_json: bool) -> int:
 
 def cmd_config_show(user: str) -> int:
     print(json.dumps(load_config(user), indent=2))
+    return 0
+
+
+def cmd_config_explain(user: str) -> int:
+    from runtime import explain_setup
+    from validate import collect, format_health
+
+    hw = probe()
+    t = target_for(user)
+    print(explain_setup(user, t, hw))
+    print()
+    print("Health")
+    print(format_health(collect(t, hw)))
     return 0
 
 
@@ -276,12 +291,34 @@ def cmd_download(user: str, ids: tuple[str, ...], dry_run: bool) -> int:
     return 0
 
 
-def cmd_config_set(user: str, bind: str | None, model_root: str | None) -> int:
+def cmd_config_set(
+    user: str,
+    bind: str | None,
+    model_root: str | None,
+    chat_model: str | None = None,
+    backend: str | None = None,
+    tts: str | None = None,
+    stt: str | None = None,
+    openai_uri: str | None = None,
+    openai_key: str | None = None,
+) -> int:
     updates = {}
     if bind:
         updates["bind"] = bind
     if model_root:
         updates["model_root"] = model_root
+    if chat_model is not None:
+        updates["chat_model"] = "" if chat_model == "auto" else chat_model
+    if backend is not None:
+        updates["primary_backend"] = "" if backend == "auto" else backend
+    if tts is not None:
+        updates["tts_engine"] = "" if tts == "auto" else tts
+    if stt is not None:
+        updates["stt_engine"] = "" if stt == "auto" else stt
+    if openai_uri is not None:
+        updates["openai_base_url"] = openai_uri
+    if openai_key is not None:
+        updates["openai_api_key"] = openai_key
     path = save_config(user, updates)
     print(path)
     return 0
@@ -431,18 +468,52 @@ def validate_main(argv: list[str] | None = None) -> int:
 def config_main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="ubuntuai-config")
     p.add_argument("--user")
-    p.add_argument("--show", action="store_true")
+    p.add_argument("--show", action="store_true", help="print config.json")
+    p.add_argument(
+        "--explain",
+        action="store_true",
+        help="plain-language view of installed apps and health",
+    )
     p.add_argument("--bind", choices=("127.0.0.1", "0.0.0.0"))
     p.add_argument("--model-root")
+    p.add_argument("--chat-model")
+    p.add_argument("--backend")
+    p.add_argument("--tts")
+    p.add_argument("--stt")
+    p.add_argument("--openai-uri")
+    p.add_argument("--openai-key")
     p.add_argument("--cli", action="store_true")
     args = p.parse_args(argv)
     user = guess_user(args.user)
+    if args.explain:
+        return cmd_config_explain(user)
     if args.show:
         return cmd_config_show(user)
-    if args.bind or args.model_root:
-        return cmd_config_set(user, args.bind, args.model_root)
+    if any(
+        (
+            args.bind,
+            args.model_root,
+            args.chat_model,
+            args.backend,
+            args.tts,
+            args.stt,
+            args.openai_uri,
+            args.openai_key,
+        )
+    ):
+        return cmd_config_set(
+            user,
+            args.bind,
+            args.model_root,
+            chat_model=args.chat_model,
+            backend=args.backend,
+            tts=args.tts,
+            stt=args.stt,
+            openai_uri=args.openai_uri,
+            openai_key=args.openai_key,
+        )
     if args.cli or not _gui_available():
-        return cmd_config_show(user)
+        return cmd_config_explain(user)
     return run_gui("config")
 
 

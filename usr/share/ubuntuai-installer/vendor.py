@@ -33,8 +33,9 @@ if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
   echo "ubuntuai-openmoss: no GGUF in $MODELS" >&2
   exit 1
 fi
+HOST="${{UBUNTUAI_BIND:-127.0.0.1}}"
 export LD_LIBRARY_PATH="$DIR${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
-exec "$DIR/moss-tts-server" --model "$MODEL" --host 127.0.0.1 --port {port} --webui-dir "$DIR/webui" "$@"
+exec "$DIR/moss-tts-server" --model "$MODEL" --host "$HOST" --port {port} --webui-dir "$DIR/webui" "$@"
 """
 
 

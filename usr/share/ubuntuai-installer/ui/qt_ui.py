@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -25,9 +26,10 @@ from PyQt6.QtWidgets import (
 )
 
 from apply import ApplyError, build_plan, execute_plan, format_plan
-from catalog import load_workflows, recommended_ids
+from catalog import expand_selection, load_workflows, recommended_ids
 from configstore import add_scan_folder
 from configstore import load as load_config
+from configstore import record_installed
 from configstore import remove_scan_folder
 from configstore import save as save_config
 from configstore import saved_scan_folders
@@ -39,7 +41,13 @@ from repair import (
 )
 from probe import probe
 from users import guess_user, target_for
-from validate import collect, format_checks
+from runtime import (
+    BACKEND_LABELS,
+    app_statuses,
+    backend_choices,
+    chat_models,
+)
+from validate import collect, format_checks, format_health
 from weights import (
     catalog_dest,
     download,
@@ -164,6 +172,7 @@ def _qt_workflows(win, hw, user, workflows, status) -> QWidget:
             return
         try:
             execute_plan(actions, t, hw=hw, dry_run=False)
+            record_installed(user, expand_selection(ids, workflows, hw))
         except ApplyError as exc:
             status.setText(exc.english)
             _show_failure(win, exc.english, exc.technical)
@@ -529,10 +538,32 @@ def _qt_repair(win, user, status) -> QWidget:
     return page
 
 
+def _qcombo(pairs: list[tuple[str, str]], current: str) -> QComboBox:
+    box = QComboBox()
+    ids: list[str] = []
+    for key, label in pairs:
+        box.addItem(label, key)
+        ids.append(key)
+    if current in ids:
+        box.setCurrentIndex(ids.index(current))
+    return box
+
+
+def _combo_value(box: QComboBox | None) -> str:
+    if box is None:
+        return ""
+    value = str(box.currentData() or "")
+    if value == "auto":
+        return ""
+    return value
+
+
 def _config_widget(win: QMainWindow) -> QWidget:
     user = guess_user()
+    t = target_for(user)
     data = load_config(user)
     hw = probe()
+    apps = app_statuses(user, t)
     root = QWidget()
     layout = QVBoxLayout(root)
     title = QLabel("Ubuntu AI Configuration")
@@ -540,57 +571,185 @@ def _config_widget(win: QMainWindow) -> QWidget:
     font.setPointSize(18)
     title.setFont(font)
     layout.addWidget(title)
+    hint = QLabel(
+        "Settings for the apps Ubuntu AI Installer put on this computer. "
+        "Overview is the short path. Advanced has paths and API fields."
+    )
+    hint.setWordWrap(True)
+    layout.addWidget(hint)
     layout.addWidget(_banner(hw))
-    row = QHBoxLayout()
-    row.addWidget(QLabel("Model root"))
-    root_entry = QLineEdit(str(data.get("model_root") or ""))
-    row.addWidget(root_entry, 1)
-    layout.addLayout(row)
-    bind_row = QHBoxLayout()
-    local = QRadioButton("127.0.0.1")
-    lan = QRadioButton("0.0.0.0 (LAN)")
-    group = QButtonGroup(root)
-    group.addButton(local)
-    group.addButton(lan)
-    if data.get("bind") == "0.0.0.0":
-        lan.setChecked(True)
+    tabs = QTabWidget()
+
+    overview = QWidget()
+    ov = QVBoxLayout(overview)
+    installed = [a for a in apps if a.present]
+    missing = [a for a in apps if not a.present]
+    ov.addWidget(QLabel("Installed"))
+    if installed:
+        for app in installed:
+            line = app.title
+            if app.endpoint:
+                line += f"\n{app.endpoint}"
+            lab = QLabel(line)
+            lab.setWordWrap(True)
+            ov.addWidget(lab)
     else:
-        local.setChecked(True)
-    bind_row.addWidget(QLabel("Bind"))
-    bind_row.addWidget(local)
-    bind_row.addWidget(lan)
-    bind_row.addStretch(1)
-    layout.addLayout(bind_row)
-    layout.addWidget(
+        ov.addWidget(QLabel("Nothing from the installer is on this computer yet."))
+    if missing:
+        miss = QLabel(
+            "Not installed. Open Ubuntu AI Installer to add: "
+            + ", ".join(a.title for a in missing)
+            + "."
+        )
+        miss.setWordWrap(True)
+        ov.addWidget(miss)
+    ov.addWidget(QLabel("Who can connect"))
+    this_pc = QRadioButton("This computer only")
+    network = QRadioButton("Also on my home network")
+    group = QButtonGroup(overview)
+    group.addButton(this_pc)
+    group.addButton(network)
+    if data.get("bind") == "0.0.0.0":
+        network.setChecked(True)
+    else:
+        this_pc.setChecked(True)
+    ov.addWidget(this_pc)
+    ov.addWidget(network)
+    warn = QLabel(
+        "Home network lets other devices on your LAN reach local models. "
+        "Leave this computer only unless you mean it."
+    )
+    warn.setWordWrap(True)
+    ov.addWidget(warn)
+    health_view = QLabel("")
+    health_view.setWordWrap(True)
+    ov.addWidget(health_view, 1)
+    tabs.addTab(overview, "Overview")
+
+    settings = QWidget()
+    st = QVBoxLayout(settings)
+    models = chat_models(t.model_root)
+    chat_combo = _qcombo(
+        [("auto", "Choose for me")] + [(n, n) for n in models],
+        str(data.get("chat_model") or "auto"),
+    )
+    st.addWidget(QLabel("Chat model"))
+    st.addWidget(chat_combo)
+    if not models:
+        none = QLabel(
+            "No GGUF chat files in the model folder yet. Use the installer Weights tab."
+        )
+        none.setWordWrap(True)
+        st.addWidget(none)
+    tts_combo = None
+    stt_combo = None
+    tts_apps = [a for a in installed if a.role == "tts"]
+    stt_apps = [a for a in installed if a.role == "stt"]
+    if tts_apps:
+        st.addWidget(QLabel("Speech out (TTS)"))
+        tts_combo = _qcombo(
+            [("auto", "Choose for me")] + [(a.id, a.title) for a in tts_apps],
+            str(data.get("tts_engine") or "auto"),
+        )
+        st.addWidget(tts_combo)
+    if stt_apps:
+        st.addWidget(QLabel("Speech in (STT)"))
+        stt_combo = _qcombo(
+            [("auto", "Choose for me")] + [(a.id, a.title) for a in stt_apps],
+            str(data.get("stt_engine") or "auto"),
+        )
+        st.addWidget(stt_combo)
+    st.addWidget(QLabel("GPU mode"))
+    backend_combo = _qcombo(
+        [(b, BACKEND_LABELS.get(b, b)) for b in backend_choices(hw)],
+        str(data.get("primary_backend") or "auto"),
+    )
+    st.addWidget(backend_combo)
+    st.addStretch(1)
+    tabs.addTab(settings, "Settings")
+
+    advanced = QWidget()
+    adv = QVBoxLayout(advanced)
+    adv.addWidget(QLabel("Model folder"))
+    root_entry = QLineEdit(str(data.get("model_root") or t.model_root))
+    adv.addWidget(root_entry)
+    adv.addWidget(
         QLabel(
-            "LAN bind exposes local models on the network. Leave localhost unless you mean it."
+            f"Technical bind is 127.0.0.1 or 0.0.0.0. Current: {data.get('bind') or t.bind}."
         )
     )
+    adv.addWidget(QLabel("OpenAI-compatible URI"))
+    uri_entry = QLineEdit(str(data.get("openai_base_url") or ""))
+    uri_entry.setPlaceholderText("http://127.0.0.1:8080/v1")
+    adv.addWidget(uri_entry)
+    adv.addWidget(QLabel("API key"))
+    key_entry = QLineEdit(str(data.get("openai_api_key") or ""))
+    key_entry.setEchoMode(QLineEdit.EchoMode.Password)
+    key_entry.setPlaceholderText("API key if the URI needs one")
+    adv.addWidget(key_entry)
+    folders = saved_scan_folders(user)
+    adv.addWidget(QLabel("Extra scan folders"))
+    if folders:
+        for folder in folders:
+            adv.addWidget(QLabel(str(folder)))
+    else:
+        adv.addWidget(QLabel("None. Add folders in the installer Weights tab."))
+    raw_view = QLabel("")
+    raw_view.setWordWrap(True)
+    adv.addWidget(raw_view, 1)
+    tabs.addTab(advanced, "Advanced")
+    layout.addWidget(tabs, 1)
+
     status = QLabel("")
     status.setWordWrap(True)
-    layout.addWidget(status, 1)
+    layout.addWidget(status)
     btns = QHBoxLayout()
     exit_btn = QPushButton("Exit")
     save_btn = QPushButton("Save")
-    val_btn = QPushButton("Validate")
+    val_btn = QPushButton("Check health")
     btns.addWidget(exit_btn)
     btns.addStretch(1)
     btns.addWidget(save_btn)
     btns.addWidget(val_btn)
     layout.addLayout(btns)
 
+    def refresh_health() -> None:
+        checks = collect(target_for(user), hw)
+        health_view.setText(format_health(checks))
+        raw_view.setText(format_checks(checks))
+
     def do_save() -> None:
-        bind = "0.0.0.0" if lan.isChecked() else "127.0.0.1"
-        path = save_config(
-            user, {"bind": bind, "model_root": root_entry.text().strip()}
-        )
+        bind = "0.0.0.0" if network.isChecked() else "127.0.0.1"
+        uri = uri_entry.text().strip()
+        if not uri and any(a.id == "ubuntuai-chat" and a.present for a in apps):
+            host = "127.0.0.1" if bind != "0.0.0.0" else bind
+            uri = f"http://{host}:8080/v1"
+        try:
+            path = save_config(
+                user,
+                {
+                    "bind": bind,
+                    "model_root": root_entry.text().strip(),
+                    "chat_model": _combo_value(chat_combo),
+                    "primary_backend": _combo_value(backend_combo),
+                    "tts_engine": _combo_value(tts_combo),
+                    "stt_engine": _combo_value(stt_combo),
+                    "openai_base_url": uri,
+                    "openai_api_key": key_entry.text().strip(),
+                },
+            )
+        except ValueError as exc:
+            _show_failure(win, str(exc), "")
+            status.setText(str(exc))
+            return
         status.setText(f"Saved {path}")
 
     def do_validate() -> None:
-        status.setText(format_checks(collect(target_for(user), hw)))
+        refresh_health()
+        status.setText("Health updated.")
 
     exit_btn.clicked.connect(win.close)
     save_btn.clicked.connect(do_save)
     val_btn.clicked.connect(do_validate)
-    do_validate()
+    refresh_health()
     return root

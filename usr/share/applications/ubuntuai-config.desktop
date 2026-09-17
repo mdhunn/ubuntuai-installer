@@ -1,6 +1,6 @@
 [Desktop Entry]
 Name=Ubuntu AI Configuration
-Comment=Tune local-AI backend, model root, and bind address
+Comment=Tune installed local-AI apps, listen address, models, and health
 Exec=ubuntuai-config
 Icon=ubuntuai-installer
 Terminal=false

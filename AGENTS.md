@@ -31,6 +31,7 @@ ubuntuai-installer --repair --repair-advisor openai --openai-uri https://api.ope
 ubuntuai-installer --repair-approve
 ubuntuai-installer --list-downloads
 ubuntuai-validate
+ubuntuai-config --explain
 ubuntuai-config --show
 ```
 
@@ -46,6 +47,7 @@ GUI needs a session bus and a display. CLI must remain complete without either.
 | `usr/share/ubuntuai-installer/vendor.py` | Download, extract, wrap vendor binaries into `~/.local`. |
 | `usr/share/ubuntuai-installer/weights.py` | Scan, classify, symlink/copy/move, download, ensure required weights. |
 | `usr/share/ubuntuai-installer/repair.py` | Diagnose, plan, human-approved repair of config, vendors, and checksums. |
+| `usr/share/ubuntuai-installer/runtime.py` | Which installer workflows are present and how to reach them. |
 | `usr/share/ubuntuai-installer/probe.py` | Hardware report. |
 | `usr/share/ubuntuai-installer/apply.py` | Plan and privileged apply. Idempotent. |
 | `usr/share/ubuntuai-installer/validate.py` | Real checks against devices, groups, firmware, binaries. |
@@ -75,6 +77,7 @@ Install copies `usr/` into `PREFIX`. Keep runtime paths working from a source tr
 16. Repair plans are shown as plain English plus a numbered list. `repair-plan.json` is an implementation file. It is not the user interface.
 17. The OpenAI repair path takes a URI and an API key. Both can come from the GUI, `--openai-uri` / `--openai-key`, config, or `OPENAI_BASE_URL` / `OPENAI_API_KEY`.
 18. Apply failures show a plain-English reason first. Technical logs (helper command, exit code, apt text) are behind a details expander in the GUI and after a "Technical details" heading on the CLI. Capture helper stdout and stderr. Do not stop at `failed with 1`.
+19. `ubuntuai-config` only tunes apps the installer actually put on the machine (recorded Apply plus live binaries). Overview is sentences. Settings are chat model, speech, and GPU. Advanced is paths, URI, key, and raw checks. `--explain` is the CLI for new users. `--show` is JSON.
 
 ## How to change a workflow
 

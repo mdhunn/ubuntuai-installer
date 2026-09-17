@@ -16,7 +16,7 @@ It is additive. Kubuntu stays Kubuntu. GNOME stays GNOME. The user does not need
 
 1. **Core.** Drivers, groups, memlock, udev-visible device nodes, shared model store, `ubuntuai-validate`.
 2. **Workflows.** Chat, coding, image, video, speech, RAG, serve, train, hybrid. Checkboxes.
-3. **Config.** Backend, context versus RAM, quant, bind address, power. The JACK buffer-size analog.
+3. **Config.** Companion to the installer, not a second catalog. It lists the workflows Apply recorded and the binaries that are on PATH. New users get Overview (what is installed, who can connect, health). Settings pick chat model, speech engines, and GPU mode from what exists. Advanced has model folder, OpenAI URI and key, scan folders, and raw checks. Bind still defaults to this computer only.
 4. **Catalog.** Names and sizes of models live in `weights.json`. The blobs are opt-in downloads or files already on disk.
 
 If core is wrong, every app is a paperweight.

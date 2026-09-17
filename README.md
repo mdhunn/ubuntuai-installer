@@ -51,7 +51,7 @@ ubuntuai-validate
 | Command | Role |
 |---|---|
 | `ubuntuai-installer` | Checklist GUI, or `--install` on the CLI |
-| `ubuntuai-config` | Bind address, model root, backend |
+| `ubuntuai-config` | Installed apps, listen address, chat model, speech, GPU, health |
 | `ubuntuai-validate` | Devices, groups, firmware, binaries |
 
 ## Layout of a checkout

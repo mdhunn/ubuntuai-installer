@@ -25,6 +25,9 @@ def load(user: str) -> dict:
         "openai_base_url": "",
         "openai_api_key": "",
         "repair_advisor": "classical",
+        "installed_workflows": [],
+        "tts_engine": "",
+        "stt_engine": "",
     }
     if path.is_file():
         try:
@@ -43,6 +46,16 @@ def save(user: str, updates: dict) -> Path:
     data.update(updates)
     if data.get("bind") not in {"127.0.0.1", "0.0.0.0"}:
         raise ValueError("bind must be 127.0.0.1 or 0.0.0.0")
+    raw_root = str(data.get("model_root") or "").strip()
+    if raw_root:
+        root = Path(raw_root).expanduser()
+        if not root.is_absolute():
+            root = t.home / root
+        try:
+            root.resolve(strict=False).relative_to(t.home.resolve())
+        except ValueError as exc:
+            raise ValueError("model root must stay under the home directory") from exc
+        data["model_root"] = str(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     try:
@@ -95,3 +108,11 @@ def remove_scan_folder(user: str, raw: str | Path) -> None:
     folder = normalize_scan_folder(raw, target_for(user).home)
     kept = tuple(p for p in saved_scan_folders(user) if p != folder)
     set_scan_folders(user, kept)
+
+
+def record_installed(user: str, ids: tuple[str, ...]) -> None:
+    have = list(load(user).get("installed_workflows") or [])
+    for wid in ids:
+        if wid and wid not in have:
+            have.append(wid)
+    save(user, {"installed_workflows": have})

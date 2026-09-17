@@ -74,26 +74,45 @@ def extra_model_paths(home: Path, model_root: Path) -> tuple[Path, ...]:
     return tuple(extras)
 
 
-def load_saved_bind(home: Path) -> str:
+def _saved_cfg(home: Path) -> dict:
     cfg = user_config_path(home)
     if not cfg.is_file():
-        return "127.0.0.1"
+        return {}
     try:
-        import json
-
         data = json.loads(cfg.read_text(encoding="utf-8"))
-        bind = data.get("bind") or "127.0.0.1"
-        if bind in {"127.0.0.1", "0.0.0.0"}:
-            return bind
     except (OSError, json.JSONDecodeError):
-        return "127.0.0.1"
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_saved_bind(home: Path) -> str:
+    bind = _saved_cfg(home).get("bind") or "127.0.0.1"
+    if bind in {"127.0.0.1", "0.0.0.0"}:
+        return bind
     return "127.0.0.1"
+
+
+def load_saved_model_root(home: Path) -> Path | None:
+    raw = str(_saved_cfg(home).get("model_root") or "").strip()
+    if not raw:
+        return None
+    root = Path(raw).expanduser()
+    if not root.is_absolute():
+        root = home / root
+    try:
+        root.resolve(strict=False).relative_to(home.resolve())
+    except ValueError:
+        return None
+    return root
 
 
 def target_for(user: str, model_root: Path | None = None) -> UserTarget:
     pw = _pw(user)
     home = Path(pw.pw_dir)
-    root = Path(model_root) if model_root else default_model_root(home)
+    if model_root is not None:
+        root = Path(model_root)
+    else:
+        root = load_saved_model_root(home) or default_model_root(home)
     return UserTarget(
         name=pw.pw_name,
         uid=pw.pw_uid,

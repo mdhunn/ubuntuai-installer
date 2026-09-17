@@ -208,5 +208,26 @@ def format_checks(checks: tuple[Check, ...]) -> str:
     return "\n".join(lines)
 
 
+def format_health(checks: tuple[Check, ...]) -> str:
+    fails = [c for c in checks if c.status == "fail"]
+    warns = [c for c in checks if c.status == "warn"]
+    if not fails and not warns:
+        return "This computer looks ready for local AI."
+    lines: list[str] = []
+    if fails:
+        lines.append("These need a fix:")
+        for c in fails:
+            lines.append(f"- {c.detail}")
+    if warns:
+        if lines:
+            lines.append("")
+        lines.append("These are worth a look:")
+        for c in warns:
+            lines.append(f"- {c.detail}")
+    lines.append("")
+    lines.append("Open Ubuntu AI Installer and use Repair if you want a plan.")
+    return "\n".join(lines)
+
+
 def run_for_user(user: str, model_root: Path | None = None) -> tuple[Check, ...]:
     return collect(target_for(user, model_root))

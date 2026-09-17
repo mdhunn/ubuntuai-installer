@@ -11,9 +11,10 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from apply import ApplyError, build_plan, execute_plan, format_plan
-from catalog import load_workflows, recommended_ids
+from catalog import expand_selection, load_workflows, recommended_ids
 from configstore import add_scan_folder
 from configstore import load as load_config
+from configstore import record_installed
 from configstore import remove_scan_folder
 from configstore import save as save_config
 from configstore import saved_scan_folders
@@ -25,7 +26,13 @@ from repair import (
 )
 from probe import probe
 from users import guess_user, target_for
-from validate import collect, format_checks, worst
+from runtime import (
+    BACKEND_LABELS,
+    app_statuses,
+    backend_choices,
+    chat_models,
+)
+from validate import collect, format_checks, format_health, worst
 from weights import (
     catalog_dest,
     download,
@@ -230,6 +237,7 @@ def _workflows_page(win, hw, user, workflows, checks, status) -> Gtk.Widget:
                 GLib.idle_add(status.set_text, f"Apply failed. {exc}")
                 GLib.idle_add(_show_failure, win, "Apply failed.", str(exc))
                 return
+            record_installed(user, expand_selection(selected_ids(), workflows, hw))
             report = collect(t, hw)
             extra = ""
             if any(c.name.startswith("group:") for c in report):
@@ -686,10 +694,25 @@ def _repair_page(win, user, status) -> Gtk.Widget:
     return page
 
 
+def _combo(pairs: list[tuple[str, str]], current: str) -> Gtk.ComboBoxText:
+    box = Gtk.ComboBoxText()
+    ids = []
+    for key, label in pairs:
+        box.append(key, label)
+        ids.append(key)
+    if current in ids:
+        box.set_active_id(current)
+    elif ids:
+        box.set_active_id(ids[0])
+    return box
+
+
 def _config_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
     user = guess_user()
+    t = target_for(user)
     data = load_config(user)
     hw = probe()
+    apps = app_statuses(user, t)
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
     outer.set_margin_top(16)
     outer.set_margin_bottom(16)
@@ -698,62 +721,230 @@ def _config_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
     header = Gtk.Label(label="Ubuntu AI Configuration", xalign=0)
     header.add_css_class("title-1")
     outer.append(header)
+    hint = Gtk.Label(
+        label=(
+            "Settings for the apps Ubuntu AI Installer put on this computer. "
+            "Overview is the short path. Advanced has paths and API fields."
+        ),
+        xalign=0,
+        wrap=True,
+    )
+    hint.add_css_class("dim-label")
+    outer.append(hint)
     outer.append(_banner(hw))
 
-    root_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-    root_row.append(Gtk.Label(label="Model root", xalign=0))
-    root_entry = Gtk.Entry(text=str(data.get("model_root") or ""), hexpand=True)
-    root_row.append(root_entry)
-    outer.append(root_row)
+    stack = Adw.ViewStack()
+    switcher = Adw.ViewSwitcher()
+    switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
+    switcher.set_stack(stack)
+    outer.append(switcher)
 
-    bind_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-    bind_row.append(Gtk.Label(label="Bind", xalign=0))
-    local = Gtk.CheckButton(label="127.0.0.1")
-    lan = Gtk.CheckButton(label="0.0.0.0 (LAN)", group=local)
-    if data.get("bind") == "0.0.0.0":
-        lan.set_active(True)
+    overview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    installed = [a for a in apps if a.present]
+    missing = [a for a in apps if not a.present]
+    inst_label = Gtk.Label(label="Installed", xalign=0)
+    inst_label.add_css_class("heading")
+    overview.append(inst_label)
+    if installed:
+        for app in installed:
+            line = app.title
+            if app.endpoint:
+                line += f"\n{app.endpoint}"
+            overview.append(Gtk.Label(label=line, xalign=0, wrap=True))
     else:
-        local.set_active(True)
-    bind_row.append(local)
-    bind_row.append(lan)
-    outer.append(bind_row)
+        overview.append(
+            Gtk.Label(
+                label="Nothing from the installer is on this computer yet.",
+                xalign=0,
+                wrap=True,
+            )
+        )
+    if missing:
+        miss = Gtk.Label(
+            label="Not installed. Open Ubuntu AI Installer to add: "
+            + ", ".join(a.title for a in missing)
+            + ".",
+            xalign=0,
+            wrap=True,
+        )
+        miss.add_css_class("dim-label")
+        overview.append(miss)
+
+    listen_head = Gtk.Label(label="Who can connect", xalign=0)
+    listen_head.add_css_class("heading")
+    overview.append(listen_head)
+    this_pc = Gtk.CheckButton(label="This computer only")
+    network = Gtk.CheckButton(label="Also on my home network", group=this_pc)
+    if data.get("bind") == "0.0.0.0":
+        network.set_active(True)
+    else:
+        this_pc.set_active(True)
+    overview.append(this_pc)
+    overview.append(network)
     warn = Gtk.Label(
-        label="LAN bind exposes local models on the network. Leave localhost unless you mean it.",
+        label="Home network lets other devices on your LAN reach local models. Leave this computer only unless you mean it.",
         xalign=0,
         wrap=True,
     )
     warn.add_css_class("dim-label")
-    outer.append(warn)
+    overview.append(warn)
+    health_view = Gtk.Label(label="", xalign=0, wrap=True)
+    overview.append(health_view)
+    stack.add_titled(_scroller(overview), "overview", "Overview")
 
-    status = Gtk.Label(label="", xalign=0, wrap=True, vexpand=True)
+    settings = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    models = chat_models(t.model_root)
+    chat_pairs = [("auto", "Choose for me")] + [(n, n) for n in models]
+    settings.append(Gtk.Label(label="Chat model", xalign=0))
+    chat_combo = _combo(chat_pairs, str(data.get("chat_model") or "auto"))
+    settings.append(chat_combo)
+    if not models:
+        none = Gtk.Label(
+            label="No GGUF chat files in the model folder yet. Use the installer Weights tab.",
+            xalign=0,
+            wrap=True,
+        )
+        none.add_css_class("dim-label")
+        settings.append(none)
+
+    tts_apps = [a for a in installed if a.role == "tts"]
+    stt_apps = [a for a in installed if a.role == "stt"]
+    tts_combo = None
+    stt_combo = None
+    if tts_apps:
+        settings.append(Gtk.Label(label="Speech out (TTS)", xalign=0))
+        tts_combo = _combo(
+            [("auto", "Choose for me")] + [(a.id, a.title) for a in tts_apps],
+            str(data.get("tts_engine") or "auto"),
+        )
+        settings.append(tts_combo)
+    if stt_apps:
+        settings.append(Gtk.Label(label="Speech in (STT)", xalign=0))
+        stt_combo = _combo(
+            [("auto", "Choose for me")] + [(a.id, a.title) for a in stt_apps],
+            str(data.get("stt_engine") or "auto"),
+        )
+        settings.append(stt_combo)
+
+    settings.append(Gtk.Label(label="GPU mode", xalign=0))
+    backend_combo = _combo(
+        [(b, BACKEND_LABELS.get(b, b)) for b in backend_choices(hw)],
+        str(data.get("primary_backend") or "auto"),
+    )
+    settings.append(backend_combo)
+    stack.add_titled(_scroller(settings), "settings", "Settings")
+
+    advanced = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    advanced.append(Gtk.Label(label="Model folder", xalign=0))
+    root_entry = Gtk.Entry(text=str(data.get("model_root") or t.model_root), hexpand=True)
+    advanced.append(root_entry)
+    advanced.append(
+        Gtk.Label(
+            label=f"Technical bind is 127.0.0.1 or 0.0.0.0. Current: {data.get('bind') or t.bind}.",
+            xalign=0,
+            wrap=True,
+        )
+    )
+    advanced.append(Gtk.Label(label="OpenAI-compatible URI", xalign=0))
+    uri_entry = Gtk.Entry(
+        text=str(data.get("openai_base_url") or ""),
+        hexpand=True,
+        placeholder_text="http://127.0.0.1:8080/v1",
+    )
+    advanced.append(uri_entry)
+    advanced.append(Gtk.Label(label="API key", xalign=0))
+    key_entry = Gtk.Entry(
+        text=str(data.get("openai_api_key") or ""),
+        hexpand=True,
+        placeholder_text="API key if the URI needs one",
+    )
+    key_entry.set_visibility(False)
+    advanced.append(key_entry)
+    coding = next((a for a in apps if a.id == "ubuntuai-coding" and a.present), None)
+    if coding:
+        advanced.append(
+            Gtk.Label(
+                label="Coding apps should use the Chat URI above.",
+                xalign=0,
+                wrap=True,
+            )
+        )
+    folders = saved_scan_folders(user)
+    advanced.append(Gtk.Label(label="Extra scan folders", xalign=0))
+    if folders:
+        for folder in folders:
+            advanced.append(Gtk.Label(label=str(folder), xalign=0))
+    else:
+        advanced.append(
+            Gtk.Label(
+                label="None. Add folders in the installer Weights tab.",
+                xalign=0,
+                wrap=True,
+            )
+        )
+    raw_view = Gtk.Label(label="", xalign=0, wrap=True)
+    advanced.append(raw_view)
+    stack.add_titled(_scroller(advanced), "advanced", "Advanced")
+
+    status = Gtk.Label(label="", xalign=0, wrap=True)
+    outer.append(stack)
     outer.append(status)
-
     buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     exit_btn = Gtk.Button(label="Exit")
     save_btn = Gtk.Button(label="Save")
-    val_btn = Gtk.Button(label="Validate")
+    val_btn = Gtk.Button(label="Check health")
     val_btn.add_css_class("suggested-action")
-    spacer = Gtk.Box(hexpand=True)
     buttons.append(exit_btn)
-    buttons.append(spacer)
+    buttons.append(Gtk.Box(hexpand=True))
     buttons.append(save_btn)
     buttons.append(val_btn)
     outer.append(buttons)
 
+    def combo_value(box: Gtk.ComboBoxText | None) -> str:
+        if box is None:
+            return ""
+        value = box.get_active_id() or ""
+        if value == "auto":
+            return ""
+        return value
+
+    def refresh_health() -> None:
+        checks = collect(target_for(user), hw)
+        health_view.set_label(format_health(checks))
+        raw_view.set_label(format_checks(checks))
+
     def do_save() -> None:
-        bind = "0.0.0.0" if lan.get_active() else "127.0.0.1"
-        path = save_config(
-            user,
-            {"bind": bind, "model_root": root_entry.get_text().strip()},
-        )
+        bind = "0.0.0.0" if network.get_active() else "127.0.0.1"
+        uri = uri_entry.get_text().strip()
+        if not uri and any(a.id == "ubuntuai-chat" and a.present for a in apps):
+            host = "127.0.0.1" if bind != "0.0.0.0" else bind
+            uri = f"http://{host}:8080/v1"
+        try:
+            path = save_config(
+                user,
+                {
+                    "bind": bind,
+                    "model_root": root_entry.get_text().strip(),
+                    "chat_model": combo_value(chat_combo),
+                    "primary_backend": combo_value(backend_combo),
+                    "tts_engine": combo_value(tts_combo),
+                    "stt_engine": combo_value(stt_combo),
+                    "openai_base_url": uri,
+                    "openai_api_key": key_entry.get_text().strip(),
+                },
+            )
+        except ValueError as exc:
+            _show_failure(win, str(exc), "")
+            status.set_text(str(exc))
+            return
         status.set_text(f"Saved {path}")
 
     def do_validate() -> None:
-        t = target_for(user)
-        status.set_text(format_checks(collect(t, hw)))
+        refresh_health()
+        status.set_text("Health updated.")
 
     exit_btn.connect("clicked", lambda *_: win.close())
     save_btn.connect("clicked", lambda *_: do_save())
     val_btn.connect("clicked", lambda *_: do_validate())
-    do_validate()
+    refresh_health()
     return outer
