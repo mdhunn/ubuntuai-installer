@@ -15,6 +15,7 @@ from catalog import by_id, expand_selection, load_workflows
 from configstore import saved_scan_folders
 from domain import Action, Hardware, UserTarget, Workflow
 from paths import ENV_FILE, LIMITS_FILE, LIMITS_TEMPLATE, PROFILE_FILE, helper_path
+from progress import ProgressEvent, emit, english_for_action, new_apply_log
 from vendor import install_vendor
 from weights import ensure_weight, load_catalog as load_weight_catalog
 
@@ -232,7 +233,42 @@ def _technical_block(cmd: list[str], rc: int, output: str) -> str:
     return "\n".join(lines)
 
 
-def run_privileged(verb: str, args: list[str], *, dry_run: bool = False) -> tuple[int, str]:
+def _pump_output(proc: subprocess.Popen, on_line: object | None) -> str:
+    chunks: list[str] = []
+    buf = ""
+    assert proc.stdout is not None
+    while True:
+        piece = proc.stdout.read(512)
+        if not piece:
+            break
+        buf += piece
+        while True:
+            npos = buf.find("\n")
+            rpos = buf.find("\r")
+            cuts = [i for i in (npos, rpos) if i >= 0]
+            if not cuts:
+                break
+            cut = min(cuts)
+            line = buf[:cut]
+            buf = buf[cut + 1 :]
+            if line:
+                chunks.append(line + "\n")
+                if on_line:
+                    on_line(line)
+    if buf:
+        chunks.append(buf)
+        if on_line:
+            on_line(buf)
+    return "".join(chunks)
+
+
+def run_privileged(
+    verb: str,
+    args: list[str],
+    *,
+    dry_run: bool = False,
+    on_line: object | None = None,
+) -> tuple[int, str]:
     if dry_run:
         return 0, ""
     helper = helper_path()
@@ -245,9 +281,20 @@ def run_privileged(verb: str, args: list[str], *, dry_run: bool = False) -> tupl
                 "Install pkexec or run the installer as root."
             )
         cmd = [pkexec, *cmd]
-    p = subprocess.run(cmd, check=False, capture_output=True, text=True)
-    out = (p.stdout or "") + (p.stderr or "")
-    return p.returncode, out
+    if on_line is None:
+        p = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        out = (p.stdout or "") + (p.stderr or "")
+        return p.returncode, out
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    out = _pump_output(proc, on_line)
+    rc = proc.wait()
+    return rc, out
 
 
 def execute_plan(
@@ -261,135 +308,193 @@ def execute_plan(
     log: list[str] = []
     _assert_user(target.name)
     model_root = assert_model_root(target.name, target.model_root)
-    for action in actions:
-        if action.kind == "skip":
-            log.append(action.summary)
-            continue
-        if action.kind == "apt_install":
-            log.append("apt install " + " ".join(action.payload))
-            rc, out = run_privileged("install", list(action.payload), dry_run=dry_run)
-            if rc != 0:
-                raise ApplyError(
-                    explain_helper_failure("install", out, rc),
-                    _technical_block(
-                        ["ubuntuai-installer-helper", "install", *action.payload],
-                        rc,
-                        out,
-                    ),
+    work = [a for a in actions if a.kind != "skip"]
+    total_steps = max(len(work), 1)
+    step_i = 0
+    log_path = None if dry_run else new_apply_log(target.home)
+    if log_path is not None:
+        log.append(f"log {log_path}")
+
+    def relay(english: str, technical: str = "", fraction: float | None = None) -> None:
+        frac = step_i / total_steps if fraction is None else min(max(fraction, 0.0), 1.0)
+        emit(
+            on_progress,
+            ProgressEvent(english, technical, frac),
+            log_path,
+        )
+
+    try:
+        for action in actions:
+            if action.kind == "skip":
+                log.append(action.summary)
+                continue
+            relay(english_for_action(action), action.summary)
+            if action.kind == "apt_install":
+                log.append("apt install " + " ".join(action.payload))
+                rc, out = run_privileged(
+                    "install",
+                    list(action.payload),
+                    dry_run=dry_run,
+                    on_line=None
+                    if dry_run
+                    else (lambda line: relay(english_for_action(action), line)),
                 )
-            continue
-        if action.kind == "groups":
-            log.append(f"usermod -aG {','.join(action.payload)} {target.name}")
-            rc, out = run_privileged(
-                "groups",
-                [target.name, *action.payload],
-                dry_run=dry_run,
-            )
-            if rc != 0:
-                raise ApplyError(
-                    explain_helper_failure("groups", out, rc),
-                    _technical_block(
-                        [
-                            "ubuntuai-installer-helper",
-                            "groups",
-                            target.name,
-                            *action.payload,
-                        ],
-                        rc,
-                        out,
-                    ),
-                )
-            continue
-        if action.kind == "core_files":
-            log.append(f"write {ENV_FILE}, {LIMITS_FILE}, {PROFILE_FILE}")
-            rc, out = run_privileged(
-                "core-files",
-                [
-                    target.name,
-                    str(model_root),
-                    target.bind,
-                ],
-                dry_run=dry_run,
-            )
-            if rc != 0:
-                raise ApplyError(
-                    explain_helper_failure("core-files", out, rc),
-                    _technical_block(
-                        [
-                            "ubuntuai-installer-helper",
-                            "core-files",
-                            target.name,
-                            str(model_root),
-                            target.bind,
-                        ],
-                        rc,
-                        out,
-                    ),
-                )
-            continue
-        if action.kind == "model_dirs":
-            log.append(f"mkdir {model_root} / " + ",".join(action.payload))
-            if not dry_run:
-                _mkdirs(model_root, action.payload, target)
-            continue
-        if action.kind == "vendor":
-            vendor_id = action.payload[0]
-            if hw is None:
-                raise ApplyError(
-                    "Could not install the extra runtime. Hardware probe is missing."
-                )
-            if on_progress:
-                on_progress(f"Installing {vendor_id}")
-            try:
-                msg = install_vendor(
-                    vendor_id,
-                    hw,
-                    target,
-                    on_progress=on_progress,
+                if rc != 0:
+                    raise ApplyError(
+                        explain_helper_failure("install", out, rc),
+                        _technical_block(
+                            ["ubuntuai-installer-helper", "install", *action.payload],
+                            rc,
+                            out,
+                        ),
+                    )
+            elif action.kind == "groups":
+                log.append(f"usermod -aG {','.join(action.payload)} {target.name}")
+                rc, out = run_privileged(
+                    "groups",
+                    [target.name, *action.payload],
                     dry_run=dry_run,
                 )
-            except Exception as exc:  # noqa: BLE001
-                raise ApplyError(
-                    "Could not install the extra runtime into your home folder.",
-                    str(exc),
-                ) from exc
-            log.append(msg)
-            continue
-        if action.kind == "weights":
-            extra = saved_scan_folders(target.name)
-            catalog = {w.id: w for w in load_weight_catalog()}
-            for wid in action.payload:
-                model = catalog.get(wid)
-                if model is None:
+                if rc != 0:
                     raise ApplyError(
-                        f"Could not find the model catalog entry {wid}.",
+                        explain_helper_failure("groups", out, rc),
+                        _technical_block(
+                            [
+                                "ubuntuai-installer-helper",
+                                "groups",
+                                target.name,
+                                *action.payload,
+                            ],
+                            rc,
+                            out,
+                        ),
                     )
-                if on_progress:
-                    on_progress(f"Ensuring {model.filename}")
+            elif action.kind == "core_files":
+                log.append(f"write {ENV_FILE}, {LIMITS_FILE}, {PROFILE_FILE}")
+                rc, out = run_privileged(
+                    "core-files",
+                    [target.name, str(model_root), target.bind],
+                    dry_run=dry_run,
+                )
+                if rc != 0:
+                    raise ApplyError(
+                        explain_helper_failure("core-files", out, rc),
+                        _technical_block(
+                            [
+                                "ubuntuai-installer-helper",
+                                "core-files",
+                                target.name,
+                                str(model_root),
+                                target.bind,
+                            ],
+                            rc,
+                            out,
+                        ),
+                    )
+            elif action.kind == "model_dirs":
+                log.append(f"mkdir {model_root} / " + ",".join(action.payload))
+                if not dry_run:
+                    _mkdirs(model_root, action.payload, target)
+            elif action.kind == "vendor":
+                vendor_id = action.payload[0]
+                if hw is None:
+                    raise ApplyError(
+                        "Could not install the extra runtime. Hardware probe is missing."
+                    )
                 try:
-                    msg = ensure_weight(
-                        model,
+                    msg = install_vendor(
+                        vendor_id,
+                        hw,
                         target,
-                        extra,
-                        on_progress=on_progress,
+                        on_progress=lambda msg: relay(str(msg), str(msg)),
                         dry_run=dry_run,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    detail = str(exc)
-                    if "mismatch" in detail.lower():
-                        english = (
-                            "A downloaded model file did not match the checksum "
-                            "published on its page. The broken file was not kept."
-                        )
-                    else:
-                        english = "Could not get a required model file."
-                    raise ApplyError(english, detail) from exc
+                    raise ApplyError(
+                        "Could not install the extra runtime into your home folder.",
+                        str(exc),
+                    ) from exc
                 log.append(msg)
-            continue
-        raise ApplyError(f"The installer does not know how to run step {action.kind}.")
-    if not dry_run:
-        _write_user_config(target, model_root)
-    return log
+            elif action.kind == "weights":
+                extra = saved_scan_folders(target.name)
+                catalog = {w.id: w for w in load_weight_catalog()}
+                wids = list(action.payload)
+                for wi, wid in enumerate(wids):
+                    model = catalog.get(wid)
+                    if model is None:
+                        raise ApplyError(
+                            f"Could not find the model catalog entry {wid}.",
+                        )
+                    relay(
+                        f"Getting {model.title}.",
+                        model.filename,
+                        fraction=(step_i + wi / max(len(wids), 1)) / total_steps,
+                    )
+
+                    def weight_cb(msg: object) -> None:
+                        relay(str(msg), str(msg))
+
+                    try:
+                        msg = ensure_weight(
+                            model,
+                            target,
+                            extra,
+                            on_progress=weight_cb,
+                            dry_run=dry_run,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        detail = str(exc)
+                        if "mismatch" in detail.lower():
+                            english = (
+                                "A downloaded model file did not match the checksum "
+                                "published on its page. The broken file was not kept."
+                            )
+                        else:
+                            english = "Could not get a required model file."
+                        raise ApplyError(english, detail) from exc
+                    log.append(msg)
+            else:
+                raise ApplyError(
+                    f"The installer does not know how to run step {action.kind}."
+                )
+            step_i += 1
+        emit(
+            on_progress,
+            ProgressEvent(
+                "Finished.",
+                f"log {log_path}" if log_path else "",
+                1.0,
+                done=True,
+            ),
+            log_path,
+        )
+        if not dry_run:
+            _write_user_config(target, model_root)
+        return log
+    except ApplyError as exc:
+        emit(
+            on_progress,
+            ProgressEvent(
+                exc.english,
+                exc.technical,
+                min(step_i / total_steps, 1.0),
+                failed=True,
+            ),
+            log_path,
+        )
+        raise
+    except Exception as exc:
+        emit(
+            on_progress,
+            ProgressEvent(
+                "Apply failed.",
+                str(exc),
+                min(step_i / total_steps, 1.0),
+                failed=True,
+            ),
+            log_path,
+        )
+        raise
 
 
 def _mkdirs(root: Path, subdirs: tuple[str, ...], target: UserTarget) -> None:

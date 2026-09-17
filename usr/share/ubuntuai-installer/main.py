@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from apply import ApplyError, build_plan, execute_plan, format_failure, format_plan
+from progress import ProgressEvent
 from catalog import expand_selection, load_workflows, recommended_ids
 from configstore import add_scan_folder
 from configstore import load as load_config
@@ -111,8 +112,18 @@ def cmd_plan(user: str, selected: tuple[str, ...], dry_run: bool) -> int:
     print(format_plan(actions))
     if dry_run:
         return 0
+    def _cli_progress(ev: object) -> None:
+        if isinstance(ev, ProgressEvent):
+            print(ev.english, flush=True)
+            if ev.technical and ev.technical != ev.english:
+                print("  " + ev.technical, flush=True)
+            return
+        print(ev, flush=True)
+
     try:
-        log = execute_plan(actions, t, hw=hw, dry_run=False)
+        log = execute_plan(
+            actions, t, hw=hw, dry_run=False, on_progress=_cli_progress
+        )
     except ApplyError as exc:
         print(format_failure(exc), file=sys.stderr)
         return 1

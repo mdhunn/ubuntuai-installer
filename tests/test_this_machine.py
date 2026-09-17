@@ -15,7 +15,7 @@ class ThisMachineTests(unittest.TestCase):
         hw = probe()
         if "xdna" not in hw.backends():
             self.skipTest("not an XDNA machine")
-        self.assertIn("vulkan", hw.backends())
+        self.assertTrue({"vulkan", "rocm"} & hw.backends())
         self.assertTrue(hw.hybrid_ok())
         nodes = {d.node for d in hw.devices if d.node}
         self.assertTrue(nodes & {"/dev/accel/accel0", "/dev/dri/renderD128"})

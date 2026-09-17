@@ -92,7 +92,7 @@ The desktop user is never a literal in the tree. `guess_user()` reads the enviro
 
 **Foundational Thinking.** The domain types are `Device`, `Hardware`, `Workflow`, `Action`. Write those first. UI last.
 
-**Experience First.** Defaults must work for a first-time Ubuntu user after Apply. Chat on localhost. TTS that speaks. STT that transcribes. Do not leave a checkbox that only prints "binary not on PATH". If Apply fails, say what happened in sentences. Keep the apt log behind details. Ship fewer polished workflows rather than ten broken frontends. Large vendor stacks such as OpenMOSS stay opt-in because of download size. When they are checked, they install fully.
+**Experience First.** Defaults must work for a first-time Ubuntu user after Apply. Chat on localhost. TTS that speaks. STT that transcribes. Do not leave a checkbox that only prints "binary not on PATH". If Apply fails, say what happened in sentences. Keep the apt log behind details. While Apply runs, show a progress bar, a plain-English step, and a technical log. Write the same log under `~/.local/share/ubuntuai/logs`. Ship fewer polished workflows rather than ten broken frontends. Large vendor stacks such as OpenMOSS stay opt-in because of download size. When they are checked, they install fully.
 
 **Model the Domain.** Backend choice, bind address, and workflow availability are data. Not scattered `if nvidia` blocks in the GUI.
 

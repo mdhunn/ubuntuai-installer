@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import os
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -26,6 +28,7 @@ from PyQt6.QtWidgets import (
 )
 
 from apply import ApplyError, build_plan, execute_plan, format_plan
+from progress import ProgressEvent
 from catalog import expand_selection, load_workflows, recommended_ids
 from configstore import add_scan_folder
 from configstore import load as load_config
@@ -116,6 +119,50 @@ def _installer_widget(win: QMainWindow) -> QWidget:
     return root
 
 
+def _open_apply_progress(win) -> tuple[QDialog, object]:
+    dialog = QDialog(win)
+    dialog.setWindowTitle("Installing")
+    dialog.resize(580, 400)
+    layout = QVBoxLayout(dialog)
+    english = QLabel("Starting.")
+    english.setWordWrap(True)
+    layout.addWidget(english)
+    bar = QProgressBar()
+    bar.setRange(0, 100)
+    bar.setValue(0)
+    layout.addWidget(bar)
+    hint = QLabel(
+        "This can take a while for large model files. "
+        "Open Technical details for apt and download lines."
+    )
+    hint.setWordWrap(True)
+    layout.addWidget(hint)
+    layout.addWidget(QLabel("Technical details"))
+    log = QTextEdit()
+    log.setReadOnly(True)
+    layout.addWidget(log, 1)
+    close_btn = QPushButton("Close")
+    close_btn.setEnabled(False)
+    close_btn.clicked.connect(dialog.close)
+    row = QHBoxLayout()
+    row.addStretch(1)
+    row.addWidget(close_btn)
+    layout.addLayout(row)
+    dialog.show()
+
+    def update(ev: object) -> None:
+        if not isinstance(ev, ProgressEvent):
+            ev = ProgressEvent(str(ev), str(ev))
+        bar.setValue(int(max(0.0, min(ev.fraction, 1.0)) * 100))
+        english.setText(ev.english)
+        if ev.technical:
+            log.append(ev.technical)
+        if ev.done or ev.failed:
+            close_btn.setEnabled(True)
+
+    return dialog, update
+
+
 def _show_failure(win, english: str, technical: str = "") -> None:
     box = QMessageBox(win)
     box.setIcon(QMessageBox.Icon.Critical)
@@ -170,21 +217,54 @@ def _qt_workflows(win, hw, user, workflows, status) -> QWidget:
         if dry_run:
             status.setText("Dry run\n" + format_plan(actions))
             return
-        try:
-            execute_plan(actions, t, hw=hw, dry_run=False)
-            record_installed(user, expand_selection(ids, workflows, hw))
-        except ApplyError as exc:
-            status.setText(exc.english)
-            _show_failure(win, exc.english, exc.technical)
-            return
-        except Exception as exc:  # noqa: BLE001
-            status.setText(f"Apply failed. {exc}")
-            _show_failure(win, "Apply failed.", str(exc))
-            return
-        status.setText(
-            format_checks(collect(t, hw))
-            + "\nLog out and back in if group membership just changed."
-        )
+        import threading
+
+        _dialog, update = _open_apply_progress(win)
+        pending: list[object] = []
+        timer = QTimer(_dialog)
+        timer.setInterval(80)
+
+        def drain() -> None:
+            while pending:
+                ev = pending.pop(0)
+                update(ev)
+                if isinstance(ev, ProgressEvent) and ev.failed:
+                    status.setText(ev.english)
+                    _show_failure(win, ev.english, ev.technical)
+                elif isinstance(ev, ProgressEvent) and ev.done:
+                    status.setText(ev.english)
+
+        timer.timeout.connect(drain)
+        timer.start()
+
+        def work() -> None:
+            try:
+                execute_plan(
+                    actions,
+                    t,
+                    hw=hw,
+                    dry_run=False,
+                    on_progress=pending.append,
+                )
+                record_installed(user, expand_selection(ids, workflows, hw))
+                report = collect(t, hw)
+                extra = "\nLog out and back in if group membership just changed."
+                pending.append(
+                    ProgressEvent(
+                        "Finished.",
+                        format_checks(report) + extra,
+                        1.0,
+                        done=True,
+                    )
+                )
+            except ApplyError as exc:
+                pending.append(
+                    ProgressEvent(exc.english, exc.technical, failed=True)
+                )
+            except Exception as exc:  # noqa: BLE001
+                pending.append(ProgressEvent("Apply failed.", str(exc), failed=True))
+
+        threading.Thread(target=work, daemon=True).start()
 
     exit_btn.clicked.connect(win.close)
     dry.clicked.connect(lambda: do_apply(True))

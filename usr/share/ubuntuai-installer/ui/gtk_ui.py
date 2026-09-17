@@ -11,6 +11,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from apply import ApplyError, build_plan, execute_plan, format_plan
+from progress import ProgressEvent
 from catalog import expand_selection, load_workflows, recommended_ids
 from configstore import add_scan_folder
 from configstore import load as load_config
@@ -169,6 +170,64 @@ def _show_failure(win, english: str, technical: str = "") -> None:
     dialog.present()
 
 
+def _open_apply_progress(win) -> tuple[object, object]:
+    dialog = Gtk.Window(transient_for=win, modal=True, title="Installing")
+    dialog.set_default_size(580, 400)
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    outer.set_margin_top(16)
+    outer.set_margin_bottom(16)
+    outer.set_margin_start(16)
+    outer.set_margin_end(16)
+    english = Gtk.Label(label="Starting.", wrap=True, xalign=0)
+    outer.append(english)
+    bar = Gtk.ProgressBar()
+    bar.set_show_text(True)
+    bar.set_fraction(0)
+    outer.append(bar)
+    hint = Gtk.Label(
+        label="This can take a while for large model files. You can open Technical details for apt and download lines.",
+        wrap=True,
+        xalign=0,
+    )
+    hint.add_css_class("dim-label")
+    outer.append(hint)
+    expander = Gtk.Expander(label="Technical details")
+    view = Gtk.TextView()
+    view.set_editable(False)
+    view.set_cursor_visible(False)
+    view.set_monospace(True)
+    view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+    buf = view.get_buffer()
+    scroll = Gtk.ScrolledWindow(vexpand=True)
+    scroll.set_min_content_height(160)
+    scroll.set_child(view)
+    expander.set_child(scroll)
+    outer.append(expander)
+    close_btn = Gtk.Button(label="Close")
+    close_btn.set_sensitive(False)
+    close_btn.connect("clicked", lambda *_: dialog.close())
+    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+    row.append(Gtk.Box(hexpand=True))
+    row.append(close_btn)
+    outer.append(row)
+    dialog.set_child(outer)
+    dialog.present()
+
+    def update(ev: object) -> bool:
+        if not isinstance(ev, ProgressEvent):
+            ev = ProgressEvent(str(ev), str(ev))
+        bar.set_fraction(max(0.0, min(ev.fraction, 1.0)))
+        bar.set_text(f"{int(ev.fraction * 100)}%")
+        english.set_label(ev.english)
+        if ev.technical:
+            buf.insert(buf.get_end_iter(), ev.technical + "\n")
+        if ev.done or ev.failed:
+            close_btn.set_sensitive(True)
+        return False
+
+    return dialog, update
+
+
 def _scroller(child: Gtk.Widget) -> Gtk.ScrolledWindow:
     scroller = Gtk.ScrolledWindow(vexpand=True)
     scroller.set_overlay_scrolling(False)
@@ -219,6 +278,7 @@ def _workflows_page(win, hw, user, workflows, checks, status) -> Gtk.Widget:
         if dry_run:
             status.set_text("Dry run\n" + format_plan(actions))
             return
+        _dialog, update = _open_apply_progress(win)
 
         def work() -> None:
             try:
@@ -227,7 +287,7 @@ def _workflows_page(win, hw, user, workflows, checks, status) -> Gtk.Widget:
                     t,
                     hw=hw,
                     dry_run=False,
-                    on_progress=lambda msg: GLib.idle_add(status.set_text, str(msg)),
+                    on_progress=lambda ev: GLib.idle_add(update, ev),
                 )
             except ApplyError as exc:
                 GLib.idle_add(status.set_text, exc.english)
