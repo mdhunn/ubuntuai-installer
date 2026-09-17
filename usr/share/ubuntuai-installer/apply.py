@@ -99,7 +99,7 @@ def build_plan(
                     )
                 )
                 continue
-        apt.extend(wf.apt)
+        apt.extend(wf.packages_for(hw))
         groups.extend(wf.groups)
         subdirs.extend(wf.model_subdirs)
 

@@ -214,32 +214,40 @@
     {
       "id": "ubuntuai-serve",
       "title": "Serve",
-      "summary": "vLLM or SGLang for concurrent API use. Hidden without CUDA or ROCm.",
+      "summary": "GPU serving stack. Apply installs ROCm or CUDA from Ubuntu when an AMD or NVIDIA GPU is present.",
       "default": false,
       "always": false,
       "requires": ["ubuntuai-core"],
       "apt": [],
-      "groups": [],
-      "model_subdirs": ["safetensors", "hf"],
+      "apt_for_backend": {
+        "rocm": ["rocminfo", "libhsa-runtime64-1", "libamdhip64-7", "libggml0-backend-hip"],
+        "cuda": ["nvidia-cuda-toolkit"]
+      },
+      "groups": ["render"],
+      "model_subdirs": ["safetensors", "hf", "gguf"],
       "needs_any_backend": ["cuda", "rocm"],
       "hide_unless_backend": ["cuda", "rocm"],
       "ports": [8000],
-      "notes": "Wrong default on a laptop or an APU. Not offered on Vulkan-only or NPU-only boxes."
+      "notes": "Grey out only when there is no AMD or NVIDIA GPU. Missing rocminfo or nvidia-smi is an apt job. Does not pip-install vLLM or PyTorch."
     },
     {
       "id": "ubuntuai-train",
       "title": "Train",
-      "summary": "CUDA or ROCm toolkit plus an isolated uv venv. Opt-in and large.",
+      "summary": "CUDA or ROCm from Ubuntu plus an isolated venv. Opt-in and large.",
       "default": false,
       "always": false,
       "requires": ["ubuntuai-core"],
       "apt": ["python3-venv"],
-      "groups": [],
+      "apt_for_backend": {
+        "rocm": ["rocminfo", "libhsa-runtime64-1", "libamdhip64-7", "hipcc"],
+        "cuda": ["nvidia-cuda-toolkit"]
+      },
+      "groups": ["render"],
       "model_subdirs": [],
       "needs_any_backend": ["cuda", "rocm"],
       "hide_unless_backend": ["cuda", "rocm"],
       "ports": [],
-      "notes": "v1 does not pip-install PyTorch. It only prepares the isolated venv directory."
+      "notes": "Does not pip-install PyTorch. Prepares the isolated venv directory and the archive GPU stack."
     }
   ]
 }

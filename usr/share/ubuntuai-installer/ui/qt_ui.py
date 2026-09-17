@@ -120,6 +120,10 @@ def _qt_workflows(win, hw, user, workflows, status) -> QWidget:
         summary = wf.summary
         if wf.id in rec and wf.role:
             summary = "Recommended on this machine. " + wf.summary
+        if not offered:
+            summary = wf.summary + " Unavailable on this hardware."
+        elif not wf.ready(hw):
+            summary = wf.summary + " Apply will install the missing GPU packages."
         box = QCheckBox(f"{wf.title}\n{summary}")
         box.setChecked(wf.id in rec)
         box.setEnabled(offered and not wf.always)

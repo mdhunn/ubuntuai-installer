@@ -151,6 +151,8 @@ def _workflows_page(win, hw, user, workflows, checks, status) -> Gtk.Widget:
             summary = "Recommended on this machine. " + wf.summary
         if not offered:
             summary = wf.summary + " Unavailable on this hardware."
+        elif not wf.ready(hw):
+            summary = wf.summary + " Apply will install the missing GPU packages."
         listbox.append(_check_row(wf.title, summary, cb))
     page.append(_scroller(listbox))
     buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)

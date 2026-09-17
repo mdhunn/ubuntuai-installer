@@ -37,11 +37,11 @@ Name things after the domain. `Hardware.backends()` not `get_accel_set()`.
 
 Three JSON files. Do not invent a fourth format.
 
-- `workflows.json`. `id` is the metapackage name (`ubuntuai-chat`, not `Chat`). `apt` lists Ubuntu package names. `vendor` is a key in `vendors.json`. `required_weights` lists ids in `weights.json`.
+- `workflows.json`. `id` is the metapackage name (`ubuntuai-chat`, not `Chat`). `apt` lists Ubuntu package names always needed. `apt_for_backend` maps a backend id to extra packages. `vendor` is a key in `vendors.json`. `required_weights` lists ids in `weights.json`.
 - `weights.json`. Filenames, URLs, sizes. Optional `checksum` as `algo:hex`. Empty means look it up from the download page. Never the blobs.
 - `vendors.json`. Pinned archive URLs and binary names.
 
-`hide_unless_backend` is a list of backend ids from probe. Empty means always offered.
+`hide_unless_backend` is a list of backend ids. Offer the checkbox when probe already has one of them, or when `Hardware.installable_backends()` can add one via apt (AMD GPU → ROCm, NVIDIA GPU → CUDA). Empty means always offered. Grey out only when the silicon is missing. `apt_for_backend` lists extra packages per backend. Apply merges those with `apt`.
 
 ## UI
 

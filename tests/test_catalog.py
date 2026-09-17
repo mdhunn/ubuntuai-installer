@@ -31,7 +31,7 @@ class CatalogTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             expand_selection(("ubuntuai-nope",), self.wfs)
 
-    def test_serve_hidden_without_cuda(self) -> None:
+    def test_serve_offered_when_rocm_can_be_installed(self) -> None:
         hw = Hardware(
             cpu_name="x",
             ram_bytes=1,
@@ -41,7 +41,11 @@ class CatalogTests(unittest.TestCase):
             ),
         )
         serve = by_id(self.wfs)["ubuntuai-serve"]
-        self.assertFalse(serve.offered(hw))
+        self.assertTrue(serve.offered(hw))
+        self.assertTrue(serve.satisfied(hw))
+        self.assertFalse(serve.ready(hw))
+        self.assertIn("rocminfo", serve.packages_for(hw))
+        self.assertNotIn("nvidia-cuda-toolkit", serve.packages_for(hw))
         hybrid = by_id(self.wfs)["ubuntuai-hybrid"]
         npu = Hardware(
             cpu_name="x",
@@ -54,6 +58,31 @@ class CatalogTests(unittest.TestCase):
         )
         self.assertTrue(hybrid.offered(npu))
         self.assertTrue(npu.hybrid_ok())
+
+    def test_serve_hidden_on_cpu_only(self) -> None:
+        hw = Hardware(
+            cpu_name="cpu",
+            ram_bytes=8 * 1024**3,
+            devices=(Device("cpu", "cpu", "cpu", None, "cpu"),),
+        )
+        serve = by_id(self.wfs)["ubuntuai-serve"]
+        self.assertFalse(serve.offered(hw))
+        self.assertFalse(serve.satisfied(hw))
+
+    def test_serve_offered_on_nvidia_without_smi(self) -> None:
+        hw = Hardware(
+            cpu_name="x",
+            ram_bytes=16 * 1024**3,
+            devices=(
+                Device("dgpu", "nvidia", "rtx", "/dev/dri/renderD128", "vulkan"),
+                Device("cpu", "cpu", "cpu", None, "cpu"),
+            ),
+        )
+        serve = by_id(self.wfs)["ubuntuai-serve"]
+        self.assertTrue(serve.offered(hw))
+        self.assertIn("cuda", hw.installable_backends())
+        self.assertIn("nvidia-cuda-toolkit", serve.packages_for(hw))
+        self.assertNotIn("rocminfo", serve.packages_for(hw))
 
     def test_speech_engines(self) -> None:
         ids = {w.id for w in self.wfs}

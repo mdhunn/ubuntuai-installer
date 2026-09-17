@@ -37,6 +37,10 @@ def load_workflows(path: Path | None = None) -> tuple[Workflow, ...]:
             runtime_bins=tuple(row.get("runtime_bins") or ()),
             vendor=row.get("vendor") or "",
             required_weights=tuple(row.get("required_weights") or ()),
+            apt_for_backend=tuple(
+                (str(backend), tuple(pkgs or ()))
+                for backend, pkgs in (row.get("apt_for_backend") or {}).items()
+            ),
         )
         if wf.id in seen:
             raise ValueError(f"duplicate workflow id {wf.id}")

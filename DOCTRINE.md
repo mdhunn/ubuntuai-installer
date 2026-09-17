@@ -25,14 +25,16 @@ If core is wrong, every app is a paperweight.
 
 Probe, then pick one primary backend. Mixing CUDA wheels onto a Vulkan box is a bug.
 
+Chat stays on the backend that already runs. Serve and Train may install a second GPU stack from Ubuntu when the card can use it.
+
 | Silicon | Backend |
 |---|---|
-| NVIDIA dGPU | CUDA runtime. Toolkit only with Train. |
-| AMD dGPU on the ROCm list | ROCm plus `/dev/kfd`. |
-| AMD iGPU or unlisted dGPU | Vulkan. |
-| AMD XDNA2 NPU | `amdxdna` plus matched firmware plus XRT plus FastFlowLM. |
-| Intel GPU or NPU | Level Zero or Vulkan. |
-| CPU | llama.cpp CPU. First class. |
+| NVIDIA dGPU | CUDA once `nvidia-smi` exists. Serve and Train install `nvidia-cuda-toolkit` if it does not. |
+| AMD GPU with `/dev/kfd` | ROCm once `rocminfo` exists. Serve and Train install `rocminfo`, HIP, and the llama.cpp HIP backend if it does not. Vulkan remains the Chat default until then. |
+| AMD iGPU without ROCm packages | Vulkan for Chat. Serve and Train stay checkable. Apply installs the archive ROCm packages. |
+| AMD XDNA2 NPU | `amdxdna` plus matched firmware plus XRT plus FastFlowLM. Cannot be apt-installed. Hybrid stays grey without the NPU. |
+| Intel GPU or NPU | Level Zero or Vulkan. No CUDA or ROCm to install. Serve and Train stay grey. |
+| CPU | llama.cpp CPU. First class. Serve and Train stay grey. |
 
 Hybrid is first class on Strix Halo-class APUs. NPU (FastFlowLM) and iGPU (llama.cpp Vulkan) do not discover each other. The installer must wire both.
 
@@ -109,7 +111,7 @@ The desktop user is never a literal in the tree. `guess_user()` reads the enviro
 - A new Ubuntu flavor as the only path.
 - Pinokio or unpinned `curl | sh` app stores. Pinned GitHub release tarballs listed in `vendors.json` are how non-archive runtimes get installed.
 - Ollama as the only engine.
-- vLLM on this APU. It needs CUDA or ROCm and eats the card.
+- vLLM or SGLang via `pip`. Serve installs archive ROCm or CUDA. It does not pip-install those stacks.
 - Global `pip install torch`.
 - Shipping weight files or abliterated defaults.
 - Silent cloud fallback.
@@ -118,7 +120,7 @@ The desktop user is never a literal in the tree. `guess_user()` reads the enviro
 
 ## Apt versus vendor
 
-Prefer Ubuntu archive packages. On 26.04 that includes `llama.cpp-tools`, `libggml0-backend-vulkan`, `whisper.cpp`, `rhvoice`, and `espeak-ng`.
+Prefer Ubuntu archive packages. On 26.04 that includes `llama.cpp-tools`, `libggml0-backend-vulkan`, `libggml0-backend-hip`, `rocminfo`, `whisper.cpp`, `rhvoice`, and `espeak-ng`.
 
 When the archive cannot ship a runtime, `vendors.json` names a pinned archive, install prefix, and binaries. OpenMOSS is `pwilkin/openmoss` Vulkan Linux x64 into `~/.local/lib/ubuntuai/openmoss`, with wrappers in `~/.local/bin`. CUDA archives are not the default. They are 650 MiB and Vulkan already runs on NVIDIA.
 

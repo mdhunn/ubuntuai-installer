@@ -19,7 +19,7 @@ make test
 make install PREFIX=/usr/local
 make uninstall PREFIX=/usr/local
 ubuntuai-installer --list
-ubuntuai-installer --dry-run ubuntuai-core ubuntuai-chat
+ubuntuai-installer --install ubuntuai-core ubuntuai-chat --dry-run
 ubuntuai-installer --install ubuntuai-core ubuntuai-chat
 ubuntuai-installer --scan-weights
 ubuntuai-installer --scan-folder /path/to/weights
@@ -64,7 +64,7 @@ Install copies `usr/` into `PREFIX`. Keep runtime paths working from a source tr
 5. Bind defaults to `127.0.0.1`. `0.0.0.0` needs an explicit config choice.
 6. No model weights in git. Organize offers symlink, copy, or move. Copy/move may delete the original only after a checksum match. Do not assume SHA-256. Use the algorithm the download page or API publishes. No unpinned `curl | sh`. No `pip install torch` on system Python.
 7. Firmware is a matched pair. Never half-update NPU firmware from the installer.
-8. Serve and Train stay disabled unless probe finds CUDA or ROCm.
+8. Grey out a workflow only when the required silicon cannot exist on this machine. Missing archive packages are Apply's job. Serve and Train stay available when an AMD or NVIDIA GPU is present. Apply installs ROCm or CUDA from Ubuntu. An NPU-only or CPU-only box still hides them. Do not pip-install PyTorch.
 9. Speech engines have `role` `tts` or `stt`. Defaults come from `pick_role_winners`. `ubuntuai-speech` is a CLI alias for those winners.
 10. A checked workflow with `vendor` must install that runtime from `vendors.json`. A checked workflow with `required_weights` must link or download every id. Apply is not done if those steps are skipped.
 11. Vendor installs go under `~/.local` so a desktop user does not need a second password after groups are set. Put `~/.local/bin` on PATH from `/etc/profile.d/ubuntuai.sh`.

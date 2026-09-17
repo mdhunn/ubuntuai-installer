@@ -91,7 +91,12 @@ def cmd_list(user: str) -> int:
     for wf in wfs:
         offered = wf.offered(hw) and wf.satisfied(hw)
         mark = "*" if wf.id in rec else " "
-        state = "on" if offered else "unavailable"
+        if not offered:
+            state = "unavailable"
+        elif not wf.ready(hw):
+            state = "install"
+        else:
+            state = "on"
         note = " recommended" if wf.role and wf.id in rec else ""
         print(f"{mark} {wf.id:24} {state:12} {wf.title}  {wf.summary}{note}")
     return 0

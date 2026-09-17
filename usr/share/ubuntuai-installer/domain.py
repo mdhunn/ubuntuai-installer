@@ -29,6 +29,17 @@ class Hardware:
         found.add("cpu")
         return frozenset(found)
 
+    def installable_backends(self) -> frozenset[str]:
+        found = set(self.backends())
+        for d in self.devices:
+            if d.kind not in {"igpu", "dgpu"}:
+                continue
+            if d.vendor == "amd":
+                found.add("rocm")
+            elif d.vendor == "nvidia":
+                found.add("cuda")
+        return frozenset(found)
+
     def hybrid_ok(self) -> bool:
         kinds = {d.kind for d in self.devices}
         return "npu" in kinds and bool(kinds & {"igpu", "dgpu"})
@@ -63,16 +74,30 @@ class Workflow:
     runtime_bins: tuple[str, ...] = ()
     vendor: str = ""
     required_weights: tuple[str, ...] = ()
+    apt_for_backend: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def offered(self, hw: Hardware) -> bool:
         if not self.hide_unless_backend:
             return True
-        return bool(set(self.hide_unless_backend) & set(hw.backends()))
+        return bool(set(self.hide_unless_backend) & set(hw.installable_backends()))
 
     def satisfied(self, hw: Hardware) -> bool:
         if not self.needs_any_backend:
             return True
+        return bool(set(self.needs_any_backend) & set(hw.installable_backends()))
+
+    def ready(self, hw: Hardware) -> bool:
+        if not self.needs_any_backend:
+            return True
         return bool(set(self.needs_any_backend) & set(hw.backends()))
+
+    def packages_for(self, hw: Hardware) -> tuple[str, ...]:
+        pkgs: list[str] = list(self.apt)
+        installable = hw.installable_backends()
+        for backend, extra in self.apt_for_backend:
+            if backend in installable:
+                pkgs.extend(extra)
+        return tuple(dict.fromkeys(pkgs))
 
     def ram_ok(self, hw: Hardware) -> bool:
         return hw.ram_bytes >= self.min_ram_bytes

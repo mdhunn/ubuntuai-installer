@@ -50,8 +50,8 @@ class ApplyTests(unittest.TestCase):
         root = assert_model_root(name, home / "Models")
         self.assertEqual(root, (home / "Models").resolve())
 
-    def test_plan_skips_serve_on_strix(self) -> None:
-        with patch("apply.dpkg_installed", return_value=True), patch(
+    def test_plan_installs_rocm_for_serve_on_strix(self) -> None:
+        with patch("apply.dpkg_installed", return_value=False), patch(
             "apply.user_in_group", return_value=True
         ):
             actions = build_plan(
@@ -60,9 +60,32 @@ class ApplyTests(unittest.TestCase):
                 self.target,
                 self.wfs,
             )
-        kinds = [a.kind for a in actions]
-        self.assertIn("skip", kinds)
-        self.assertTrue(any("ubuntuai-serve" in a.payload for a in actions if a.kind == "skip"))
+        kinds = {a.kind: a for a in actions}
+        self.assertNotIn("skip", kinds)
+        self.assertIn("apt_install", kinds)
+        pkgs = kinds["apt_install"].payload
+        self.assertIn("rocminfo", pkgs)
+        self.assertIn("libggml0-backend-hip", pkgs)
+        self.assertNotIn("nvidia-cuda-toolkit", pkgs)
+
+    def test_plan_skips_serve_on_cpu_only(self) -> None:
+        cpu = Hardware(
+            cpu_name="cpu",
+            ram_bytes=8 * 1024**3,
+            devices=(Device("cpu", "cpu", "cpu", None, "cpu"),),
+        )
+        with patch("apply.dpkg_installed", return_value=True), patch(
+            "apply.user_in_group", return_value=True
+        ):
+            actions = build_plan(
+                ("ubuntuai-core", "ubuntuai-serve"),
+                cpu,
+                self.target,
+                self.wfs,
+            )
+        self.assertTrue(
+            any("ubuntuai-serve" in a.payload for a in actions if a.kind == "skip")
+        )
 
     def test_plan_installs_missing_apt(self) -> None:
         with patch("apply.dpkg_installed", return_value=False), patch(

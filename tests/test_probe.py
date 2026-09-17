@@ -12,6 +12,7 @@ class ProbeTests(unittest.TestCase):
         hw = probe(lspci_text=STRIX_LSPCI, cpuinfo=CPUINFO, meminfo=MEMINFO)
         self.assertIn("xdna", hw.backends())
         self.assertIn("vulkan", hw.backends())
+        self.assertIn("rocm", hw.installable_backends())
         self.assertTrue(hw.hybrid_ok())
         self.assertEqual(hw.primary_backend(), "xdna")
         kinds = {d.kind for d in hw.devices}
@@ -24,10 +25,12 @@ class ProbeTests(unittest.TestCase):
         gpu = next(d for d in hw.devices if d.vendor == "nvidia")
         self.assertEqual(gpu.kind, "dgpu")
         self.assertIn(gpu.backend, {"cuda", "vulkan"})
+        self.assertIn("cuda", hw.installable_backends())
 
     def test_cpu_always_present(self) -> None:
         hw = probe(lspci_text="", cpuinfo=CPUINFO, meminfo=MEMINFO)
         self.assertEqual(hw.backends(), frozenset({"cpu"}))
+        self.assertEqual(hw.installable_backends(), frozenset({"cpu"}))
         self.assertFalse(hw.hybrid_ok())
 
 
