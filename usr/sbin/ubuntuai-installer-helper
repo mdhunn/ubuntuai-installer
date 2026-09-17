@@ -21,6 +21,8 @@ else:
     sys.exit(1)
 
 from apply import add_user_to_groups, apt_install, write_core_files  # noqa: E402
+from lemonade import publish  # noqa: E402
+from users import target_for  # noqa: E402
 
 
 def main(argv: list[str]) -> int:
@@ -43,6 +45,12 @@ def main(argv: list[str]) -> int:
             sys.stderr.write("core-files requires USER MODEL_ROOT BIND\n")
             return 2
         write_core_files(rest[0], rest[1], rest[2])
+        return 0
+    if verb == "lemonade-publish":
+        if not rest:
+            sys.stderr.write("lemonade-publish requires USER\n")
+            return 2
+        print(publish(target_for(rest[0])))
         return 0
     sys.stderr.write(f"unknown verb {verb}\n")
     return 2

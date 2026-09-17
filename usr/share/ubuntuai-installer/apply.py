@@ -16,6 +16,7 @@ from configstore import saved_scan_folders
 from domain import Action, Hardware, UserTarget, Workflow
 from paths import ENV_FILE, LIMITS_FILE, LIMITS_TEMPLATE, PROFILE_FILE, helper_path
 from progress import ProgressEvent, emit, english_for_action, new_apply_log
+from lemonade import detect as lemonade_detect
 from vendor import install_vendor
 from weights import ensure_weight, load_catalog as load_weight_catalog
 
@@ -151,6 +152,10 @@ def build_plan(
     if unique_weights:
         actions.append(
             Action("weights", "link or download required weights", unique_weights)
+        )
+    if lemonade_detect():
+        actions.append(
+            Action("lemonade", "publish GGUF files to Lemonade", (target.name,))
         )
     return tuple(actions)
 
@@ -453,6 +458,18 @@ def execute_plan(
                             english = "Could not get a required model file."
                         raise ApplyError(english, detail) from exc
                     log.append(msg)
+            elif action.kind == "lemonade":
+                rc, out = run_privileged(
+                    "lemonade-publish",
+                    [target.name],
+                    dry_run=dry_run,
+                )
+                if rc != 0:
+                    raise ApplyError(
+                        "Could not make downloaded models visible to Lemonade.",
+                        out,
+                    )
+                log.append((out or "published models to Lemonade").strip())
             else:
                 raise ApplyError(
                     f"The installer does not know how to run step {action.kind}."

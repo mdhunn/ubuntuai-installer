@@ -122,6 +122,8 @@ The desktop user is never a literal in the tree. `guess_user()` reads the enviro
 
 Prefer Ubuntu archive packages. On 26.04 that includes `llama.cpp-tools`, `libggml0-backend-vulkan`, `libggml0-backend-hip`, `rocminfo`, `whisper.cpp`, `rhvoice`, and `espeak-ng`.
 
+Lemonade (snap) is a separate server on `127.0.0.1:13305`. Store organize defaults to symlink. The snap cannot follow those links and cannot use `~/Models` as `extra_models_dir`. Apply bind-mounts the real GGUF trees into snap common and sets `extra_models_dir`.
+
 When the archive cannot ship a runtime, `vendors.json` names a pinned archive, install prefix, and binaries. OpenMOSS is `pwilkin/openmoss` Vulkan Linux x64 into `~/.local/lib/ubuntuai/openmoss`, with wrappers in `~/.local/bin`. CUDA archives are not the default. They are 650 MiB and Vulkan already runs on NVIDIA.
 
 Required weights live in `weights.json` and are listed on the workflow as `required_weights`. Apply order is: reuse a file already in the scan roots, else download into `~/Models/<subdir>`. Whisper's required ggml is small and is fetched when STT is selected. OpenMOSS local GGUF plus sidecar is large and is fetched only when that TTS box is checked.

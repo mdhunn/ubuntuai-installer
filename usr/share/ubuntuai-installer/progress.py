@@ -70,6 +70,8 @@ def english_for_action(action: Action) -> str:
         return f"Installing {name} into your home folder."
     if kind == "weights":
         return "Finding or downloading required model files."
+    if kind == "lemonade":
+        return "Making downloaded GGUF files visible to Lemonade."
     return action.summary
 
 

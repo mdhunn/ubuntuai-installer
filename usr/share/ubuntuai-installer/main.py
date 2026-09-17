@@ -407,6 +407,11 @@ def _parser() -> argparse.ArgumentParser:
         help="forget a remembered scan folder",
     )
     p.add_argument("--list-scan-folders", action="store_true")
+    p.add_argument(
+        "--publish-lemonade",
+        action="store_true",
+        help="point Lemonade at GGUF files already in the model store",
+    )
     return p
 
 
@@ -430,6 +435,15 @@ def installer_main(argv: list[str] | None = None) -> int:
             print("  (none)")
         for p in saved:
             print(f"  {p}")
+        return 0
+    if args.publish_lemonade:
+        from apply import run_privileged
+
+        rc, out = run_privileged("lemonade-publish", [user], dry_run=args.dry_run)
+        if rc != 0:
+            print(out or "lemonade publish failed", file=sys.stderr)
+            return 1
+        print((out or "published").strip())
         return 0
     if args.list:
         return cmd_list(user)

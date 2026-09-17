@@ -79,6 +79,7 @@ Install copies `usr/` into `PREFIX`. Keep runtime paths working from a source tr
 18. Apply failures show a plain-English reason first. Technical logs (helper command, exit code, apt text) are behind a details expander in the GUI and after a "Technical details" heading on the CLI. Capture helper stdout and stderr. Do not stop at `failed with 1`.
 19. `ubuntuai-config` only tunes apps the installer actually put on the machine (recorded Apply plus live binaries). Overview is sentences. Settings are chat model, speech, and GPU. Advanced is paths, URI, key, and raw checks. `--explain` is the CLI for new users. `--show` is JSON.
 20. Apply opens a progress dialog with a bar, a plain-English line, and a Technical details log. The same events go to `~/.local/share/ubuntuai/logs/apply-*.log`. Do not leave Apply as a silent wait.
+21. Lemonade must see the GGUF files the installer already has. The snap cannot follow `~/Models` symlinks and cannot read `/home` as `extra_models_dir`. Bind the real trees (often `~/AI models`) into `/var/snap/lemonade-server/common/ubuntuai-models` and set `extra_models_dir`.
 
 ## How to change a workflow
 
