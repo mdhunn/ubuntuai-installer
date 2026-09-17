@@ -2,6 +2,7 @@
   "openmoss": {
     "title": "OpenMOSS moss-tts-server",
     "version": "v0.3.0",
+    "github": "pwilkin/openmoss",
     "binaries": ["moss-tts-server"],
     "wrapper": "moss-tts-server",
     "launcher": "ubuntuai-openmoss",

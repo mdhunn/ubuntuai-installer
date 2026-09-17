@@ -281,6 +281,34 @@ def cmd_repair(
     return 0
 
 
+def cmd_upgrade(user: str, *, approve: bool, dry_run: bool) -> int:
+    from upgrade import (
+        build_plan_for as build_upgrade_plan,
+        execute_plan_steps as execute_upgrade_steps,
+        format_plan as format_upgrade_plan,
+        load_saved_plan as load_upgrade_plan,
+    )
+
+    if approve:
+        saved = load_upgrade_plan(user)
+        if saved is None:
+            print("no saved update plan. run --upgrade first.", file=sys.stderr)
+            return 2
+        try:
+            log = execute_upgrade_steps(user, saved.get("plan"), dry_run=dry_run)
+        except ApplyError as exc:
+            print(format_failure(exc), file=sys.stderr)
+            return 1
+        for line in log:
+            print(line)
+        return 0
+    _diag, plan = build_upgrade_plan(user)
+    print(format_upgrade_plan(plan))
+    print("")
+    print("Review this text. Then --upgrade-approve to apply.")
+    return 0
+
+
 def cmd_list_downloads(user: str) -> int:
     t = target_for(user)
     for w in load_weight_catalog():
@@ -412,6 +440,16 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="point Lemonade at GGUF files already in the model store",
     )
+    p.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="diagnose vendor, catalog, and Lemonade load updates",
+    )
+    p.add_argument(
+        "--upgrade-approve",
+        action="store_true",
+        help="apply the last saved update plan after you have reviewed it",
+    )
     return p
 
 
@@ -449,6 +487,8 @@ def installer_main(argv: list[str] | None = None) -> int:
         return cmd_list(user)
     if args.scan_weights:
         return cmd_scan_weights(user, extra)
+    if args.upgrade or args.upgrade_approve:
+        return cmd_upgrade(user, approve=args.upgrade_approve, dry_run=args.dry_run)
     if args.repair or args.repair_approve:
         return cmd_repair(
             user,

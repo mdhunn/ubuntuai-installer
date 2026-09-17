@@ -29,6 +29,8 @@ ubuntuai-installer --organize-weights copy --remove-source
 ubuntuai-installer --repair
 ubuntuai-installer --repair --repair-advisor openai --openai-uri https://api.openai.com/v1 --openai-key "$OPENAI_API_KEY"
 ubuntuai-installer --repair-approve
+ubuntuai-installer --upgrade
+ubuntuai-installer --upgrade-approve
 ubuntuai-installer --list-downloads
 ubuntuai-validate
 ubuntuai-config --explain
@@ -47,6 +49,8 @@ GUI needs a session bus and a display. CLI must remain complete without either.
 | `usr/share/ubuntuai-installer/vendor.py` | Download, extract, wrap vendor binaries into `~/.local`. |
 | `usr/share/ubuntuai-installer/weights.py` | Scan, classify, symlink/copy/move, download, ensure required weights. |
 | `usr/share/ubuntuai-installer/repair.py` | Diagnose, plan, human-approved repair of config, vendors, and checksums. |
+| `usr/share/ubuntuai-installer/upgrade.py` | Human-approved vendor, catalog, and Lemonade load updates. |
+| `usr/share/ubuntuai-installer/lemonade.py` | Publish GGUF trees to Lemonade. Tune large-model load. |
 | `usr/share/ubuntuai-installer/runtime.py` | Which installer workflows are present and how to reach them. |
 | `usr/share/ubuntuai-installer/probe.py` | Hardware report. |
 | `usr/share/ubuntuai-installer/apply.py` | Plan and privileged apply. Idempotent. |
@@ -80,6 +84,7 @@ Install copies `usr/` into `PREFIX`. Keep runtime paths working from a source tr
 19. `ubuntuai-config` only tunes apps the installer actually put on the machine (recorded Apply plus live binaries). Overview is sentences. Settings are chat model, speech, and GPU. Advanced is paths, URI, key, and raw checks. `--explain` is the CLI for new users. `--show` is JSON.
 20. Apply opens a progress dialog with a bar, a plain-English line, and a Technical details log. The same events go to `~/.local/share/ubuntuai/logs/apply-*.log`. Do not leave Apply as a silent wait.
 21. Lemonade must see the GGUF files the installer already has. The snap cannot follow `~/Models` symlinks and cannot read `/home` as `extra_models_dir`. Bind the real trees (often `~/AI models`) into `/var/snap/lemonade-server/common/ubuntuai-models` and set `extra_models_dir`.
+22. Updates are human-in-the-loop. `--upgrade` / the Updates tab diagnose vendor GitHub releases, catalog checksum drift, and Lemonade load settings. Approve is a separate action. Apt and snap refreshes stay with those tools. Numbered GGUF shard folders stay one store entry. Large GGUFs get `max_loaded_models=1`, a bounded context, and a longer first-load timeout.
 
 ## How to change a workflow
 

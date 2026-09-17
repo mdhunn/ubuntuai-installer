@@ -42,6 +42,12 @@ from repair import (
     format_plan as format_repair_plan,
     load_saved_plan,
 )
+from upgrade import (
+    build_plan_for as build_upgrade_plan,
+    execute_plan_steps as execute_upgrade_steps,
+    format_plan as format_upgrade_plan,
+    load_saved_plan as load_upgrade_plan,
+)
 from probe import probe
 from users import guess_user, target_for
 from runtime import (
@@ -113,6 +119,7 @@ def _installer_widget(win: QMainWindow) -> QWidget:
     status.setWordWrap(True)
     tabs.addTab(_qt_workflows(win, hw, user, workflows, status), "Workflows")
     tabs.addTab(_qt_weights(win, user, status), "Weights")
+    tabs.addTab(_qt_upgrade(win, user, status), "Updates")
     tabs.addTab(_qt_repair(win, user, status), "Repair")
     layout.addWidget(tabs, 1)
     layout.addWidget(status)
@@ -614,6 +621,64 @@ def _qt_repair(win, user, status) -> QWidget:
     if saved and saved.get("plan"):
         plan_view.setPlainText(
             str(saved.get("english") or format_repair_plan(saved["plan"]))
+        )
+    return page
+
+
+def _qt_upgrade(win, user, status) -> QWidget:
+    page = QWidget()
+    layout = QVBoxLayout(page)
+    hint = QLabel(
+        "Upgrade vendor runtimes that are not apt or snap, refresh catalog "
+        "models that drifted, and tune Lemonade for very large GGUF files. "
+        "Diagnose writes a plan. Nothing is applied until you approve."
+    )
+    hint.setWordWrap(True)
+    layout.addWidget(hint)
+    plan_view = QTextEdit()
+    plan_view.setReadOnly(True)
+    layout.addWidget(plan_view, 1)
+    btns = QHBoxLayout()
+    exit_btn = QPushButton("Exit")
+    diag_btn = QPushButton("Diagnose")
+    approve_btn = QPushButton("Approve")
+    btns.addWidget(exit_btn)
+    btns.addStretch(1)
+    btns.addWidget(diag_btn)
+    btns.addWidget(approve_btn)
+    layout.addLayout(btns)
+
+    def do_diagnose() -> None:
+        try:
+            _diag, plan = build_upgrade_plan(user)
+            plan_view.setPlainText(format_upgrade_plan(plan))
+            status.setText("Review the update plan. Approve only if you accept every step.")
+        except Exception as exc:  # noqa: BLE001
+            plan_view.setPlainText(f"Diagnose failed. {exc}")
+
+    def do_approve() -> None:
+        saved = load_upgrade_plan(user)
+        if saved is None:
+            status.setText("No update plan to approve. Diagnose first.")
+            return
+        try:
+            log = execute_upgrade_steps(user, saved.get("plan"))
+            plan_view.setPlainText("\n".join(log))
+            status.setText("Updates finished.")
+        except ApplyError as exc:
+            status.setText(exc.english)
+            _show_failure(win, exc.english, exc.technical)
+        except Exception as exc:  # noqa: BLE001
+            status.setText(f"Update failed. {exc}")
+            _show_failure(win, "Update failed.", str(exc))
+
+    exit_btn.clicked.connect(win.close)
+    diag_btn.clicked.connect(do_diagnose)
+    approve_btn.clicked.connect(do_approve)
+    saved = load_upgrade_plan(user)
+    if saved and saved.get("plan"):
+        plan_view.setPlainText(
+            str(saved.get("english") or format_upgrade_plan(saved["plan"]))
         )
     return page
 

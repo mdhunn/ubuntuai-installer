@@ -129,6 +129,90 @@ def _restart_snap() -> None:
     _run(["snap", "restart", "lemonade-server.daemon"])
 
 
+def largest_gguf_bytes(target: UserTarget) -> int:
+    biggest = 0
+    for root in gguf_sources(target):
+        shard_dirs: dict[Path, int] = {}
+        for p in root.rglob("*.gguf"):
+            if p.is_symlink() or not p.is_file():
+                continue
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            biggest = max(biggest, size)
+            if "-of-" in p.name.lower():
+                shard_dirs[p.parent] = shard_dirs.get(p.parent, 0) + size
+        if shard_dirs:
+            biggest = max(biggest, max(shard_dirs.values()))
+    return biggest
+
+
+def load_tuning(hw, largest_bytes: int) -> dict[str, object]:
+    ram = max(int(getattr(hw, "ram_bytes", 0) or 0), 1)
+    frac = largest_bytes / ram
+    backends = hw.backends() if hasattr(hw, "backends") else set()
+    if "rocm" in backends:
+        backend = "rocm"
+    elif "vulkan" in backends:
+        backend = "vulkan"
+    else:
+        backend = "auto"
+    timeout = 600
+    ctx = -1
+    if frac >= 0.70:
+        ctx = 2048
+        timeout = 2400
+    elif frac >= 0.50:
+        ctx = 4096
+        timeout = 1800
+    elif frac >= 0.35:
+        ctx = 8192
+        timeout = 1200
+    return {
+        "ctx_size": ctx,
+        "global_timeout": timeout,
+        "max_loaded_models": 1,
+        "llamacpp_backend": backend,
+    }
+
+
+def apply_tuning(settings: dict[str, object]) -> str:
+    body = json.dumps(settings).encode("utf-8")
+    req = urllib.request.Request(
+        f"{LEMONADE_API}/internal/set",
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": UA},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            json.loads(resp.read().decode("utf-8"))
+        return "lemonade load settings updated"
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        pass
+    exe = shutil.which("lemonade-server") or shutil.which("lemonade")
+    if not exe:
+        raise RuntimeError("lemonade-server is not on PATH")
+    parts = [f"{key}={value}" for key, value in settings.items()]
+    # CLI wants dotted backend key.
+    parts = [
+        p.replace("llamacpp_backend=", "llamacpp.backend=") for p in parts
+    ]
+    p = _run([exe, "config", "set", *parts])
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr or p.stdout or "lemonade config set failed").strip())
+    return "lemonade load settings updated"
+
+
+def check_model_updates() -> str:
+    exe = shutil.which("lemonade-server") or shutil.which("lemonade")
+    if not exe:
+        return ""
+    p = _run([exe, "check-updates"])
+    return ((p.stdout or "") + (p.stderr or "")).strip()
+
+
 def publish(target: UserTarget) -> str:
     kind = detect()
     if not kind:

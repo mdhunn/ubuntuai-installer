@@ -421,10 +421,33 @@ def classify(path: Path) -> str | None:
     return None
 
 
+SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.I)
+
+
+def detect_shard_bundle(path: Path) -> bool:
+    """True when this folder holds a numbered GGUF shard set (keep it intact)."""
+    if not path.is_dir():
+        return False
+    try:
+        names = [p.name for p in path.iterdir() if p.is_file() or p.is_symlink()]
+    except OSError:
+        return False
+    totals: dict[int, int] = {}
+    for name in names:
+        match = SHARD_RE.search(name)
+        if not match:
+            continue
+        total = int(match.group(2))
+        totals[total] = totals.get(total, 0) + 1
+    return any(count >= 2 and total >= 2 for total, count in totals.items())
+
+
 def detect_bundle(path: Path) -> tuple[str, str] | None:
-    """Return (subdir, fmt) for a Hugging Face, Diffusers, or EXL2 directory."""
+    """Return (subdir, fmt) for a Hugging Face, Diffusers, shard, or EXL2 directory."""
     if not path.is_dir():
         return None
+    if detect_shard_bundle(path):
+        return "gguf", "gguf"
     if (path / "model_index.json").is_file():
         return "diffusers", "diffusers"
     has_config = (path / "config.json").is_file()

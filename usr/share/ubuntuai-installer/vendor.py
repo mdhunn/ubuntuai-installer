@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import tarfile
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -82,6 +83,39 @@ def _id_from_spec(spec: dict) -> str:
     return spec.get("id") or "openmoss"
 
 
+def vendor_versions_path(home: Path) -> Path:
+    return home / ".config" / "ubuntuai" / "vendor-versions.json"
+
+
+def recorded_vendor_version(home: Path, vendor_id: str) -> str:
+    path = vendor_versions_path(home)
+    if not path.is_file():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get(vendor_id) or "")
+
+
+def record_vendor_version(home: Path, vendor_id: str, version: str, uid: int, gid: int) -> None:
+    path = vendor_versions_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data: dict = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    data[vendor_id] = version
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.chown(path, uid, gid)
+
+
 def install_vendor(
     vendor_id: str,
     hw: Hardware,
@@ -91,6 +125,8 @@ def install_vendor(
     dry_run: bool = False,
     vendors: dict | None = None,
     force: bool = False,
+    archive_url: str = "",
+    version: str = "",
 ) -> str:
     table = vendors or load_vendors()
     spec = table.get(vendor_id)
@@ -103,7 +139,12 @@ def install_vendor(
         return f"already {vendor_id}"
     if force and libdir.exists():
         shutil.rmtree(libdir)
-    archive = pick_archive(spec, hw)
+    archive = dict(pick_archive(spec, hw))
+    if archive_url:
+        archive["url"] = archive_url
+        name = Path(urllib.parse.urlparse(archive_url).path).name
+        if name:
+            archive["filename"] = name
     bindir = vendor_bindir(target.home)
     cache = vendor_cachedir(target.home)
     tarball = cache / archive["filename"]
@@ -149,6 +190,13 @@ def install_vendor(
         os.chmod(script, 0o755)
         os.chown(script, target.uid, target.gid)
     os.chown(bindir, target.uid, target.gid)
+    record_vendor_version(
+        target.home,
+        vendor_id,
+        version or str(spec.get("version") or ""),
+        target.uid,
+        target.gid,
+    )
     return f"installed {vendor_id} to {libdir}"
 
 

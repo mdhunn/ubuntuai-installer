@@ -25,6 +25,12 @@ from repair import (
     format_plan as format_repair_plan,
     load_saved_plan,
 )
+from upgrade import (
+    build_plan_for as build_upgrade_plan,
+    execute_plan_steps as execute_upgrade_steps,
+    format_plan as format_upgrade_plan,
+    load_saved_plan as load_upgrade_plan,
+)
 from probe import probe
 from users import guess_user, target_for
 from runtime import (
@@ -108,8 +114,10 @@ def _installer_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
     wf_page = _workflows_page(win, hw, user, workflows, checks, status)
     wt_page = _weights_page(win, user, status)
     rp_page = _repair_page(win, user, status)
+    up_page = _upgrade_page(win, user, status)
     stack.add_titled(wf_page, "workflows", "Workflows")
     stack.add_titled(wt_page, "weights", "Weights")
+    stack.add_titled(up_page, "updates", "Updates")
     stack.add_titled(rp_page, "repair", "Repair")
     outer.append(stack)
     outer.append(status)
@@ -751,6 +759,83 @@ def _repair_page(win, user, status) -> Gtk.Widget:
     saved = load_saved_plan(user)
     if saved and saved.get("plan"):
         set_plan_text(str(saved.get("english") or format_repair_plan(saved["plan"])))
+    return page
+
+
+def _upgrade_page(win, user, status) -> Gtk.Widget:
+    import threading
+
+    page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    hint = Gtk.Label(
+        label=(
+            "Upgrade vendor runtimes that are not apt or snap, refresh catalog "
+            "models that drifted, and tune Lemonade for very large GGUF files. "
+            "Diagnose writes a plan. Nothing is applied until you approve."
+        ),
+        xalign=0,
+        wrap=True,
+    )
+    hint.add_css_class("dim-label")
+    page.append(hint)
+    plan_view = Gtk.TextView()
+    plan_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+    plan_view.set_editable(False)
+    page.append(_scroller(plan_view))
+    buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    exit_btn = Gtk.Button(label="Exit")
+    diag_btn = Gtk.Button(label="Diagnose")
+    approve_btn = Gtk.Button(label="Approve")
+    approve_btn.add_css_class("suggested-action")
+    buttons.append(exit_btn)
+    buttons.append(Gtk.Box(hexpand=True))
+    buttons.append(diag_btn)
+    buttons.append(approve_btn)
+    page.append(buttons)
+
+    def set_plan_text(text: str) -> None:
+        plan_view.get_buffer().set_text(text)
+
+    def do_diagnose() -> None:
+        def work() -> None:
+            try:
+                _diag, plan = build_upgrade_plan(user)
+                text = format_upgrade_plan(plan)
+            except Exception as exc:  # noqa: BLE001
+                text = f"Diagnose failed. {exc}"
+            GLib.idle_add(set_plan_text, text)
+            GLib.idle_add(
+                status.set_text,
+                "Review the update plan. Approve only if you accept every step.",
+            )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def do_approve() -> None:
+        saved = load_upgrade_plan(user)
+        if saved is None:
+            status.set_text("No update plan to approve. Diagnose first.")
+            return
+
+        def work() -> None:
+            try:
+                log = execute_upgrade_steps(user, saved.get("plan"))
+                GLib.idle_add(set_plan_text, "\n".join(log))
+                GLib.idle_add(status.set_text, "Updates finished. Diagnose again if you want a new plan.")
+            except ApplyError as exc:
+                GLib.idle_add(status.set_text, exc.english)
+                GLib.idle_add(_show_failure, win, exc.english, exc.technical)
+            except Exception as exc:  # noqa: BLE001
+                GLib.idle_add(status.set_text, f"Update failed. {exc}")
+                GLib.idle_add(_show_failure, win, "Update failed.", str(exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    exit_btn.connect("clicked", lambda *_: win.close())
+    diag_btn.connect("clicked", lambda *_: do_diagnose())
+    approve_btn.connect("clicked", lambda *_: do_approve())
+    saved = load_upgrade_plan(user)
+    if saved and saved.get("plan"):
+        set_plan_text(str(saved.get("english") or format_upgrade_plan(saved["plan"])))
     return page
 
 
