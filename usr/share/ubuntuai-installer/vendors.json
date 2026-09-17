@@ -1,0 +1,22 @@
+{
+  "openmoss": {
+    "title": "OpenMOSS moss-tts-server",
+    "version": "v0.3.0",
+    "binaries": ["moss-tts-server"],
+    "wrapper": "moss-tts-server",
+    "launcher": "ubuntuai-openmoss",
+    "port": 8081,
+    "archives": {
+      "vulkan": {
+        "url": "https://github.com/pwilkin/openmoss/releases/download/v0.3.0/moss-tts-vulkan-linux-x64.tar.gz",
+        "filename": "moss-tts-vulkan-linux-x64.tar.gz",
+        "bytes": 17810759
+      },
+      "rocm": {
+        "url": "https://github.com/pwilkin/openmoss/releases/download/v0.3.0/moss-tts-rocm-linux-x64.tar.gz",
+        "filename": "moss-tts-rocm-linux-x64.tar.gz",
+        "bytes": 44067054
+      }
+    }
+  }
+}

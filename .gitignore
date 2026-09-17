@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+/usr/share/polkit-1/actions/org.ubuntuai.pkexec.policy
+*.deb

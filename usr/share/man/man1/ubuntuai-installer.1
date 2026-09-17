@@ -1,0 +1,27 @@
+.TH UBUNTUAI-INSTALLER 1
+.SH NAME
+ubuntuai-installer \- add local-AI workstation packages to Ubuntu
+.SH SYNOPSIS
+.B ubuntuai-installer
+[\fI--list\fR]
+[\fI--dry-run\fR]
+[\fI--install\fR workflow ...]
+[\fI--scan-weights\fR]
+[\fI--scan-folder\fR dir]
+[\fI--add-scan-folder\fR dir]
+[\fI--organize-weights\fR link|copy|move]
+[\fI--remove-source\fR]
+[\fI--repair\fR]
+[\fI--repair-approve\fR]
+[\fI--repair-comment\fR text]
+[\fI--repair-advisor\fR classical|openai|local]
+[\fI--openai-uri\fR url]
+[\fI--openai-key\fR key]
+[\fI--list-downloads\fR]
+[\fI--download\fR id ...]
+[\fI--user\fR name]
+.SH DESCRIPTION
+Checkbox GUI over workflow groups. The Weights tab finds, copies or moves, and optionally downloads model files. Copy and move delete the original only after a checksum match. The checksum algorithm is the one published on the model download page when that page can be found. The Repair tab diagnoses config, vendor installs, and model checksums. It shows a plain-language plan. Approve is a separate action. The OpenAI advisor needs a URI and may need an API key. The desktop user is taken from the environment unless \fI--user\fR is passed.
+Does not convert the desktop flavor.
+.SH SEE ALSO
+ubuntuai-config(1), ubuntuai-validate(1)

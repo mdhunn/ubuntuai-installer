@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Ubuntu AI validate."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_CANDIDATES = (
+    Path("/usr/local/share/ubuntuai-installer"),
+    Path("/usr/share/ubuntuai-installer"),
+    Path(__file__).resolve().parents[1] / "share" / "ubuntuai-installer",
+)
+for _pkg in _CANDIDATES:
+    if (_pkg / "main.py").is_file():
+        sys.path.insert(0, str(_pkg))
+        break
+
+from main import validate_main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(validate_main())

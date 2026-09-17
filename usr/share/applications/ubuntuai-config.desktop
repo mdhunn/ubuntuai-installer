@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Ubuntu AI Configuration
+Comment=Tune local-AI backend, model root, and bind address
+Exec=ubuntuai-config
+Icon=ubuntuai-installer
+Terminal=false
+Type=Application
+Categories=System;Settings;
+Keywords=AI;LLM;Vulkan;NPU;
+StartupNotify=true
