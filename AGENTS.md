@@ -74,6 +74,7 @@ Install copies `usr/` into `PREFIX`. Keep runtime paths working from a source tr
 15. Checksums come from the download page. Parse `oid sha256:`, GitHub `digest`, HTML labels, and sidecar `.md5` / `.sha256` / `.sha1` / `.sha512`. Verify with `hashlib.new(algo)`. Copy/move of local files still compares both sides so a mismatch cannot delete the original.
 16. Repair plans are shown as plain English plus a numbered list. `repair-plan.json` is an implementation file. It is not the user interface.
 17. The OpenAI repair path takes a URI and an API key. Both can come from the GUI, `--openai-uri` / `--openai-key`, config, or `OPENAI_BASE_URL` / `OPENAI_API_KEY`.
+18. Apply failures show a plain-English reason first. Technical logs (helper command, exit code, apt text) are behind a details expander in the GUI and after a "Technical details" heading on the CLI. Capture helper stdout and stderr. Do not stop at `failed with 1`.
 
 ## How to change a workflow
 

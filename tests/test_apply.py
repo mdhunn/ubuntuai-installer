@@ -8,7 +8,15 @@ from unittest.mock import patch
 
 from support import PKG
 
-from apply import PKG_RE, assert_model_root, build_plan
+from apply import (
+    ApplyError,
+    PKG_RE,
+    assert_model_root,
+    build_plan,
+    execute_plan,
+    explain_apt_failure,
+    format_failure,
+)
 from catalog import load_workflows
 from domain import Device, Hardware, UserTarget
 
@@ -135,9 +143,44 @@ class ApplyTests(unittest.TestCase):
                 weight_ids.extend(a.payload)
         self.assertIn("whisper-base-en", weight_ids)
 
-    def test_dry_run_does_not_write(self) -> None:
-        from apply import execute_plan
+    def test_explain_apt_lock_is_english(self) -> None:
+        msg = explain_apt_failure(
+            "E: Could not get lock /var/lib/dpkg/lock-frontend",
+            100,
+        )
+        self.assertIn("another install is running", msg.lower())
+        self.assertNotIn("100", msg)
 
+    def test_explain_apt_conflict_is_english(self) -> None:
+        msg = explain_apt_failure(
+            "The following packages have unmet dependencies:\n libfoo : Conflicts: libbar",
+            100,
+        )
+        self.assertTrue("clash" in msg.lower() or "conflict" in msg.lower())
+
+    def test_execute_plan_apt_failure_keeps_details(self) -> None:
+        with patch("apply.dpkg_installed", return_value=False), patch(
+            "apply.user_in_group", return_value=True
+        ):
+            actions = build_plan(
+                ("ubuntuai-chat",),
+                _hw_strix(),
+                self.target,
+                self.wfs,
+            )
+        apt_log = "E: Unable to locate package llama.cpp-tools"
+        with patch("apply.run_privileged", return_value=(100, apt_log)):
+            with self.assertRaises(ApplyError) as ctx:
+                execute_plan(actions, self.target, hw=_hw_strix(), dry_run=False)
+        err = ctx.exception
+        self.assertIn("does not know", err.english)
+        self.assertIn("Unable to locate package", err.technical)
+        self.assertIn("exit: 100", err.technical)
+        text = format_failure(err)
+        self.assertIn("Technical details:", text)
+        self.assertTrue(text.startswith(err.english))
+
+    def test_dry_run_does_not_write(self) -> None:
         t = self.target
         with patch("apply.dpkg_installed", return_value=True), patch(
             "apply.user_in_group", return_value=True

@@ -10,7 +10,14 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from apply import build_plan, execute_plan, run_privileged
+from apply import (
+    ApplyError,
+    _technical_block,
+    build_plan,
+    execute_plan,
+    explain_helper_failure,
+    run_privileged,
+)
 from catalog import load_workflows
 from configstore import load as load_config
 from configstore import save as save_config
@@ -639,15 +646,27 @@ def execute_plan_steps(
         if on_progress:
             on_progress(f"Repair: {kind}")
         if kind == "write_core":
-            rc = run_privileged(
+            rc, out = run_privileged(
                 "core-files",
                 [t.name, str(t.model_root), t.bind],
                 dry_run=False,
             )
             if rc != 0:
-                log.append(f"write_core failed with {rc}")
-            else:
-                log.append("wrote core files")
+                raise ApplyError(
+                    explain_helper_failure("core-files", out, rc),
+                    _technical_block(
+                        [
+                            "ubuntuai-installer-helper",
+                            "core-files",
+                            t.name,
+                            str(t.model_root),
+                            t.bind,
+                        ],
+                        rc,
+                        out,
+                    ),
+                )
+            log.append("wrote core files")
             continue
         if kind == "fix_bind":
             bind = step.get("bind") or "127.0.0.1"

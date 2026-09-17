@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -23,7 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from apply import build_plan, execute_plan, format_plan
+from apply import ApplyError, build_plan, execute_plan, format_plan
 from catalog import load_workflows, recommended_ids
 from configstore import add_scan_folder
 from configstore import load as load_config
@@ -107,6 +108,16 @@ def _installer_widget(win: QMainWindow) -> QWidget:
     return root
 
 
+def _show_failure(win, english: str, technical: str = "") -> None:
+    box = QMessageBox(win)
+    box.setIcon(QMessageBox.Icon.Critical)
+    box.setWindowTitle("Install failed")
+    box.setText(english)
+    if technical.strip():
+        box.setDetailedText(technical)
+    box.exec()
+
+
 def _qt_workflows(win, hw, user, workflows, status) -> QWidget:
     page = QWidget()
     layout = QVBoxLayout(page)
@@ -153,8 +164,13 @@ def _qt_workflows(win, hw, user, workflows, status) -> QWidget:
             return
         try:
             execute_plan(actions, t, hw=hw, dry_run=False)
+        except ApplyError as exc:
+            status.setText(exc.english)
+            _show_failure(win, exc.english, exc.technical)
+            return
         except Exception as exc:  # noqa: BLE001
             status.setText(f"Apply failed. {exc}")
+            _show_failure(win, "Apply failed.", str(exc))
             return
         status.setText(
             format_checks(collect(t, hw))
@@ -379,7 +395,14 @@ def _qt_weights(win, user, status) -> QWidget:
                     download(catalog[mid], t.model_root, uid=t.uid, gid=t.gid)
                 )
             except Exception as exc:  # noqa: BLE001
-                lines.append(f"{mid}: {exc}")
+                english = (
+                    "A downloaded model file did not match its published checksum. "
+                    "The broken file was not kept."
+                    if "mismatch" in str(exc).lower()
+                    else "Could not download a selected model file."
+                )
+                lines.append(english)
+                _show_failure(win, english, str(exc))
         status.setText("\n".join(lines))
         refill_downloads()
         refill_found()
@@ -487,8 +510,12 @@ def _qt_repair(win, user, status) -> QWidget:
             log = execute_plan_steps(user, saved.get("plan"))
             plan_view.setPlainText("\n".join(log))
             status.setText("Repair steps finished.")
+        except ApplyError as exc:
+            status.setText(exc.english)
+            _show_failure(win, exc.english, exc.technical)
         except Exception as exc:  # noqa: BLE001
             status.setText(f"Repair failed. {exc}")
+            _show_failure(win, "Repair failed.", str(exc))
 
     exit_btn.clicked.connect(win.close)
     diag_btn.clicked.connect(lambda: do_diagnose(""))

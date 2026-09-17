@@ -16,6 +16,8 @@ Never write a login name in docs, comments, or tests. The seated user comes from
 
 Repair text shown to a human is sentences. JSON keys and step kinds stay in `repair.py`. The GUI and CLI print `format_plan()`, not the saved JSON.
 
+A failed Apply prints English first. Exit codes, apt logs, and helper command lines belong in technical details, not in the heading.
+
 Checksum copy in the UI is "checksum". Name an algorithm only when a download page published that algorithm.
 
 Comments exist only for a non-obvious why. No phase labels. No narration of the next line.

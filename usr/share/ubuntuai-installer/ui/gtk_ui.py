@@ -10,7 +10,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
-from apply import build_plan, execute_plan, format_plan
+from apply import ApplyError, build_plan, execute_plan, format_plan
 from catalog import load_workflows, recommended_ids
 from configstore import add_scan_folder
 from configstore import load as load_config
@@ -127,6 +127,41 @@ def _check_row(title: str, summary: str, check: Gtk.CheckButton) -> Gtk.Widget:
     return row
 
 
+def _show_failure(win, english: str, technical: str = "") -> None:
+    dialog = Gtk.Window(transient_for=win, modal=True, title="Install failed")
+    dialog.set_default_size(560, 280)
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    outer.set_margin_top(16)
+    outer.set_margin_bottom(16)
+    outer.set_margin_start(16)
+    outer.set_margin_end(16)
+    body = Gtk.Label(label=english, wrap=True, xalign=0)
+    body.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+    outer.append(body)
+    if technical.strip():
+        expander = Gtk.Expander(label="Technical details")
+        view = Gtk.TextView()
+        view.set_editable(False)
+        view.set_cursor_visible(False)
+        view.set_monospace(True)
+        view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        view.get_buffer().set_text(technical)
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        scroll.set_min_content_height(140)
+        scroll.set_child(view)
+        expander.set_child(scroll)
+        outer.append(expander)
+    ok = Gtk.Button(label="OK")
+    ok.add_css_class("suggested-action")
+    ok.connect("clicked", lambda *_: dialog.close())
+    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+    row.append(Gtk.Box(hexpand=True))
+    row.append(ok)
+    outer.append(row)
+    dialog.set_child(outer)
+    dialog.present()
+
+
 def _scroller(child: Gtk.Widget) -> Gtk.ScrolledWindow:
     scroller = Gtk.ScrolledWindow(vexpand=True)
     scroller.set_overlay_scrolling(False)
@@ -187,8 +222,13 @@ def _workflows_page(win, hw, user, workflows, checks, status) -> Gtk.Widget:
                     dry_run=False,
                     on_progress=lambda msg: GLib.idle_add(status.set_text, str(msg)),
                 )
+            except ApplyError as exc:
+                GLib.idle_add(status.set_text, exc.english)
+                GLib.idle_add(_show_failure, win, exc.english, exc.technical)
+                return
             except Exception as exc:  # noqa: BLE001
                 GLib.idle_add(status.set_text, f"Apply failed. {exc}")
+                GLib.idle_add(_show_failure, win, "Apply failed.", str(exc))
                 return
             report = collect(t, hw)
             extra = ""
@@ -474,7 +514,14 @@ def _weights_page(win, user, status) -> Gtk.Widget:
                         )
                     )
                 except Exception as exc:  # noqa: BLE001
-                    lines.append(f"{mid}: {exc}")
+                    english = (
+                        "A downloaded model file did not match its published checksum. "
+                        "The broken file was not kept."
+                        if "mismatch" in str(exc).lower()
+                        else "Could not download a selected model file."
+                    )
+                    lines.append(english)
+                    GLib.idle_add(_show_failure, win, english, str(exc))
             def finish() -> None:
                 status.set_text("\n".join(lines))
                 refill_downloads()
@@ -618,8 +665,12 @@ def _repair_page(win, user, status) -> Gtk.Widget:
                 )
                 GLib.idle_add(set_plan_text, "\n".join(log))
                 GLib.idle_add(status.set_text, "Repair steps finished. Re-diagnose if you want a new plan.")
+            except ApplyError as exc:
+                GLib.idle_add(status.set_text, exc.english)
+                GLib.idle_add(_show_failure, win, exc.english, exc.technical)
             except Exception as exc:  # noqa: BLE001
                 GLib.idle_add(status.set_text, f"Repair failed. {exc}")
+                GLib.idle_add(_show_failure, win, "Repair failed.", str(exc))
 
         threading.Thread(target=work, daemon=True).start()
 

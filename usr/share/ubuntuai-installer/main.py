@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from apply import build_plan, execute_plan, format_plan
+from apply import ApplyError, build_plan, execute_plan, format_failure, format_plan
 from catalog import load_workflows, recommended_ids
 from configstore import add_scan_folder
 from configstore import load as load_config
@@ -110,7 +110,11 @@ def cmd_plan(user: str, selected: tuple[str, ...], dry_run: bool) -> int:
     print(format_plan(actions))
     if dry_run:
         return 0
-    log = execute_plan(actions, t, hw=hw, dry_run=False)
+    try:
+        log = execute_plan(actions, t, hw=hw, dry_run=False)
+    except ApplyError as exc:
+        print(format_failure(exc), file=sys.stderr)
+        return 1
     for line in log:
         print(line)
     print()
@@ -224,7 +228,11 @@ def cmd_repair(
         if saved is None:
             print("no saved repair plan. run --repair first.", file=sys.stderr)
             return 2
-        log = execute_plan_steps(user, saved.get("plan"), dry_run=dry_run)
+        try:
+            log = execute_plan_steps(user, saved.get("plan"), dry_run=dry_run)
+        except ApplyError as exc:
+            print(format_failure(exc), file=sys.stderr)
+            return 1
         for line in log:
             print(line)
         return 0

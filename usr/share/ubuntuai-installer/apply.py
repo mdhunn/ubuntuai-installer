@@ -162,19 +162,92 @@ def format_plan(actions: tuple[Action, ...]) -> str:
     return "\n".join(lines) if lines else "- nothing to do"
 
 
-def run_privileged(verb: str, args: list[str], *, dry_run: bool = False) -> int:
+class ApplyError(RuntimeError):
+    def __init__(self, english: str, technical: str = "") -> None:
+        super().__init__(english)
+        self.english = english
+        self.technical = (technical or "").strip()
+
+
+def format_failure(err: ApplyError) -> str:
+    lines = [err.english]
+    if err.technical:
+        lines.extend(["", "Technical details:", err.technical])
+    return "\n".join(lines)
+
+
+def explain_apt_failure(output: str, rc: int) -> str:
+    text = (output or "").lower()
+    if "could not get lock" in text or "unable to acquire the dpkg frontend lock" in text:
+        return (
+            "Could not install packages because another install is running. "
+            "Wait for it to finish, then try again."
+        )
+    if "unmet dependencies" in text or ("depends:" in text and "but it is not" in text):
+        return (
+            "Could not install the Ubuntu packages. "
+            "Some required packages are missing or clash with what is already installed."
+        )
+    if "conflict" in text:
+        return (
+            "Could not install the Ubuntu packages. "
+            "apt reported a conflict between packages."
+        )
+    if "no space" in text or "not enough space" in text:
+        return "Could not install the Ubuntu packages. The disk is full."
+    if "unable to locate package" in text or "has no installation candidate" in text:
+        return (
+            "Could not install the Ubuntu packages. "
+            "apt does not know one of the package names."
+        )
+    if "network" in text or "temporary failure resolving" in text or "404" in text:
+        return "Could not install the Ubuntu packages. A download or network step failed."
+    if rc in {126, 127} or "not authorized" in text or "dismissed" in text:
+        return "Administrator permission was not granted."
+    if not (output or "").strip():
+        return (
+            "Could not install the Ubuntu packages. "
+            "The privileged helper failed with no extra text. Open technical details for the exit code."
+        )
+    return "Could not install the Ubuntu packages. apt refused the request."
+
+
+def explain_helper_failure(verb: str, output: str, rc: int) -> str:
+    text = (output or "").lower()
+    if rc in {126, 127} or "not authorized" in text or "dismissed" in text:
+        return "Administrator permission was not granted."
+    if verb == "install":
+        return explain_apt_failure(output, rc)
+    if verb == "groups":
+        return "Could not add this user to the device groups."
+    if verb == "core-files":
+        return "Could not write the installer core files (environment, memlock, and PATH)."
+    return "The privileged install step failed."
+
+
+def _technical_block(cmd: list[str], rc: int, output: str) -> str:
+    lines = ["command: " + " ".join(cmd), f"exit: {rc}"]
+    if output.strip():
+        lines.extend(["", output.strip()])
+    return "\n".join(lines)
+
+
+def run_privileged(verb: str, args: list[str], *, dry_run: bool = False) -> tuple[int, str]:
     if dry_run:
-        return 0
+        return 0, ""
     helper = helper_path()
     cmd = [str(helper), verb, *args]
-    if os.geteuid() == 0:
-        p = subprocess.run(cmd, check=False)
-        return p.returncode
-    pkexec = shutil.which("pkexec")
-    if not pkexec:
-        raise RuntimeError("root or pkexec is required to apply system changes")
-    p = subprocess.run([pkexec, *cmd], check=False)
-    return p.returncode
+    if os.geteuid() != 0:
+        pkexec = shutil.which("pkexec")
+        if not pkexec:
+            raise ApplyError(
+                "Administrator permission is required to change system files. "
+                "Install pkexec or run the installer as root."
+            )
+        cmd = [pkexec, *cmd]
+    p = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    out = (p.stdout or "") + (p.stderr or "")
+    return p.returncode, out
 
 
 def execute_plan(
@@ -194,23 +267,42 @@ def execute_plan(
             continue
         if action.kind == "apt_install":
             log.append("apt install " + " ".join(action.payload))
-            rc = run_privileged("install", list(action.payload), dry_run=dry_run)
+            rc, out = run_privileged("install", list(action.payload), dry_run=dry_run)
             if rc != 0:
-                raise RuntimeError(f"apt install failed with {rc}")
+                raise ApplyError(
+                    explain_helper_failure("install", out, rc),
+                    _technical_block(
+                        ["ubuntuai-installer-helper", "install", *action.payload],
+                        rc,
+                        out,
+                    ),
+                )
             continue
         if action.kind == "groups":
             log.append(f"usermod -aG {','.join(action.payload)} {target.name}")
-            rc = run_privileged(
+            rc, out = run_privileged(
                 "groups",
                 [target.name, *action.payload],
                 dry_run=dry_run,
             )
             if rc != 0:
-                raise RuntimeError(f"group update failed with {rc}")
+                raise ApplyError(
+                    explain_helper_failure("groups", out, rc),
+                    _technical_block(
+                        [
+                            "ubuntuai-installer-helper",
+                            "groups",
+                            target.name,
+                            *action.payload,
+                        ],
+                        rc,
+                        out,
+                    ),
+                )
             continue
         if action.kind == "core_files":
             log.append(f"write {ENV_FILE}, {LIMITS_FILE}, {PROFILE_FILE}")
-            rc = run_privileged(
+            rc, out = run_privileged(
                 "core-files",
                 [
                     target.name,
@@ -220,7 +312,20 @@ def execute_plan(
                 dry_run=dry_run,
             )
             if rc != 0:
-                raise RuntimeError(f"core file write failed with {rc}")
+                raise ApplyError(
+                    explain_helper_failure("core-files", out, rc),
+                    _technical_block(
+                        [
+                            "ubuntuai-installer-helper",
+                            "core-files",
+                            target.name,
+                            str(model_root),
+                            target.bind,
+                        ],
+                        rc,
+                        out,
+                    ),
+                )
             continue
         if action.kind == "model_dirs":
             log.append(f"mkdir {model_root} / " + ",".join(action.payload))
@@ -230,16 +335,24 @@ def execute_plan(
         if action.kind == "vendor":
             vendor_id = action.payload[0]
             if hw is None:
-                raise RuntimeError("vendor install needs a hardware probe")
+                raise ApplyError(
+                    "Could not install the extra runtime. Hardware probe is missing."
+                )
             if on_progress:
                 on_progress(f"Installing {vendor_id}")
-            msg = install_vendor(
-                vendor_id,
-                hw,
-                target,
-                on_progress=on_progress,
-                dry_run=dry_run,
-            )
+            try:
+                msg = install_vendor(
+                    vendor_id,
+                    hw,
+                    target,
+                    on_progress=on_progress,
+                    dry_run=dry_run,
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise ApplyError(
+                    "Could not install the extra runtime into your home folder.",
+                    str(exc),
+                ) from exc
             log.append(msg)
             continue
         if action.kind == "weights":
@@ -248,19 +361,32 @@ def execute_plan(
             for wid in action.payload:
                 model = catalog.get(wid)
                 if model is None:
-                    raise KeyError(f"unknown weight {wid}")
+                    raise ApplyError(
+                        f"Could not find the model catalog entry {wid}.",
+                    )
                 if on_progress:
                     on_progress(f"Ensuring {model.filename}")
-                msg = ensure_weight(
-                    model,
-                    target,
-                    extra,
-                    on_progress=on_progress,
-                    dry_run=dry_run,
-                )
+                try:
+                    msg = ensure_weight(
+                        model,
+                        target,
+                        extra,
+                        on_progress=on_progress,
+                        dry_run=dry_run,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    detail = str(exc)
+                    if "mismatch" in detail.lower():
+                        english = (
+                            "A downloaded model file did not match the checksum "
+                            "published on its page. The broken file was not kept."
+                        )
+                    else:
+                        english = "Could not get a required model file."
+                    raise ApplyError(english, detail) from exc
                 log.append(msg)
             continue
-        raise RuntimeError(f"unknown action {action.kind}")
+        raise ApplyError(f"The installer does not know how to run step {action.kind}.")
     if not dry_run:
         _write_user_config(target, model_root)
     return log
@@ -339,19 +465,22 @@ def add_user_to_groups(user: str, groups: list[str]) -> None:
             raise ValueError(f"illegal group {g!r}")
     if not groups:
         return
-    subprocess.run(
+    p = subprocess.run(
         ["usermod", "-aG", ",".join(groups), user],
-        check=True,
+        check=False,
     )
+    if p.returncode != 0:
+        raise SystemExit(p.returncode)
 
 
 def apt_install(packages: list[str]) -> None:
     pkgs = [_assert_pkg(p) for p in packages]
     env = os.environ.copy()
     env["DEBIAN_FRONTEND"] = "noninteractive"
-    subprocess.run(["apt-get", "update"], check=True, env=env)
-    subprocess.run(
+    for cmd in (
+        ["apt-get", "update"],
         ["apt-get", "install", "-y", "--no-install-recommends", *pkgs],
-        check=True,
-        env=env,
-    )
+    ):
+        p = subprocess.run(cmd, check=False, env=env)
+        if p.returncode != 0:
+            raise SystemExit(p.returncode)
