@@ -300,7 +300,10 @@ def load_tuning(hw, largest_bytes: int) -> dict[str, object]:
     ram = max(int(getattr(hw, "ram_bytes", 0) or 0), 1)
     frac = largest_bytes / ram
     backends = hw.backends() if hasattr(hw, "backends") else set()
-    if "rocm" in backends:
+    # Strix Halo / gfx115x chat stays on Vulkan. See lemonade#3610, llama.cpp#28211.
+    if hasattr(hw, "strix_halo_class") and hw.strix_halo_class():
+        backend = "vulkan"
+    elif "rocm" in backends:
         backend = "rocm"
     elif "vulkan" in backends:
         backend = "vulkan"

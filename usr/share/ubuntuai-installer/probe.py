@@ -9,7 +9,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from domain import Device, Hardware
+from domain import Device, Hardware, strix_halo_name
 
 NPU_FIRMWARE_LINK = Path("/lib/firmware/amdnpu/17f0_11/npu.sbin.zst")
 NPU_FIRMWARE_LINK_PLAIN = Path("/lib/firmware/amdnpu/17f0_11/npu.sbin")
@@ -56,13 +56,28 @@ def _lspci(text: str | None = None) -> str:
     return _run(["lspci", "-nn"])
 
 
+def _rocminfo_present(injected: bool | None) -> bool:
+    if injected is not None:
+        return bool(injected)
+    return shutil.which("rocminfo") is not None
+
+
+def _gfx_is_strix_halo(gfx: str | None) -> bool:
+    if not gfx:
+        return False
+    return gfx.lower().replace(" ", "").startswith("gfx115")
+
+
 def _parse_lspci(
     text: str,
     *,
     npu_firmware_link: Path | None = None,
     npu_accel_node: Path | None = None,
+    rocminfo: bool = False,
+    gfx: str | None = None,
 ) -> list[Device]:
     devices: list[Device] = []
+    gfx_strix = _gfx_is_strix_halo(gfx)
     for line in text.splitlines():
         lower = line.lower()
         if f"[{AMD_SYS}:{NPU_DEV}]" in lower or "neural processing unit" in lower:
@@ -92,19 +107,27 @@ def _parse_lspci(
             )
             continue
         if f"[{AMD_GPU}:" in line and _is_display(lower):
-            rocm = shutil.which("rocminfo") is not None
+            name = _strip_pci(line)
             node = _first_existing(("/dev/dri/renderD128", "/dev/kfd"))
-            kind = "igpu" if "strix" in lower or "radeon 80" in lower else "dgpu"
-            if "strix halo" in lower or "8060s" in lower or "8050s" in lower:
-                kind = "igpu"
+            vulkan_first = strix_halo_name(lower) or gfx_strix
+            kind = "igpu" if vulkan_first else "dgpu"
+            if vulkan_first:
+                backend = "vulkan"
+                detail = "Vulkan (Mesa)"
+            elif rocminfo:
+                backend = "rocm"
+                detail = "ROCm"
+            else:
+                backend = "vulkan"
+                detail = "Vulkan (Mesa)"
             devices.append(
                 Device(
                     kind=kind,
                     vendor="amd",
-                    name=_strip_pci(line),
+                    name=name,
                     node=node,
-                    backend="rocm" if rocm else "vulkan",
-                    detail="ROCm" if rocm else "Vulkan (Mesa)",
+                    backend=backend,
+                    detail=detail,
                 )
             )
             continue
@@ -330,11 +353,29 @@ def _pair_disk_name(newer: Path, siblings: tuple[Path, ...]) -> str:
     return newer.name
 
 
-def _notes(devices: list[Device]) -> tuple[str, ...]:
+def _notes(
+    devices: list[Device],
+    *,
+    rocminfo: bool = False,
+    gfx: str | None = None,
+) -> tuple[str, ...]:
     notes: list[str] = []
+    gfx_strix = _gfx_is_strix_halo(gfx)
     for d in devices:
-        if d.kind in {"igpu", "dgpu"} and d.vendor == "amd" and d.backend == "vulkan":
-            if Path("/dev/kfd").exists():
+        vulkan_first = (
+            d.vendor == "amd"
+            and d.kind in {"igpu", "dgpu"}
+            and (strix_halo_name(d.name) or gfx_strix)
+        )
+        if vulkan_first and d.backend == "vulkan":
+            notes.append(
+                "Chat on this AMD iGPU uses Vulkan. "
+                "ROCm is not the chat default. "
+                "llama.cpp HIP still misses gfx1150. "
+                "libgomp on this silicon is a known pain."
+            )
+        elif d.kind in {"igpu", "dgpu"} and d.vendor == "amd" and d.backend == "vulkan":
+            if Path("/dev/kfd").exists() and not rocminfo:
                 notes.append(
                     "/dev/kfd is present. rocminfo is not. GPU inference uses Vulkan."
                 )
@@ -433,18 +474,24 @@ def probe(
     meminfo: str | None = None,
     npu_firmware_link: Path | None = None,
     npu_accel_node: Path | None = None,
+    rocminfo: bool | None = None,
+    gfx: str | None = None,
 ) -> Hardware:
     cpu = _cpu_name(cpuinfo)
     ram = _ram_bytes(meminfo)
+    have_rocminfo = _rocminfo_present(rocminfo)
     devices = _parse_lspci(
         _lspci(lspci_text),
         npu_firmware_link=npu_firmware_link,
         npu_accel_node=npu_accel_node,
+        rocminfo=have_rocminfo,
+        gfx=gfx,
     )
     devices = _ensure_cpu_device(cpu, devices)
     return Hardware(
         cpu_name=cpu,
         ram_bytes=ram,
         devices=tuple(devices),
-        notes=_notes(devices),
+        notes=_notes(devices, rocminfo=have_rocminfo, gfx=gfx),
+        gfx=gfx or "",
     )

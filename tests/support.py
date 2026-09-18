@@ -18,5 +18,13 @@ NVIDIA_LSPCI = """
 01:00.0 VGA compatible controller [0300]: NVIDIA Corporation GA104 [GeForce RTX 3070] [10de:2484] (rev a1)
 """.strip()
 
+RX7900_LSPCI = """
+03:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XT/7900 XTX] [1002:744c] (rev c8)
+""".strip()
+
+GENERIC_AMD_LSPCI = """
+01:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Radeon Graphics [1002:15bf] (rev c1)
+""".strip()
+
 CPUINFO = "model name\t: AMD RYZEN AI MAX+ 395 w/ Radeon 8060S\n"
 MEMINFO = "MemTotal:       128000000 kB\n"
