@@ -41,8 +41,9 @@ def _log_owner(uid: int | None, gid: int | None) -> tuple[int, int]:
 
 def _own_log_paths(path: Path, last: Path, folder: Path, home: Path, uid: int, gid: int) -> None:
     os.chown(path, uid, gid)
-    if last.exists() and not last.is_symlink():
-        os.chown(last, uid, gid)
+    if last.exists(follow_symlinks=False):
+        # last.log is usually a symlink. Default chown follows and leaves the inode root-owned.
+        os.chown(last, uid, gid, follow_symlinks=False)
     home_r = home.resolve()
     cur = folder
     while True:

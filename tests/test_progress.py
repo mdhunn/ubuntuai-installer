@@ -74,6 +74,37 @@ class ProgressTests(unittest.TestCase):
             self.assertIn(home / ".local" / "share" / "ubuntuai", paths)
             self.assertTrue(all(u == 4242 and g == 4243 for _, u, g in owned))
 
+    def test_new_apply_log_chowns_last_log_symlink_inode(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch("progress.os.chown") as chown:
+                path = new_apply_log(home, uid=4242, gid=4243)
+            last = apply_log_dir(home) / "last.log"
+            self.assertTrue(last.is_symlink())
+            self.assertEqual(last.readlink(), Path(path.name))
+            last_calls = [c for c in chown.call_args_list if c.args[0] == last]
+            self.assertEqual(len(last_calls), 1)
+            self.assertEqual(last_calls[0].args[1], 4242)
+            self.assertEqual(last_calls[0].args[2], 4243)
+            self.assertIs(last_calls[0].kwargs.get("follow_symlinks"), False)
+            path_calls = [c for c in chown.call_args_list if c.args[0] == path]
+            self.assertTrue(path_calls)
+            self.assertNotIn("follow_symlinks", path_calls[0].kwargs)
+
+    def test_new_apply_log_chowns_regular_last_log(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch.object(Path, "symlink_to", side_effect=OSError("no symlink")):
+                with patch("progress.os.chown") as chown:
+                    new_apply_log(home, uid=4242, gid=4243)
+            last = apply_log_dir(home) / "last.log"
+            self.assertTrue(last.is_file())
+            self.assertFalse(last.is_symlink())
+            last_calls = [c for c in chown.call_args_list if c.args[0] == last]
+            self.assertEqual(len(last_calls), 1)
+            self.assertEqual(last_calls[0].args[1], 4242)
+            self.assertEqual(last_calls[0].args[2], 4243)
+
     def test_new_apply_log_uses_guess_user_when_ids_omitted(self) -> None:
         with TemporaryDirectory() as tmp:
             home = Path(tmp)
