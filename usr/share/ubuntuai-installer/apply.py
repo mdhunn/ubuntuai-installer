@@ -328,7 +328,9 @@ def execute_plan(
     work = [a for a in actions if a.kind != "skip"]
     total_steps = max(len(work), 1)
     step_i = 0
-    log_path = None if dry_run else new_apply_log(target.home)
+    log_path = None if dry_run else new_apply_log(
+        target.home, uid=target.uid, gid=target.gid
+    )
     if log_path is not None:
         log.append(f"log {log_path}")
 
