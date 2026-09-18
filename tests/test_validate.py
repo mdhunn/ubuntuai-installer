@@ -9,6 +9,8 @@ from tempfile import TemporaryDirectory
 
 from support import CPUINFO, MEMINFO, STRIX_LSPCI
 
+from unittest.mock import patch
+
 from catalog import by_id, load_workflows, recommended_ids
 from domain import Device, Hardware, UserTarget
 from probe import HYBRID_FLM_MISSING, probe
@@ -116,6 +118,18 @@ class ValidateCollectHybridTests(unittest.TestCase):
     def test_collect_skips_hybrid_warning_without_xdna(self) -> None:
         checks = collect(_target(), _cpu(), which=lambda name: None)
         self.assertEqual(_named(checks, "fastflowlm"), [])
+
+    def test_collect_warns_on_huge_lemonade_load(self) -> None:
+        with (
+            patch("validate.lemonade_detect", return_value="snap"),
+            patch("validate.largest_gguf_bytes", return_value=105 * 1024**3),
+        ):
+            checks = collect(_target(), _strix(), which=lambda name: None)
+        load = _named(checks, "lemonade-load")
+        self.assertEqual(len(load), 1)
+        self.assertEqual(load[0].status, "warn")
+        self.assertIn("Strong warning", load[0].detail)
+        self.assertNotEqual(load[0].status, "fail")
 
 
 class ChatNotGatedByFlmTests(unittest.TestCase):

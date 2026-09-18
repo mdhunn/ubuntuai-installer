@@ -8,22 +8,32 @@ from unittest.mock import patch
 
 from support import PKG  # noqa: F401
 
-from domain import Action, UserTarget
+from domain import Action, Device, Hardware, UserTarget
 from lemonade import (
     APPLY_PUBLISH_VERB,
     BindMount,
+    HUGE_GGUF_BYTES,
+    LLAMACPP_MMAP_ARGS,
+    LOAD_RISK_POLICY,
     OWNED_UNIT_DESC,
     _drop_bind_unit,
     bind_mounts,
+    cli_tuning_parts,
     detect,
     extra_dir,
     gguf_sources,
     is_owned_lemonade_where,
+    largest_gguf_bytes,
     leftover_owned_binds,
+    load_risk,
+    load_tuning,
     mount_unit_text,
     owned_bind_wheres,
     publish,
     quote_unit_path,
+    report_load_tuning,
+    risk_english,
+    verify_tuning,
 )
 from paths import (
     SNAP_LEMONADE_MODELS,
@@ -281,6 +291,7 @@ class LemonadePublishTests(unittest.TestCase):
                 patch("lemonade._write_bind_unit", side_effect=record_bind),
                 patch("lemonade._set_extra_models_dir", side_effect=extras.append),
                 patch("lemonade._restart_snap"),
+                patch("lemonade.report_load_tuning", return_value=""),
             ):
                 msg = publish(_target(home))
             self.assertEqual(binds, [(real.resolve(), dest)])
@@ -309,6 +320,7 @@ class LemonadePublishTests(unittest.TestCase):
                 patch("lemonade._write_bind_unit", side_effect=record_bind),
                 patch("lemonade._set_extra_models_dir"),
                 patch("lemonade._restart_snap"),
+                patch("lemonade.report_load_tuning", return_value=""),
             ):
                 msg = publish(_target(home, extra=(extra,), model_root=store))
             self.assertEqual(binds, [(extra.resolve(), dest)])
@@ -336,6 +348,7 @@ class LemonadePublishTests(unittest.TestCase):
                 patch("lemonade._write_bind_unit", side_effect=record_bind),
                 patch("lemonade._set_extra_models_dir"),
                 patch("lemonade._restart_snap"),
+                patch("lemonade.report_load_tuning", return_value=""),
             ):
                 msg = publish(_target(home, extra=(extra,), model_root=home / "Models"))
             self.assertEqual(
@@ -526,6 +539,7 @@ class LemonadePublishTests(unittest.TestCase):
                 patch("lemonade._write_bind_unit", side_effect=record_bind),
                 patch("lemonade._set_extra_models_dir"),
                 patch("lemonade._restart_snap"),
+                patch("lemonade.report_load_tuning", return_value=""),
             ):
                 publish(_target(home, extra=(extra,), model_root=store))
             self.assertEqual(binds, [(extra.resolve(), dest)])
@@ -568,6 +582,7 @@ class LemonadePublishTests(unittest.TestCase):
                 patch("lemonade._write_bind_unit", return_value="unit.mount"),
                 patch("lemonade._set_extra_models_dir"),
                 patch("lemonade._restart_snap"),
+                patch("lemonade.report_load_tuning", return_value=""),
             ):
                 publish(_target(home, extra=(extra,), model_root=home / "Models"))
             self.assertEqual([path.resolve() for path in dropped], [src2.resolve()])
@@ -604,6 +619,7 @@ class LemonadePublishTests(unittest.TestCase):
                 patch("lemonade._write_bind_unit", side_effect=record_bind),
                 patch("lemonade._set_extra_models_dir"),
                 patch("lemonade._restart_snap"),
+                patch("lemonade.report_load_tuning", return_value=""),
             ):
                 publish(_target(home, extra=(extra,), model_root=home / "Models"))
             self.assertEqual([path.resolve() for path in dropped], [dest.resolve()])
@@ -647,6 +663,210 @@ class LemonadePublishTests(unittest.TestCase):
         self.assertEqual(APPLY_PUBLISH_VERB, "lemonade-publish")
         action = Action("lemonade", "publish GGUF files to Lemonade", ("owner",))
         self.assertEqual(action.kind, "lemonade")
+
+
+def _vulkan_igpu(ram_gib: int = 122) -> Hardware:
+    return Hardware(
+        cpu_name="strix",
+        ram_bytes=ram_gib * 1024**3,
+        devices=(
+            Device("igpu", "amd", "8060S", "/dev/dri/renderD128", "vulkan"),
+            Device("cpu", "cpu", "cpu", None, "cpu"),
+        ),
+    )
+
+
+class LemonadeLoadTuningTests(unittest.TestCase):
+    def test_large_vulkan_igpu_lands_mmap(self) -> None:
+        hw = _vulkan_igpu(122)
+        huge = 105 * 1024**3
+        tun = load_tuning(hw, huge)
+        self.assertEqual(tun["llamacpp_args"], LLAMACPP_MMAP_ARGS)
+        self.assertEqual(tun["llamacpp_backend"], "vulkan")
+        self.assertEqual(tun["max_loaded_models"], 1)
+        self.assertEqual(tun["ctx_size"], 2048)
+        self.assertGreaterEqual(int(tun["global_timeout"]), 2400)
+
+    def test_small_vulkan_igpu_skips_mmap(self) -> None:
+        hw = _vulkan_igpu(122)
+        tun = load_tuning(hw, 2 * 1024**3)
+        self.assertEqual(tun["llamacpp_backend"], "vulkan")
+        self.assertEqual(tun["ctx_size"], -1)
+        self.assertNotIn("llamacpp_args", tun)
+
+    def test_huge_shard_on_big_ram_still_mmaps(self) -> None:
+        hw = _vulkan_igpu(512)
+        huge = 105 * 1024**3
+        tun = load_tuning(hw, huge)
+        self.assertLess(huge / hw.ram_bytes, 0.35)
+        self.assertEqual(tun["llamacpp_args"], LLAMACPP_MMAP_ARGS)
+        self.assertEqual(tun["max_loaded_models"], 1)
+
+    def test_navi_rocm_small_has_no_mmap(self) -> None:
+        hw = Hardware(
+            cpu_name="amd",
+            ram_bytes=32 * 1024**3,
+            devices=(
+                Device("dgpu", "amd", "Radeon RX 7900 XT", "/dev/dri/renderD128", "rocm"),
+                Device("cpu", "cpu", "cpu", None, "cpu"),
+            ),
+        )
+        tun = load_tuning(hw, 2 * 1024**3)
+        self.assertEqual(tun["llamacpp_backend"], "rocm")
+        self.assertNotIn("llamacpp_args", tun)
+
+    def test_cli_parts_set_vulkan_args(self) -> None:
+        parts = cli_tuning_parts(
+            {
+                "max_loaded_models": 1,
+                "llamacpp_backend": "vulkan",
+                "llamacpp_args": LLAMACPP_MMAP_ARGS,
+            }
+        )
+        self.assertIn("llamacpp.backend=vulkan", parts)
+        self.assertIn(f"llamacpp.args={LLAMACPP_MMAP_ARGS}", parts)
+        self.assertIn(f"llamacpp.vulkan_args={LLAMACPP_MMAP_ARGS}", parts)
+
+
+class LemonadeLoadRiskTests(unittest.TestCase):
+    def test_policy_is_warn_only(self) -> None:
+        self.assertEqual(LOAD_RISK_POLICY, "warn_only")
+        risk = load_risk(0.60, 70 * 1024**3, "vulkan")
+        self.assertEqual(risk["level"], "strong")
+        self.assertEqual(risk["action"], "warn")
+        self.assertEqual(risk["policy"], "warn_only")
+        self.assertIn("continue", risk_english(risk, ram_bytes=122 * 1024**3).lower())
+
+    def test_frac_warn(self) -> None:
+        risk = load_risk(0.40, 40 * 1024**3, "vulkan")
+        self.assertEqual(risk["level"], "warn")
+        self.assertIn("Warning.", risk_english(risk, ram_bytes=100 * 1024**3))
+
+    def test_absolute_huge_is_strong(self) -> None:
+        risk = load_risk(0.20, 105 * 1024**3, "vulkan")
+        self.assertGreaterEqual(105 * 1024**3, HUGE_GGUF_BYTES)
+        self.assertEqual(risk["level"], "strong")
+        self.assertEqual(risk["action"], "warn")
+
+    def test_small_is_ok(self) -> None:
+        risk = load_risk(0.10, 2 * 1024**3, "vulkan")
+        self.assertEqual(risk["level"], "ok")
+        self.assertEqual(risk_english(risk, ram_bytes=122 * 1024**3), "")
+
+
+class LemonadeVerifyTests(unittest.TestCase):
+    def test_verify_accepts_nested_mmap(self) -> None:
+        expected = {
+            "ctx_size": 4096,
+            "global_timeout": 1800,
+            "max_loaded_models": 1,
+            "llamacpp_args": LLAMACPP_MMAP_ARGS,
+        }
+        ok, miss = verify_tuning(
+            expected,
+            {
+                "ctx_size": 4096,
+                "global_timeout": 1800,
+                "max_loaded_models": 1,
+                "llamacpp": {"args": "", "vulkan_args": LLAMACPP_MMAP_ARGS},
+            },
+        )
+        self.assertTrue(ok)
+        self.assertEqual(miss, "")
+
+    def test_verify_miss_is_soft_english(self) -> None:
+        ok, miss = verify_tuning(
+            {
+                "ctx_size": 4096,
+                "global_timeout": 1800,
+                "max_loaded_models": 1,
+                "llamacpp_args": LLAMACPP_MMAP_ARGS,
+            },
+            {"ctx_size": 4096, "global_timeout": 1800, "max_loaded_models": 8},
+        )
+        self.assertFalse(ok)
+        self.assertIn("max_loaded_models", miss)
+        self.assertIn("still published", miss)
+
+    def test_verify_skips_mmap_when_key_absent(self) -> None:
+        ok, miss = verify_tuning(
+            {
+                "ctx_size": 4096,
+                "global_timeout": 1800,
+                "max_loaded_models": 1,
+                "llamacpp_args": LLAMACPP_MMAP_ARGS,
+            },
+            {
+                "ctx_size": 4096,
+                "global_timeout": 1800,
+                "max_loaded_models": 1,
+            },
+        )
+        self.assertTrue(ok)
+        self.assertEqual(miss, "")
+
+
+class LemonadePublishTuningTests(unittest.TestCase):
+    def test_publish_applies_load_tuning(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            real = home / "AI models"
+            real.mkdir()
+            (real / "tiny.gguf").write_bytes(b"G" * 2048)
+            dest = Path(tmp) / "snap-common" / "ubuntuai-models"
+            hw = _vulkan_igpu(122)
+            captured: list[dict] = []
+
+            def record_apply(settings: dict) -> str:
+                captured.append(settings)
+                return "lemonade load settings updated"
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade._write_bind_unit", return_value="unit.mount"),
+                patch("lemonade._set_extra_models_dir"),
+                patch("lemonade._restart_snap"),
+                patch("lemonade.probe", return_value=hw),
+                patch("lemonade.largest_gguf_bytes", return_value=105 * 1024**3),
+                patch("lemonade.apply_tuning", side_effect=record_apply),
+            ):
+                msg = publish(_target(home))
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0]["llamacpp_args"], LLAMACPP_MMAP_ARGS)
+            self.assertEqual(captured[0]["max_loaded_models"], 1)
+            self.assertIn("Strong warning", msg)
+            self.assertIn(str(dest), msg)
+
+    def test_report_continues_when_verify_misses(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            hw = _vulkan_igpu(122)
+            with (
+                patch(
+                    "lemonade.apply_tuning",
+                    return_value=(
+                        "Lemonade did not keep the load settings the installer wrote "
+                        "(max_loaded_models). Models are still published."
+                    ),
+                ),
+                patch("lemonade.largest_gguf_bytes", return_value=105 * 1024**3),
+            ):
+                text = report_load_tuning(_target(home), hw)
+            self.assertIn("still published", text)
+            self.assertIn("Strong warning", text)
+
+    def test_shard_bytes_sum_as_one_tree(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "AI models"
+            shard = extra / "Huge"
+            shard.mkdir(parents=True)
+            for i in range(1, 5):
+                (shard / f"huge-0000{i}-of-00004.gguf").write_bytes(b"G" * 1000)
+            (shard / "mmproj.gguf").write_bytes(b"M" * 100)
+            size = largest_gguf_bytes(_target(home, extra=(extra,)))
+            self.assertEqual(size, 4000)
 
 
 if __name__ == "__main__":
