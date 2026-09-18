@@ -407,8 +407,14 @@ class InstallerTwinWarnTests(unittest.TestCase):
             self.assertIn("warn_for_publish", src)
             self.assertIn("plan_publishes_lemonade", src)
             self.assertIn("_confirm_load_warn", src)
+            self.assertIn("warn.body", src)
             self.assertNotIn("action\": \"refuse\"", src)
             self.assertNotIn("This model may strain this computer", src)
+            self.assertNotIn("Lemonade Desktop Load", src)
+        self.assertNotIn("set_default_size(520, 280)", gtk)
+        self.assertIn("set_max_width_chars", gtk)
+        self.assertIn("set_width_chars", gtk)
+        self.assertIn("setWordWrap", qt)
 
 
 class InstallerTwinOrganizeTests(unittest.TestCase):
@@ -419,6 +425,9 @@ class InstallerTwinOrganizeTests(unittest.TestCase):
             self.assertIn("then copy into", src)
             self.assertTrue(
                 'label="Copy"' in src or 'QRadioButton("Copy")' in src
+            )
+            self.assertTrue(
+                'label="Move"' in src or 'QRadioButton("Move")' in src
             )
             self.assertNotIn("then symlink into", src)
             self.assertNotIn('"Symlink"', src)

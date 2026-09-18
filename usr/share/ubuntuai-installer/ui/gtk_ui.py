@@ -154,14 +154,17 @@ def _confirm_load_warn(win, warn: LoadWarn, on_continue) -> None:
         on_continue()
         return
     dialog = Gtk.Window(transient_for=win, modal=True, title=warn.title)
-    dialog.set_default_size(520, 280)
+    dialog.set_default_size(560, 420)
+    dialog.set_resizable(True)
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
     outer.set_margin_top(16)
     outer.set_margin_bottom(16)
     outer.set_margin_start(16)
     outer.set_margin_end(16)
-    body = Gtk.Label(label=warn.body, wrap=True, xalign=0)
+    body = Gtk.Label(label=warn.body, wrap=True, xalign=0, hexpand=True)
     body.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+    body.set_max_width_chars(60)
+    body.set_width_chars(48)
     outer.append(body)
 
     def accept(*_args) -> None:

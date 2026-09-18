@@ -320,15 +320,23 @@ class ConfigHealthAndCliTests(unittest.TestCase):
             self.assertIn("warn_for_chat_model", src)
             self.assertIn("warn_for_publish", src)
             self.assertIn("_confirm_load_warn", src)
+            self.assertIn("warn.body", src)
             self.assertIn("This computer only", src)
             self.assertNotIn("This model may strain this computer", src)
             self.assertNotIn("Continue anyway", src)
+            self.assertNotIn("Lemonade Desktop Load", src)
             self.assertNotIn("Backends:", src)
             self.assertNotIn("Hybrid available", src)
             self.assertNotIn("Hybrid not detected", src)
             self.assertNotIn("Bind {", src)
             self.assertNotIn("No GGUF chat files", src)
             self.assertIn("then copy into", src)
+            self.assertTrue(
+                'label="Copy"' in src or 'QRadioButton("Copy")' in src
+            )
+            self.assertTrue(
+                'label="Move"' in src or 'QRadioButton("Move")' in src
+            )
             self.assertNotIn("then symlink into", src)
             self.assertNotIn('"Symlink"', src)
             self.assertNotIn("mode = \"link\"", src)
