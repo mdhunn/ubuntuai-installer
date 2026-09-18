@@ -150,6 +150,21 @@ class InstallerCatalogContractTests(unittest.TestCase):
         self.assertIn("ubuntuai-core", rec_cpu)
         self.assertNotIn("ubuntuai-hybrid", rec_cpu)
 
+    def test_recommended_includes_default_helpers(self) -> None:
+        rec = recommended_ids(self.wfs, _strix())
+        helpers = (
+            "ubuntuai-image",
+            "ubuntuai-video",
+            "ubuntuai-rag",
+            "ubuntuai-coding",
+        )
+        for wid in helpers:
+            wf = self.index[wid]
+            self.assertTrue(wf.helpers_only, wid)
+            self.assertTrue(wf.default, wid)
+            self.assertEqual(wf.role, "")
+            self.assertIn(wid, rec)
+
     def test_chat_is_not_gated_on_flm(self) -> None:
         chat = self.index["ubuntuai-chat"]
         self.assertEqual(chat.runtime_bins, ())
@@ -415,6 +430,19 @@ class InstallerTwinWarnTests(unittest.TestCase):
         self.assertIn("set_max_width_chars", gtk)
         self.assertIn("set_width_chars", gtk)
         self.assertIn("setWordWrap", qt)
+
+
+class InstallerTwinHelpersTests(unittest.TestCase):
+    def test_gtk_qt_keep_helpers_section_grouped(self) -> None:
+        gtk = (PKG / "ui" / "gtk_ui.py").read_text(encoding="utf-8")
+        qt = (PKG / "ui" / "qt_ui.py").read_text(encoding="utf-8")
+        for src in (gtk, qt):
+            self.assertIn("HELPERS_SECTION", src)
+            self.assertIn("HELPERS_BLURB", src)
+            self.assertIn("helper_wfs", src)
+            self.assertIn("wf.id not in helpers", src)
+            self.assertIn("wf.id in rec", src)
+            self.assertLess(src.find("helper_wfs"), src.find("HELPERS_SECTION"))
 
 
 class InstallerTwinOrganizeTests(unittest.TestCase):
