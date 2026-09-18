@@ -136,6 +136,21 @@ class LemonadePublishTests(unittest.TestCase):
             src = gguf_sources(_target(home, extra=(extra,), model_root=extra))
             self.assertEqual(src, (extra.resolve(),))
 
+    def test_nested_models_gguf_under_ai_models_collapses(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "AI models"
+            _write_gguf(extra / "outer.gguf")
+            store = extra / "Models"
+            _write_gguf(store / "gguf" / "inner.gguf")
+            src = gguf_sources(_target(home, extra=(extra,), model_root=store))
+            self.assertEqual(src, (extra.resolve(),))
+            dest = extra_dir("snap")
+            self.assertEqual(
+                bind_mounts(src, dest),
+                (BindMount(extra.resolve(), dest),),
+            )
+
     def test_snap_extra_dir(self) -> None:
         dest = extra_dir("snap")
         self.assertEqual(dest, Path("/var/snap/lemonade-server/common/ubuntuai-models"))
@@ -161,7 +176,7 @@ class LemonadePublishTests(unittest.TestCase):
     def test_bind_mounts_single_source_on_dest(self) -> None:
         dest = SNAP_LEMONADE_MODELS
         src = Path("/var/tmp/ai-models")
-        self.assertEqual(bind_mounts((src,), dest), (BindMount(src, dest),))
+        self.assertEqual(bind_mounts((src,), dest), (BindMount(src.resolve(), dest),))
 
     def test_bind_mounts_many_sources_under_chat(self) -> None:
         dest = SNAP_LEMONADE_MODELS
@@ -170,10 +185,50 @@ class LemonadePublishTests(unittest.TestCase):
         self.assertEqual(
             bind_mounts((a, b), dest),
             (
-                BindMount(a, dest / "chat" / "src0"),
-                BindMount(b, dest / "chat" / "src1"),
+                BindMount(a.resolve(), dest / "chat" / "src0"),
+                BindMount(b.resolve(), dest / "chat" / "src1"),
             ),
         )
+
+    def test_bind_mounts_nested_src_is_dropped(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "ubuntuai-models"
+            extra = Path(tmp) / "AI models"
+            extra.mkdir()
+            nested = extra / "Models" / "gguf"
+            nested.mkdir(parents=True)
+            mounts = bind_mounts((extra, nested), dest)
+            self.assertEqual(mounts, (BindMount(extra.resolve(), dest),))
+            self.assertFalse(any(part == "src1" for m in mounts for part in m.where.parts))
+
+    def test_bind_mounts_symlink_nested_src_is_dropped(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "ubuntuai-models"
+            extra = Path(tmp) / "AI models"
+            extra.mkdir()
+            (extra / "gguf").mkdir()
+            models = Path(tmp) / "Models"
+            models.symlink_to(extra)
+            mounts = bind_mounts((extra, models / "gguf"), dest)
+            self.assertEqual(mounts, (BindMount(extra.resolve(), dest),))
+            self.assertEqual(len(mounts), 1)
+            self.assertEqual(mounts[0].where, dest)
+
+    def test_bind_mounts_sibling_trees_keep_srcn(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "ubuntuai-models"
+            extra = Path(tmp) / "AI models"
+            store = Path(tmp) / "Models" / "gguf"
+            extra.mkdir()
+            store.mkdir(parents=True)
+            mounts = bind_mounts((extra, store), dest)
+            self.assertEqual(
+                mounts,
+                (
+                    BindMount(extra.resolve(), dest / "chat" / "src0"),
+                    BindMount(store.resolve(), dest / "chat" / "src1"),
+                ),
+            )
 
     def test_mount_unit_quotes_spaces(self) -> None:
         what = Path("/tmp/AI models")
@@ -212,6 +267,64 @@ class LemonadePublishTests(unittest.TestCase):
             self.assertNotEqual(extras[0], real.resolve())
             self.assertTrue(str(extras[0]).endswith("ubuntuai-models"))
             self.assertIn(str(dest), msg)
+
+    def test_publish_snap_nested_src_is_one_bind(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "AI models"
+            _write_gguf(extra / "outer.gguf")
+            store = extra / "Models"
+            _write_gguf(store / "gguf" / "inner.gguf")
+            dest = Path(tmp) / "snap-common" / "ubuntuai-models"
+            binds: list[tuple[Path, Path]] = []
+
+            def record_bind(what: Path, where: Path) -> str:
+                binds.append((what, where))
+                return "unit.mount"
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade._write_bind_unit", side_effect=record_bind),
+                patch("lemonade._set_extra_models_dir"),
+                patch("lemonade._restart_snap"),
+            ):
+                msg = publish(_target(home, extra=(extra,), model_root=store))
+            self.assertEqual(binds, [(extra.resolve(), dest)])
+            self.assertFalse(any("src1" in str(where) for _, where in binds))
+            self.assertIn(str(dest), msg)
+            self.assertNotIn("2 trees", msg)
+
+    def test_publish_snap_sibling_trees_use_srcn(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "AI models"
+            store = home / "Models" / "gguf"
+            _write_gguf(extra / "a.gguf")
+            _write_gguf(store / "b.gguf")
+            dest = Path(tmp) / "snap-common" / "ubuntuai-models"
+            binds: list[tuple[Path, Path]] = []
+
+            def record_bind(what: Path, where: Path) -> str:
+                binds.append((what, where))
+                return "unit.mount"
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade._write_bind_unit", side_effect=record_bind),
+                patch("lemonade._set_extra_models_dir"),
+                patch("lemonade._restart_snap"),
+            ):
+                msg = publish(_target(home, extra=(extra,), model_root=home / "Models"))
+            self.assertEqual(
+                binds,
+                [
+                    (extra.resolve(), dest / "chat" / "src0"),
+                    (store.resolve(), dest / "chat" / "src1"),
+                ],
+            )
+            self.assertIn("2 trees", msg)
 
     def test_publish_snap_refuses_home_extra_dir(self) -> None:
         with TemporaryDirectory() as tmp:
