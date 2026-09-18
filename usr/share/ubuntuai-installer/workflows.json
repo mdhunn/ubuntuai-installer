@@ -46,6 +46,7 @@
       "needs_any_backend": [],
       "hide_unless_backend": [],
       "ports": [8080],
+      "required_weights": ["qwen3-0.6b-q8_0"],
       "notes": "llama-server loads GGUF. Safetensors chat checkpoints are stored as Hugging Face directories under hf/ for vLLM, ComfyUI, and converters. The user unit stays disabled until a model is set."
     },
     {
@@ -144,10 +145,11 @@
     },
     {
       "id": "ubuntuai-image",
-      "title": "Image",
-      "summary": "Shared ComfyUI model dirs. ffmpeg. No custom-node zoo.",
+      "title": "Image helpers",
+      "summary": "ffmpeg and ImageMagick plus shared model folders. Does not install ComfyUI.",
       "default": false,
       "always": false,
+      "helpers_only": true,
       "requires": ["ubuntuai-core"],
       "apt": ["ffmpeg", "imagemagick"],
       "groups": [],
@@ -164,14 +166,15 @@
       "needs_any_backend": [],
       "hide_unless_backend": [],
       "ports": [8188],
-      "notes": "ComfyUI itself is not in Ubuntu. If a checkout is found, extra_model_paths.yaml is written only when that file is missing."
+      "notes": "If a ComfyUI checkout is found, extra_model_paths.yaml is written only when that file is missing."
     },
     {
       "id": "ubuntuai-video",
-      "title": "Video",
-      "summary": "ffmpeg with the GPU encoder the probe found. Video checkpoints stay catalog-only.",
+      "title": "Video helpers",
+      "summary": "ffmpeg with the GPU encoder this machine can use. Does not install a video app or download video weights.",
       "default": false,
       "always": false,
+      "helpers_only": true,
       "requires": ["ubuntuai-core", "ubuntuai-image"],
       "apt": ["ffmpeg"],
       "groups": [],
@@ -183,10 +186,11 @@
     },
     {
       "id": "ubuntuai-rag",
-      "title": "RAG",
-      "summary": "Document tools for local retrieval. sqlite-vec stays optional.",
+      "title": "Document helpers",
+      "summary": "pandoc, OCR, and PDF tools for local documents. Does not install a retrieval server.",
       "default": false,
       "always": false,
+      "helpers_only": true,
       "requires": ["ubuntuai-core", "ubuntuai-chat"],
       "apt": ["pandoc", "tesseract-ocr", "poppler-utils"],
       "groups": [],
@@ -198,10 +202,11 @@
     },
     {
       "id": "ubuntuai-coding",
-      "title": "Coding",
-      "summary": "Point an editor agent at the local OpenAI-compatible endpoint.",
+      "title": "Editor helpers",
+      "summary": "ripgrep and a localhost URL for an editor agent. Does not install VS Code or an agent.",
       "default": false,
       "always": false,
+      "helpers_only": true,
       "requires": ["ubuntuai-core", "ubuntuai-chat"],
       "apt": ["ripgrep"],
       "groups": [],
@@ -209,7 +214,7 @@
       "needs_any_backend": [],
       "hide_unless_backend": [],
       "ports": [],
-      "notes": "Does not install VS Code. Writes the localhost base URL into config."
+      "notes": "Writes the localhost base URL into config."
     },
     {
       "id": "ubuntuai-serve",

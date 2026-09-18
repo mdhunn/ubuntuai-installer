@@ -264,6 +264,11 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         self.assertTrue(all(w.url.startswith("https://") for w in items))
 
+    def test_tiny_chat_gguf_is_default(self) -> None:
+        items = load_catalog(PKG / "weights.json")
+        tiny = next(w for w in items if w.id == "qwen3-0.6b-q8_0")
+        self.assertTrue(tiny.default)
+
     def test_human_bytes(self) -> None:
         self.assertEqual(human_bytes(2684354560), "2.5 GiB")
 

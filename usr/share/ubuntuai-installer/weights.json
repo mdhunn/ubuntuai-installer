@@ -23,7 +23,7 @@
       "bytes": 858993459,
       "workflows": ["ubuntuai-chat"],
       "checksum": "",
-      "default": false
+      "default": true
     },
     {
       "id": "moss-tts-local-q8",

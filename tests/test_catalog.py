@@ -6,6 +6,7 @@ from support import PKG
 
 from catalog import by_id, expand_selection, load_workflows, pick_role_winners, recommended_ids
 from domain import Device, Hardware
+from weights import load_catalog
 
 
 class CatalogTests(unittest.TestCase):
@@ -127,6 +128,27 @@ class CatalogTests(unittest.TestCase):
         self.assertFalse(openmoss.ram_ok(hw))
         self.assertEqual(openmoss.vendor, "openmoss")
         self.assertIn("moss-tts-local-q8", openmoss.required_weights)
+
+    def test_helpers_only_presentment(self) -> None:
+        index = by_id(self.wfs)
+        expected = {
+            "ubuntuai-image": "Image helpers",
+            "ubuntuai-video": "Video helpers",
+            "ubuntuai-rag": "Document helpers",
+            "ubuntuai-coding": "Editor helpers",
+        }
+        for wid, title in expected.items():
+            wf = index[wid]
+            self.assertTrue(wf.helpers_only, wid)
+            self.assertFalse(wf.default, wid)
+            self.assertEqual(wf.title, title)
+        self.assertFalse(index["ubuntuai-chat"].helpers_only)
+
+    def test_chat_requires_tiny_default_gguf(self) -> None:
+        chat = by_id(self.wfs)["ubuntuai-chat"]
+        self.assertIn("qwen3-0.6b-q8_0", chat.required_weights)
+        tiny = next(w for w in load_catalog(PKG / "weights.json") if w.id == "qwen3-0.6b-q8_0")
+        self.assertTrue(tiny.default)
 
 
 if __name__ == "__main__":
