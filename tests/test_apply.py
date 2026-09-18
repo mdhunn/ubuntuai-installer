@@ -20,6 +20,7 @@ from apply import (
     explain_apt_failure,
     format_failure,
 )
+from progress import ProgressEvent, ProgressPump, download_english
 from catalog import load_workflows
 from domain import Action, Device, Hardware, UserTarget, Workflow
 
@@ -367,6 +368,123 @@ class ApplyTests(unittest.TestCase):
                 self.target.home, uid=self.target.uid, gid=self.target.gid
             )
             self.assertIn("Finished.", log_file.read_text(encoding="utf-8"))
+
+    def test_execute_plan_relays_weight_download_strings(self) -> None:
+        ticks = (
+            "Downloading ggml-base.en.bin: 256 KiB / 1.0 MiB",
+            "Downloading ggml-base.en.bin: 512 KiB / 1.0 MiB",
+            "Downloading ggml-base.en.bin: 1.0 MiB / 1.0 MiB",
+        )
+
+        def fake_ensure(
+            model,
+            target,
+            extra=(),
+            *,
+            on_progress=None,
+            dry_run=False,
+        ):
+            self.assertTrue(callable(on_progress))
+            for tick in ticks:
+                on_progress(tick)
+            return "downloaded"
+
+        events: list[object] = []
+        actions = (
+            Action("weights", "link or download required weights", ("whisper-base-en",)),
+        )
+        with patch("apply.ensure_weight", side_effect=fake_ensure):
+            execute_plan(
+                actions,
+                self.target,
+                hw=_hw_strix(),
+                dry_run=True,
+                on_progress=events.append,
+            )
+        english = [
+            ev.english if isinstance(ev, ProgressEvent) else str(ev) for ev in events
+        ]
+        for tick in ticks:
+            self.assertIn(tick, english)
+        self.assertTrue(any(ev.done for ev in events if isinstance(ev, ProgressEvent)))
+
+    def test_execute_plan_relays_weight_byte_progress(self) -> None:
+        seen: list[object] = []
+
+        def fake_ensure(
+            model,
+            target,
+            extra=(),
+            *,
+            on_progress=None,
+            dry_run=False,
+        ):
+            on_progress(256 * 1024, 1024 * 1024)
+            on_progress(1024 * 1024, 1024 * 1024)
+            return "downloaded"
+
+        actions = (
+            Action("weights", "link or download required weights", ("whisper-base-en",)),
+        )
+        with patch("apply.ensure_weight", side_effect=fake_ensure):
+            execute_plan(
+                actions,
+                self.target,
+                hw=_hw_strix(),
+                dry_run=True,
+                on_progress=seen.append,
+            )
+        english = [
+            ev.english if isinstance(ev, ProgressEvent) else str(ev) for ev in seen
+        ]
+        first = download_english("whisper.cpp base.en", 256 * 1024, 1024 * 1024)
+        last = download_english("whisper.cpp base.en", 1024 * 1024, 1024 * 1024)
+        self.assertIn(first, english)
+        self.assertIn(last, english)
+        mid = [ev for ev in seen if isinstance(ev, ProgressEvent) and ev.english == last]
+        self.assertTrue(mid)
+        self.assertGreater(mid[0].fraction, 0.0)
+
+    def test_progress_sink_receives_mid_download_updates(self) -> None:
+        pump = ProgressPump()
+        seen: list[str] = []
+
+        def fake_ensure(
+            model,
+            target,
+            extra=(),
+            *,
+            on_progress=None,
+            dry_run=False,
+        ):
+            on_progress("Downloading ggml-base.en.bin: 256 KiB / 1.0 MiB")
+            frame = pump.take()
+            if frame:
+                seen.append(frame.english)
+            on_progress("Downloading ggml-base.en.bin: 1.0 MiB / 1.0 MiB")
+            frame = pump.take()
+            if frame:
+                seen.append(frame.english)
+            return "downloaded"
+
+        actions = (
+            Action("weights", "link or download required weights", ("whisper-base-en",)),
+        )
+        with patch("apply.ensure_weight", side_effect=fake_ensure):
+            execute_plan(
+                actions,
+                self.target,
+                hw=_hw_strix(),
+                dry_run=True,
+                on_progress=pump.push,
+            )
+        self.assertEqual(len(seen), 2)
+        self.assertIn("256 KiB", seen[0])
+        self.assertIn("1.0 MiB", seen[1])
+        final = pump.take()
+        self.assertIsNotNone(final)
+        assert final is not None
+        self.assertTrue(final.done)
 
 
 if __name__ == "__main__":
