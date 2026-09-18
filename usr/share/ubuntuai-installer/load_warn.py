@@ -2,6 +2,7 @@
 
 Risk math stays in lemonade.load_risk. This module fills the locked
 GTK and Qt English. Policy is warn-only. Callers must keep Continue.
+The warning covers Installer publish and Config Save only.
 """
 
 from __future__ import annotations
@@ -21,11 +22,15 @@ from lemonade import (
 from weights import human_bytes
 
 STRONG_TITLE = "This model may strain this computer"
+SCOPE = (
+    "This warning is only for Installer publish and Config Save. "
+    "Lemonade Desktop Load is not covered and can still freeze or crash the session."
+)
 STRONG_BODY = (
     "Largest file is {size}. This computer has about {ram}. "
     "Loading a model this big over Vulkan can freeze the screen or log you out. "
     "You can still continue. Lemonade will keep one model loaded, use a smaller "
-    "context, and memory-map the file."
+    "context, and memory-map the file. " + SCOPE
 )
 STRONG_PRIMARY = "Continue anyway"
 
@@ -33,7 +38,7 @@ SOFT_TITLE = "Large model on this computer"
 SOFT_BODY = (
     "Largest file is {size} on about {ram} of RAM. "
     "That is a large share of memory. You can still continue. "
-    "Lemonade will keep one model loaded and use a smaller context."
+    "Lemonade will keep one model loaded and use a smaller context. " + SCOPE
 )
 SOFT_PRIMARY = "Continue"
 

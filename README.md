@@ -2,7 +2,7 @@
 
 Adds a local-AI workstation layer to Ubuntu or an official flavor. It does not replace the desktop.
 
-A checked box must become a working install. Archive packages are installed with apt. OpenMOSS is fetched from a pinned GitHub release into `~/.local`. Required model files are linked from folders you already have, or downloaded into `~/Models`.
+A checked box must become a working install. Archive packages are installed with apt. OpenMOSS is fetched from a pinned GitHub release into `~/.local`. Required model files are copied from folders you already have, or downloaded into `~/Models`.
 
 The analog is [Ubuntu Studio Installer](https://ubuntustudio.org/ubuntu-studio-installer/). Core plumbing first. Workflow checkboxes second. A config tool instead of Audio Configuration.
 

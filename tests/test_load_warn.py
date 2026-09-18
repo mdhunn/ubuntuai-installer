@@ -15,6 +15,7 @@ from lemonade import (
     risk_english,
 )
 from load_warn import (
+    SCOPE,
     SOFT_BODY,
     SOFT_PRIMARY,
     SOFT_TITLE,
@@ -73,6 +74,11 @@ class LoadWarnCopyTests(unittest.TestCase):
         )
         self.assertIn(human_bytes(size), warn.body)
         self.assertIn(human_bytes(ram), warn.body)
+        self.assertIn(SCOPE, warn.body)
+        self.assertIn("Installer publish", warn.body)
+        self.assertIn("Config Save", warn.body)
+        self.assertIn("Lemonade Desktop Load", warn.body)
+        self.assertIn("not covered", warn.body)
         self.assertNotEqual(warn.body, risk_english(load_risk(size / ram, size, "vulkan"), ram))
 
     def test_soft_uses_locked_english(self) -> None:
@@ -89,6 +95,9 @@ class LoadWarnCopyTests(unittest.TestCase):
             warn.body,
             SOFT_BODY.format(size=human_bytes(size), ram=human_bytes(ram)),
         )
+        self.assertIn(SCOPE, warn.body)
+        self.assertIn("Installer publish", warn.body)
+        self.assertIn("Lemonade Desktop Load", warn.body)
 
     def test_small_does_not_prompt(self) -> None:
         warn = warn_for_bytes(2 * 1024**3, 122 * 1024**3, "vulkan")
@@ -121,6 +130,14 @@ class LoadWarnCopyTests(unittest.TestCase):
         self.assertNotEqual(warn.action, "refuse")
         self.assertTrue(warn.should_prompt)
         self.assertEqual(warn.primary, "Continue anyway")
+
+    def test_locked_bodies_name_installer_and_config_scope(self) -> None:
+        self.assertIn(SCOPE, STRONG_BODY)
+        self.assertIn(SCOPE, SOFT_BODY)
+        self.assertEqual(STRONG_TITLE, "This model may strain this computer")
+        self.assertEqual(SOFT_TITLE, "Large model on this computer")
+        self.assertEqual(STRONG_PRIMARY, "Continue anyway")
+        self.assertEqual(SOFT_PRIMARY, "Continue")
 
 
 class LoadWarnSurfaceTests(unittest.TestCase):

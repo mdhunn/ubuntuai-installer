@@ -201,15 +201,32 @@ def _confirm_load_warn(win, warn: LoadWarn, on_continue) -> None:
     if not warn.should_prompt:
         on_continue()
         return
-    box = QMessageBox(win)
-    box.setIcon(QMessageBox.Icon.Warning)
-    box.setWindowTitle(warn.title)
-    box.setText(warn.body)
-    go = box.addButton(warn.primary, QMessageBox.ButtonRole.AcceptRole)
-    box.addButton(CANCEL, QMessageBox.ButtonRole.RejectRole)
-    box.exec()
-    if box.clickedButton() is go:
+    dialog = QDialog(win)
+    dialog.setWindowTitle(warn.title)
+    dialog.setModal(True)
+    dialog.setMinimumWidth(560)
+    layout = QVBoxLayout(dialog)
+    body = QLabel(warn.body)
+    body.setWordWrap(True)
+    body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    layout.addWidget(body)
+    row = QHBoxLayout()
+    cancel = QPushButton(CANCEL)
+    go = QPushButton(warn.primary)
+    row.addWidget(cancel)
+    row.addStretch(1)
+    row.addWidget(go)
+    layout.addLayout(row)
+
+    def accept() -> None:
+        dialog.accept()
         on_continue()
+
+    go.clicked.connect(accept)
+    cancel.clicked.connect(dialog.reject)
+    go.setDefault(True)
+    dialog.adjustSize()
+    dialog.exec()
 
 
 def _show_chat_model_cta(win, on_download, body_text: str = "") -> None:
@@ -461,6 +478,14 @@ def _qt_weights(win, user, status) -> QWidget:
     add_row.addWidget(folder_entry, 1)
     add_row.addWidget(browse_btn)
     add_row.addWidget(add_folder_btn)
+    t0 = target_for(user)
+    hint = QLabel(
+        f"Search known folders plus any you add, then copy into {t0.model_root}. "
+        "Move removes the original after the checksum matches. "
+        "Downloads are opt-in and go into the same store."
+    )
+    hint.setWordWrap(True)
+    layout.addWidget(hint)
     layout.addWidget(QLabel("Folders"))
     layout.addWidget(folder_scroll)
     layout.addLayout(add_row)

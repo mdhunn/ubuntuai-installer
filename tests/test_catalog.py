@@ -160,6 +160,14 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(ids, frozenset(expected))
         unmarked = tuple(w for w in self.wfs if not w.helpers_only)
         self.assertEqual(helper_workflow_ids(unmarked), frozenset())
+        hw = Hardware(
+            cpu_name="cpu",
+            ram_bytes=16 * 1024**3,
+            devices=(Device("cpu", "cpu", "cpu", None, "cpu"),),
+        )
+        rec = recommended_ids(self.wfs, hw)
+        for wid in expected:
+            self.assertIn(wid, rec)
 
     def test_helpers_only_title_mark_without_bool(self) -> None:
         from dataclasses import replace
