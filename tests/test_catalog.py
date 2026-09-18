@@ -4,7 +4,15 @@ import unittest
 
 from support import PKG
 
-from catalog import by_id, expand_selection, load_workflows, pick_role_winners, recommended_ids
+from catalog import (
+    by_id,
+    expand_selection,
+    helper_workflow_ids,
+    is_helpers_only,
+    load_workflows,
+    pick_role_winners,
+    recommended_ids,
+)
 from domain import Device, Hardware
 from weights import load_catalog
 
@@ -140,9 +148,24 @@ class CatalogTests(unittest.TestCase):
         for wid, title in expected.items():
             wf = index[wid]
             self.assertTrue(wf.helpers_only, wid)
+            self.assertTrue(is_helpers_only(wf), wid)
             self.assertFalse(wf.default, wid)
             self.assertEqual(wf.title, title)
         self.assertFalse(index["ubuntuai-chat"].helpers_only)
+        ids = helper_workflow_ids(self.wfs)
+        self.assertEqual(ids, frozenset(expected))
+        unmarked = tuple(w for w in self.wfs if not w.helpers_only)
+        self.assertEqual(helper_workflow_ids(unmarked), frozenset())
+
+    def test_helpers_only_title_mark_without_bool(self) -> None:
+        from dataclasses import replace
+
+        chat = by_id(self.wfs)["ubuntuai-chat"]
+        marked = replace(chat, title="Chat (helpers)", helpers_only=False)
+        summary = replace(chat, summary="Local chat (helpers)", helpers_only=False)
+        self.assertTrue(is_helpers_only(marked))
+        self.assertTrue(is_helpers_only(summary))
+        self.assertEqual(helper_workflow_ids((marked,)), frozenset({chat.id}))
 
     def test_chat_requires_tiny_default_gguf(self) -> None:
         chat = by_id(self.wfs)["ubuntuai-chat"]

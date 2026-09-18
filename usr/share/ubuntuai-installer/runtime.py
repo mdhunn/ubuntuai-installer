@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from apply import dpkg_installed
-from catalog import load_workflows
+from catalog import helper_workflow_ids, load_workflows
 from configstore import load as load_config
 from domain import Hardware, UserTarget, Workflow
 from paths import ENV_FILE, LIMITS_FILE
@@ -31,6 +31,56 @@ BACKEND_LABELS = {
     "xdna": "AMD NPU (XDNA)",
     "cpu": "CPU only",
 }
+
+CHAT_MODEL_CTA = "Download a chat model"
+CHAT_MODEL_NEEDED = (
+    "Chat has no GGUF file in the model folder yet. "
+    "Download one from the Weights tab."
+)
+CHAT_MODEL_NEEDED_CONFIG = (
+    "Chat has no GGUF file in the model folder yet. "
+    "Open Ubuntu AI Installer. Use the Weights tab to download a chat model."
+)
+HELPERS_SECTION = "Helpers"
+HELPERS_BLURB = (
+    "These prepare folders and pointers. They are not full AI apps."
+)
+
+
+def listen_words(bind: str) -> str:
+    if bind == "0.0.0.0":
+        return "Other devices on your home network can connect."
+    return "This computer only."
+
+
+def machine_words(hw: Hardware) -> str:
+    have = hw.backends()
+    parts: list[str] = []
+    if "cpu" in have:
+        parts.append("CPU")
+    if have & {"vulkan", "rocm", "cuda"}:
+        parts.append("GPU")
+    if "xdna" in have:
+        parts.append("NPU")
+    if not parts:
+        text = "This machine can run local AI."
+    elif len(parts) == 1:
+        text = f"This machine runs on the {parts[0]}."
+    elif len(parts) == 2:
+        text = f"This machine can use the {parts[0]} and the {parts[1]}."
+    else:
+        text = "This machine can use the CPU, GPU, and NPU."
+    if hw.hybrid_ok():
+        text += " The NPU and GPU can work together."
+    return text
+
+
+def workflow_row_title(title: str, wid: str, helpers: frozenset[str]) -> str:
+    if wid not in helpers:
+        return title
+    if "helper" in title.lower():
+        return title
+    return f"{title} (helpers only)"
 
 
 @dataclass(frozen=True)
@@ -119,6 +169,19 @@ def chat_models(model_root: Path) -> tuple[str, ...]:
     return tuple(names)
 
 
+def no_chat_gguf(model_root: Path) -> bool:
+    return not chat_models(model_root)
+
+
+def chat_weight_ids(workflows: tuple[Workflow, ...] | None = None) -> frozenset[str]:
+    wfs = workflows if workflows is not None else load_workflows()
+    ids: set[str] = set()
+    for wf in wfs:
+        if wf.id == "ubuntuai-chat":
+            ids.update(wf.required_weights)
+    return frozenset(ids)
+
+
 def backend_choices(hw: Hardware) -> tuple[str, ...]:
     order = ("vulkan", "rocm", "cuda", "xdna", "cpu")
     have = hw.installable_backends()
@@ -129,7 +192,12 @@ def backend_choices(hw: Hardware) -> tuple[str, ...]:
 def explain_setup(user: str, target: UserTarget, hw: Hardware) -> str:
     apps = app_statuses(user, target)
     installed = [a for a in apps if a.present]
-    missing = [a for a in apps if not a.present and a.id != "ubuntuai-core"]
+    helpers = helper_workflow_ids(load_workflows())
+    missing = [
+        a
+        for a in apps
+        if not a.present and a.id != "ubuntuai-core" and a.id not in helpers
+    ]
     cfg = load_config(user)
     bind = cfg.get("bind") or target.bind
     listen = (
