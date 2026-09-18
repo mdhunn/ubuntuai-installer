@@ -69,7 +69,8 @@ def gguf_sources(target: UserTarget) -> tuple[Path, ...]:
 
 
 def bind_mounts(sources: tuple[Path, ...], dest: Path) -> tuple[BindMount, ...]:
-    """Map real trees onto dest. One source binds on dest. Many bind under dest/chat."""
+    """Map real trees onto dest. Nested sources bind once via the outer tree."""
+    sources = _collapse(sources)
     if not sources:
         return ()
     if len(sources) == 1:
@@ -203,21 +204,32 @@ def _too_wide(path: Path, home: Path) -> bool:
     return path in banned or path == home
 
 
+def _resolve(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path
+
+
+def _nested_under(path: Path, parent: Path) -> bool:
+    return parent in path.parents
+
+
 def _collapse(trees: tuple[Path, ...]) -> tuple[Path, ...]:
-    kept: list[Path] = []
+    """Keep outer trees only. A source nested under another selected source is dropped."""
+    resolved: list[Path] = []
+    seen: set[Path] = set()
     for tree in trees:
-        nested = False
-        for other in trees:
-            if other == tree:
-                continue
-            try:
-                tree.relative_to(other)
-            except ValueError:
-                continue
-            nested = True
-            break
-        if not nested:
-            kept.append(tree)
+        path = _resolve(tree)
+        if path in seen:
+            continue
+        seen.add(path)
+        resolved.append(path)
+    kept: list[Path] = []
+    for tree in resolved:
+        if any(tree != other and _nested_under(tree, other) for other in resolved):
+            continue
+        kept.append(tree)
     return tuple(kept)
 
 
@@ -384,9 +396,9 @@ def publish(target: UserTarget) -> str:
             unit = _write_bind_unit(mount.what, mount.where)
         _set_extra_models_dir(dest)
         _restart_snap()
-        if len(sources) == 1:
+        if len(mounts) == 1:
             return f"lemonade extra_models_dir={dest} via {unit}"
-        return f"lemonade extra_models_dir={dest} ({len(sources)} trees)"
+        return f"lemonade extra_models_dir={dest} ({len(mounts)} trees)"
     dest = sources[0]
     _set_extra_models_dir(dest)
     return f"lemonade extra_models_dir={dest}"
