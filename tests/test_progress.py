@@ -12,10 +12,12 @@ from support import PKG  # noqa: F401
 from domain import Action
 from progress import (
     ProgressEvent,
+    ProgressPump,
     append_log,
     apply_log_dir,
     download_english,
     english_for_action,
+    is_live_download,
     new_apply_log,
 )
 
@@ -35,6 +37,43 @@ class ProgressTests(unittest.TestCase):
         msg = download_english("OpenMOSS", 1024, 2048)
         self.assertIn("OpenMOSS", msg)
         self.assertIn("of", msg)
+
+    def test_live_download_detects_weight_and_vendor_strings(self) -> None:
+        weight = ProgressEvent("Downloading ggml-base.en.bin: 256 KiB / 1.0 MiB")
+        vendor = ProgressEvent(download_english("OpenMOSS", 1024, 2048))
+        phase = ProgressEvent("Finding or downloading required model files.")
+        self.assertTrue(is_live_download(weight))
+        self.assertTrue(is_live_download(vendor))
+        self.assertFalse(is_live_download(phase))
+
+    def test_pump_keeps_latest_download_tick(self) -> None:
+        pump = ProgressPump()
+        ticks = (
+            "Downloading ggml-base.en.bin: 256 KiB / 1.0 MiB",
+            "Downloading ggml-base.en.bin: 512 KiB / 1.0 MiB",
+            "Downloading ggml-base.en.bin: 1.0 MiB / 1.0 MiB",
+        )
+        for text in ticks:
+            pump.push(ProgressEvent(text, text, 0.4))
+        frame = pump.take()
+        self.assertIsNotNone(frame)
+        assert frame is not None
+        self.assertEqual(frame.english, ticks[-1])
+        self.assertEqual(frame.technical, (ticks[-1],))
+        self.assertFalse(frame.done)
+        self.assertIsNone(pump.take())
+
+    def test_pump_passes_apt_lines_and_terminal_event(self) -> None:
+        pump = ProgressPump()
+        pump.push(ProgressEvent("Installing Ubuntu packages.", "Get:1 rhvoice"))
+        pump.push(ProgressEvent("Installing Ubuntu packages.", "Get:2 espeak-ng"))
+        pump.push(ProgressEvent("Finished.", "log /tmp/apply.log", 1.0, done=True))
+        frame = pump.take()
+        self.assertIsNotNone(frame)
+        assert frame is not None
+        self.assertEqual(frame.english, "Finished.")
+        self.assertEqual(frame.technical, ("Get:1 rhvoice", "Get:2 espeak-ng", "log /tmp/apply.log"))
+        self.assertTrue(frame.done)
 
     def test_log_file_roundtrip(self) -> None:
         with TemporaryDirectory() as tmp:

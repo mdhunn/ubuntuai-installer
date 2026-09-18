@@ -15,7 +15,7 @@ from catalog import by_id, expand_selection, load_workflows
 from configstore import saved_scan_folders
 from domain import Action, Hardware, UserTarget, Workflow
 from paths import ENV_FILE, LIMITS_FILE, LIMITS_TEMPLATE, PROFILE_FILE, helper_path
-from progress import ProgressEvent, emit, english_for_action, new_apply_log
+from progress import ProgressEvent, download_english, emit, english_for_action, new_apply_log
 from lemonade import APPLY_PUBLISH_VERB, detect as lemonade_detect
 from vendor import install_vendor
 from weights import ensure_weight, load_catalog as load_weight_catalog
@@ -444,13 +444,31 @@ def execute_plan(
                         raise ApplyError(
                             f"Could not find the model catalog entry {wid}.",
                         )
+                    weight_base = (step_i + wi / max(len(wids), 1)) / total_steps
+                    weight_span = (1.0 / max(len(wids), 1)) / total_steps
                     relay(
                         f"Getting {model.title}.",
                         model.filename,
-                        fraction=(step_i + wi / max(len(wids), 1)) / total_steps,
+                        fraction=weight_base,
                     )
 
-                    def weight_cb(msg: object) -> None:
+                    def weight_cb(
+                        msg: object,
+                        total: object | None = None,
+                        *,
+                        _title: str = model.title,
+                        _base: float = weight_base,
+                        _span: float = weight_span,
+                    ) -> None:
+                        # ensure_weight sends one English string. download()
+                        # sends (written, total). Both become one ProgressEvent.
+                        if isinstance(msg, int) and isinstance(total, int):
+                            text = download_english(_title, msg, total)
+                            frac = _base
+                            if total > 0:
+                                frac = _base + _span * min(msg / total, 1.0)
+                            relay(text, text, fraction=frac)
+                            return
                         relay(str(msg), str(msg))
 
                     try:

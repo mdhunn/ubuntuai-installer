@@ -36,7 +36,7 @@ from load_warn import (
     warn_for_chat_model,
     warn_for_publish,
 )
-from progress import ProgressEvent
+from progress import PAINT_MS, ProgressEvent, ProgressFrame, ProgressPump
 from catalog import expand_selection, helper_workflow_ids, load_workflows, recommended_ids
 from configstore import add_scan_folder
 from configstore import load as load_config
@@ -183,17 +183,18 @@ def _open_apply_progress(win) -> tuple[QDialog, object]:
     layout.addLayout(row)
     dialog.show()
 
-    def update(ev: object) -> None:
-        if not isinstance(ev, ProgressEvent):
-            ev = ProgressEvent(str(ev), str(ev))
-        bar.setValue(int(max(0.0, min(ev.fraction, 1.0)) * 100))
-        english.setText(ev.english)
-        if ev.technical:
-            log.append(ev.technical)
-        if ev.done or ev.failed:
+    def paint(frame: ProgressFrame) -> None:
+        bar.setValue(int(max(0.0, min(frame.fraction, 1.0)) * 100))
+        english.setText(frame.english)
+        for line in frame.technical:
+            if line:
+                log.append(line)
+        if frame.done or frame.failed:
             close_btn.setEnabled(True)
+        english.repaint()
+        bar.repaint()
 
-    return dialog, update
+    return dialog, paint
 
 
 def _confirm_load_warn(win, warn: LoadWarn, on_continue) -> None:
@@ -306,12 +307,21 @@ def _qt_workflows(win, hw, user, workflows, status, show_chat_download) -> QWidg
         import threading
 
         def start_apply() -> None:
-            _dialog, update = _open_apply_progress(win)
+            _dialog, paint = _open_apply_progress(win)
+            pump = ProgressPump()
             pending: list[object] = []
             timer = QTimer(_dialog)
-            timer.setInterval(80)
+            timer.setInterval(PAINT_MS)
 
             def drain() -> None:
+                frame = pump.take()
+                if frame is not None:
+                    paint(frame)
+                    if frame.failed:
+                        status.setText(frame.english)
+                        _show_failure(win, frame.english, "\n".join(frame.technical))
+                    elif frame.done:
+                        status.setText(frame.english)
                 while pending:
                     ev = pending.pop(0)
                     if isinstance(ev, tuple) and ev and ev[0] == "chat-cta":
@@ -321,12 +331,6 @@ def _qt_workflows(win, hw, user, workflows, status, show_chat_download) -> QWidg
                     if isinstance(ev, tuple) and ev and ev[0] == "chat-cta-hide":
                         cta.setVisible(False)
                         continue
-                    update(ev)
-                    if isinstance(ev, ProgressEvent) and ev.failed:
-                        status.setText(ev.english)
-                        _show_failure(win, ev.english, ev.technical)
-                    elif isinstance(ev, ProgressEvent) and ev.done:
-                        status.setText(ev.english)
 
             timer.timeout.connect(drain)
             timer.start()
@@ -338,7 +342,7 @@ def _qt_workflows(win, hw, user, workflows, status, show_chat_download) -> QWidg
                         t,
                         hw=hw,
                         dry_run=False,
-                        on_progress=pending.append,
+                        on_progress=pump.push,
                     )
                     record_installed(user, expand_selection(ids, workflows, hw))
                     report = collect(t, hw)
@@ -346,7 +350,7 @@ def _qt_workflows(win, hw, user, workflows, status, show_chat_download) -> QWidg
                     need_model = no_chat_gguf(t.model_root)
                     if need_model:
                         extra += "\n" + CHAT_MODEL_NEEDED
-                    pending.append(
+                    pump.push(
                         ProgressEvent(
                             "Finished.",
                             format_checks(report) + extra,
@@ -359,11 +363,9 @@ def _qt_workflows(win, hw, user, workflows, status, show_chat_download) -> QWidg
                     else:
                         pending.append(("chat-cta-hide",))
                 except ApplyError as exc:
-                    pending.append(
-                        ProgressEvent(exc.english, exc.technical, failed=True)
-                    )
+                    pump.push(ProgressEvent(exc.english, exc.technical, failed=True))
                 except Exception as exc:  # noqa: BLE001
-                    pending.append(ProgressEvent("Apply failed.", str(exc), failed=True))
+                    pump.push(ProgressEvent("Apply failed.", str(exc), failed=True))
 
             threading.Thread(target=work, daemon=True).start()
 

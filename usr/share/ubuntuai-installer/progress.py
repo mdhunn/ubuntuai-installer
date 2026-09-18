@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from domain import Action
 from weights import human_bytes
+
+# How often a progress dialog should paint. Weight downloads emit every 256 KiB.
+PAINT_MS = 80
 
 
 @dataclass(frozen=True)
@@ -126,3 +130,87 @@ def download_english(title: str, done: int, total: int) -> str:
     if total > 0:
         return f"Downloading {title} ({human_bytes(done)} of {human_bytes(total)})."
     return f"Downloading {title} ({human_bytes(done)} so far)."
+
+
+def is_live_download_text(text: str) -> bool:
+    if not text.startswith("Downloading "):
+        return False
+    return " / " in text or " of " in text
+
+
+def is_live_download(event: ProgressEvent) -> bool:
+    if event.done or event.failed:
+        return False
+    return is_live_download_text(event.english)
+
+
+def as_progress_event(ev: object) -> ProgressEvent:
+    if isinstance(ev, ProgressEvent):
+        return ev
+    return ProgressEvent(str(ev), str(ev))
+
+
+@dataclass(frozen=True)
+class ProgressFrame:
+    """One paint of the Apply progress dialog."""
+
+    english: str
+    technical: tuple[str, ...] = ()
+    fraction: float = 0.0
+    done: bool = False
+    failed: bool = False
+
+
+class ProgressPump:
+    """Hold the latest Apply event so a dialog can paint during downloads.
+
+    ensure_weight calls on_progress once per 256 KiB chunk. Those already
+    become ProgressEvents. Queuing every one in GTK idle_add or a Qt list
+    freezes the dialog until Apply finishes. Keep the latest live download
+    tick. Pass other technical lines through.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._latest: ProgressEvent | None = None
+        self._technical: list[str] = []
+        self._done = False
+        self._failed = False
+        self._dirty = False
+
+    def push(self, ev: object) -> None:
+        event = as_progress_event(ev)
+        with self._lock:
+            self._latest = event
+            self._dirty = True
+            if event.done:
+                self._done = True
+            if event.failed:
+                self._failed = True
+            if not event.technical:
+                return
+            if is_live_download(event) or is_live_download_text(event.technical):
+                if self._technical and is_live_download_text(self._technical[-1]):
+                    self._technical[-1] = event.technical
+                else:
+                    self._technical.append(event.technical)
+                return
+            self._technical.append(event.technical)
+
+    def take(self) -> ProgressFrame | None:
+        with self._lock:
+            if not self._dirty:
+                return None
+            event = self._latest
+            technical = tuple(self._technical)
+            self._technical.clear()
+            self._dirty = False
+            if event is None:
+                return None
+            return ProgressFrame(
+                english=event.english,
+                technical=technical,
+                fraction=event.fraction,
+                done=self._done,
+                failed=self._failed,
+            )

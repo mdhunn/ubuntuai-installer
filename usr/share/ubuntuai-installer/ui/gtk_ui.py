@@ -19,7 +19,7 @@ from load_warn import (
     warn_for_chat_model,
     warn_for_publish,
 )
-from progress import ProgressEvent
+from progress import PAINT_MS, ProgressFrame, ProgressPump
 from catalog import expand_selection, helper_workflow_ids, load_workflows, recommended_ids
 from configstore import add_scan_folder
 from configstore import load as load_config
@@ -307,20 +307,33 @@ def _open_apply_progress(win) -> tuple[object, object]:
     outer.append(row)
     dialog.set_child(outer)
     dialog.present()
+    pump = ProgressPump()
 
-    def update(ev: object) -> bool:
-        if not isinstance(ev, ProgressEvent):
-            ev = ProgressEvent(str(ev), str(ev))
-        bar.set_fraction(max(0.0, min(ev.fraction, 1.0)))
-        bar.set_text(f"{int(ev.fraction * 100)}%")
-        english.set_label(ev.english)
-        if ev.technical:
-            buf.insert(buf.get_end_iter(), ev.technical + "\n")
-        if ev.done or ev.failed:
+    def paint(frame: ProgressFrame) -> None:
+        bar.set_fraction(max(0.0, min(frame.fraction, 1.0)))
+        if frame.english.startswith("Downloading "):
+            bar.set_text(frame.english)
+        else:
+            bar.set_text(f"{int(frame.fraction * 100)}%")
+        english.set_label(frame.english)
+        for line in frame.technical:
+            if line:
+                buf.insert(buf.get_end_iter(), line + "\n")
+        if frame.done or frame.failed:
             close_btn.set_sensitive(True)
-        return False
+        english.queue_draw()
+        bar.queue_draw()
 
-    return dialog, update
+    def tick() -> bool:
+        frame = pump.take()
+        if frame is not None:
+            paint(frame)
+            if frame.done or frame.failed:
+                return False
+        return True
+
+    GLib.timeout_add(PAINT_MS, tick)
+    return dialog, pump.push
 
 
 def _scroller(child: Gtk.Widget) -> Gtk.ScrolledWindow:
@@ -413,7 +426,7 @@ def _workflows_page(win, hw, user, workflows, checks, status, show_chat_download
                         t,
                         hw=hw,
                         dry_run=False,
-                        on_progress=lambda ev: GLib.idle_add(update, ev),
+                        on_progress=update,
                     )
                 except ApplyError as exc:
                     GLib.idle_add(status.set_text, exc.english)
