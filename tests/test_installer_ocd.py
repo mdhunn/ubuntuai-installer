@@ -22,7 +22,7 @@ from apply import (
     run_privileged,
 )
 from catalog import by_id, expand_selection, load_workflows, recommended_ids
-from domain import Action, Device, Hardware, UserTarget
+from domain import Action, Device, Hardware, UserTarget, Workflow
 from main import installer_main
 from weights import KNOWN_SUBDIRS, load_catalog
 
@@ -169,6 +169,53 @@ class InstallerPlanTests(unittest.TestCase):
         apt = next(a.payload for a in actions if a.kind == "apt_install")
         self.assertEqual(len(apt), len(set(apt)))
         self.assertEqual(apt.count("llama.cpp-tools"), 1)
+        self.assertEqual(apt.count("libggml0-backend-vulkan"), 1)
+
+    def test_plan_requires_vulkan_backend_when_catalog_omits_it(self) -> None:
+        wfs = (
+            Workflow(
+                id="ubuntuai-core",
+                title="Core",
+                summary="core",
+                default=True,
+                always=True,
+                requires=(),
+                apt=("pciutils",),
+                groups=(),
+                model_subdirs=(),
+                needs_any_backend=(),
+                hide_unless_backend=(),
+                ports=(),
+                notes="",
+            ),
+            Workflow(
+                id="ubuntuai-chat",
+                title="Chat",
+                summary="chat",
+                default=True,
+                always=False,
+                requires=("ubuntuai-core",),
+                apt=("llama.cpp-tools",),
+                groups=(),
+                model_subdirs=(),
+                needs_any_backend=(),
+                hide_unless_backend=(),
+                ports=(),
+                notes="",
+            ),
+        )
+        with patch("apply.dpkg_installed", return_value=False), patch(
+            "apply.user_in_group", return_value=True
+        ):
+            actions = build_plan(
+                ("ubuntuai-chat",),
+                _strix(),
+                self.target,
+                wfs,
+            )
+        apt = next(a.payload for a in actions if a.kind == "apt_install")
+        self.assertIn("llama.cpp-tools", apt)
+        self.assertIn("libggml0-backend-vulkan", apt)
 
     def test_hybrid_skipped_without_npu(self) -> None:
         hw = Hardware(
@@ -265,7 +312,8 @@ class InstallerFailureCopyTests(unittest.TestCase):
             ("unmet dependencies:\n foo : Depends: bar but it is not going to be installed", 100, "clash"),
             ("libfoo Conflicts: libbar", 100, "conflict"),
             ("No space left on device", 100, "disk is full"),
-            ("E: Unable to locate package nope", 100, "does not know"),
+            ("E: Unable to locate package nope", 100, "universe"),
+            ("Package foo has no installation candidate", 100, "universe"),
             ("404  Not Found", 100, "network"),
             ("pkexec: dismissed", 126, "permission"),
             ("", 1, "no extra text"),
@@ -276,6 +324,13 @@ class InstallerFailureCopyTests(unittest.TestCase):
                 msg = explain_apt_failure(output, rc)
                 self.assertIn(needle, msg.lower())
                 self.assertNotIn(str(rc), msg)
+
+    def test_unable_to_locate_names_universe_update_and_release(self) -> None:
+        msg = explain_apt_failure("E: Unable to locate package llama.cpp-tools", 100)
+        lower = msg.lower()
+        self.assertIn("universe", lower)
+        self.assertIn("apt update", lower)
+        self.assertIn("26.04", msg)
 
     def test_helper_verbs(self) -> None:
         self.assertIn("groups", explain_helper_failure("groups", "fail", 1).lower())

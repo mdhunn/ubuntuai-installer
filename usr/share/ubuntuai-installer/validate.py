@@ -39,6 +39,27 @@ def _fail(name: str, detail: str) -> Check:
     return Check(name, "fail", detail)
 
 
+FIRMWARE_VALIDATE_ONLY = (
+    "Validate-only. The installer will not rewrite firmware. "
+    "Human approval is required if a rewrite is ever offered."
+)
+
+
+def npu_firmware_check(detail: str) -> Check:
+    text = detail or "present"
+    if "firmware path missing" in text:
+        return _warn(
+            "npu-firmware",
+            f"{text}. The installer will not install or rewrite firmware.",
+        )
+    if "mismatched pair" in text:
+        return _warn(
+            "npu-firmware",
+            f"{text}. FastFlowLM wants >= 1.1.0.0. {FIRMWARE_VALIDATE_ONLY}",
+        )
+    return _ok("npu-firmware", text)
+
+
 def _readable_by_user(path: Path, user: str) -> bool:
     if not path.exists():
         return False
@@ -173,16 +194,8 @@ def collect(
             checks.append(
                 _fail(f"device:{d.kind}", f"{d.name} has no device node ({d.detail})")
             )
-        if d.backend == "xdna" and "1.0.0.166" in d.detail:
-            checks.append(
-                _warn(
-                    "npu-firmware",
-                    d.detail
-                    + ". FastFlowLM wants >= 1.1.0.0. Installer will not rewrite firmware.",
-                )
-            )
-        elif d.backend == "xdna":
-            checks.append(_ok("npu-firmware", d.detail or "present"))
+        if d.backend == "xdna":
+            checks.append(npu_firmware_check(d.detail))
 
     for g in ("render", "video"):
         if user_in_group(target.name, g):
