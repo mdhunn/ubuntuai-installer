@@ -226,56 +226,97 @@ def _hash_from_hf_row(row: object, filename: str) -> FileHash | None:
     return None
 
 
-def _hash_from_hf(url: str) -> FileHash | None:
+def _size_from_hf_row(row: object, filename: str) -> int:
+    if not isinstance(row, dict):
+        return 0
+    path = str(row.get("path") or row.get("rfilename") or "")
+    if path not in {filename, Path(filename).name}:
+        return 0
+    lfs = row.get("lfs") or {}
+    if isinstance(lfs, dict):
+        try:
+            n = int(lfs.get("size") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            return n
+    try:
+        return int(row.get("size") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _meta_from_hf(url: str) -> tuple[FileHash | None, int]:
     parsed = parse_hf_url(url)
     if parsed is None:
-        return None
+        return None, 0
     repo, filename = parsed
+    found = None
+    size = 0
     api = f"https://huggingface.co/api/models/{repo}/paths-info/main"
     body = json.dumps({"paths": [filename], "expand": True}).encode("utf-8")
     rows = _http_json(api, data=body)
     if isinstance(rows, list):
         for row in rows:
-            found = _hash_from_hf_row(row, filename)
-            if found:
-                return found
+            if found is None:
+                found = _hash_from_hf_row(row, filename)
+            if size <= 0:
+                size = _size_from_hf_row(row, filename)
+            if found and size:
+                return found, size
     parent = Path(filename).parent.as_posix()
     tree_tail = "" if parent in {".", ""} else f"/{parent}"
     tree = f"https://huggingface.co/api/models/{repo}/tree/main{tree_tail}"
     rows = _http_json(tree)
     if isinstance(rows, list):
         for row in rows:
-            found = _hash_from_hf_row(row, filename)
-            if found:
-                return found
-    blob = f"https://huggingface.co/{repo}/blob/main/{filename}"
-    html = _http_text(blob)
-    if html:
-        return parse_named_hash(html)
-    return None
+            if found is None:
+                found = _hash_from_hf_row(row, filename)
+            if size <= 0:
+                size = _size_from_hf_row(row, filename)
+            if found and size:
+                return found, size
+    if found is None:
+        blob = f"https://huggingface.co/{repo}/blob/main/{filename}"
+        html = _http_text(blob)
+        if html:
+            found = parse_named_hash(html)
+    return found, size
 
 
-def _hash_from_github(url: str) -> FileHash | None:
+def _hash_from_hf(url: str) -> FileHash | None:
+    found, _size = _meta_from_hf(url)
+    return found
+
+
+def _meta_from_github(url: str) -> tuple[FileHash | None, int]:
     parsed = parse_github_release_url(url)
     if parsed is None:
-        return None
+        return None, 0
     owner, repo, tag, filename = parsed
     api = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"
     data = _http_json(api)
-    if not isinstance(data, dict):
-        return None
-    for asset in data.get("assets") or []:
-        if not isinstance(asset, dict):
-            continue
-        if str(asset.get("name") or "") != Path(filename).name:
-            continue
-        found = parse_named_hash(str(asset.get("digest") or ""))
-        if found:
-            return found
+    if isinstance(data, dict):
+        for asset in data.get("assets") or []:
+            if not isinstance(asset, dict):
+                continue
+            if str(asset.get("name") or "") != Path(filename).name:
+                continue
+            found = parse_named_hash(str(asset.get("digest") or ""))
+            try:
+                size = int(asset.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            return found, size
     html = _http_text(f"https://github.com/{owner}/{repo}/releases/tag/{tag}")
     if html:
-        return parse_named_hash(html)
-    return None
+        return parse_named_hash(html), 0
+    return None, 0
+
+
+def _hash_from_github(url: str) -> FileHash | None:
+    found, _size = _meta_from_github(url)
+    return found
 
 
 def _hash_from_sidecar(url: str) -> FileHash | None:
@@ -294,17 +335,28 @@ def _hash_from_sidecar(url: str) -> FileHash | None:
     return None
 
 
-def lookup_published_hash(url: str) -> FileHash | None:
+def lookup_published_meta(url: str) -> tuple[FileHash | None, int]:
+    """Hash and byte size published on the download page or API. Either may be missing."""
     if not url:
-        return None
-    for finder in (_hash_from_hf, _hash_from_github, _hash_from_sidecar):
-        found = finder(url)
-        if found:
-            return found
-    html = _http_text(url)
-    if html:
-        return parse_named_hash(html)
-    return None
+        return None, 0
+    found, size = _meta_from_hf(url)
+    if found is None or size <= 0:
+        gh_found, gh_size = _meta_from_github(url)
+        found = found or gh_found
+        if size <= 0:
+            size = gh_size
+    if found is None:
+        found = _hash_from_sidecar(url)
+    if found is None:
+        html = _http_text(url)
+        if html:
+            found = parse_named_hash(html)
+    return found, size
+
+
+def lookup_published_hash(url: str) -> FileHash | None:
+    found, _size = lookup_published_meta(url)
+    return found
 
 
 def catalog_checksum(row: dict) -> tuple[str, str]:
@@ -843,6 +895,36 @@ def catalog_dest(model: CatalogWeight, model_root: Path) -> Path:
     return model_root / model.subdir / model.filename
 
 
+def verify_download(
+    path: Path,
+    model: CatalogWeight,
+    *,
+    expected: FileHash | None = None,
+    expected_size: int = 0,
+) -> None:
+    """Reject an exit-0 download that is missing, empty, short, or the wrong hash.
+
+    Hugging Face Xet and some CDNs close the body early and still report success.
+    Catalog checksums are often empty, so size is the gate when no digest exists.
+    """
+    if not path.exists() or not path.is_file():
+        raise RuntimeError(f"download missing for {model.id}")
+    size = path.stat().st_size
+    if size <= 0:
+        raise RuntimeError(f"empty download for {model.id}")
+    want = expected or model.published_hash()
+    if want:
+        digest = hash_file(path, want.algo)
+        if digest != want.hexdigest.lower():
+            raise RuntimeError(f"{want.algo} mismatch for {model.id}")
+        return
+    want_size = expected_size or model.bytes
+    if want_size > 0 and size != want_size:
+        raise RuntimeError(
+            f"incomplete download for {model.id} ({size} B of {want_size} B)"
+        )
+
+
 def download(
     model: CatalogWeight,
     model_root: Path,
@@ -870,23 +952,31 @@ def download(
     part = dest.with_name(dest.name + ".part")
     req = urllib.request.Request(model.url, headers={"User-Agent": UA})
     written = 0
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        total = int(resp.headers.get("Content-Length") or 0) or model.bytes
-        with open(part, "wb") as fh:
-            while True:
-                chunk = resp.read(256 * 1024)
-                if not chunk:
-                    break
-                fh.write(chunk)
-                written += len(chunk)
-                if on_progress:
-                    on_progress(written, total)
-    want = expected or model.published_hash() or lookup_published_hash(model.url)
-    if want:
-        digest = hash_file(part, want.algo)
-        if digest != want.hexdigest.lower():
-            part.unlink(missing_ok=True)
-            raise RuntimeError(f"{want.algo} mismatch for {model.id}")
+    content_length = 0
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            content_length = int(resp.headers.get("Content-Length") or 0)
+            total = content_length or model.bytes
+            with open(part, "wb") as fh:
+                while True:
+                    chunk = resp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    written += len(chunk)
+                    if on_progress:
+                        on_progress(written, total)
+        want = expected or model.published_hash()
+        published_size = 0
+        if want is None:
+            want, published_size = lookup_published_meta(model.url)
+        # Prefer the size published on the download page. Catalog bytes next.
+        # Content-Length last. A truncated Xet body can advertise its own short length.
+        want_size = published_size or model.bytes or content_length
+        verify_download(part, model, expected=want, expected_size=want_size)
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
     part.replace(dest)
     if uid is not None and gid is not None:
         os.chown(dest, uid, gid)

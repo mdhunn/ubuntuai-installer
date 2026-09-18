@@ -231,6 +231,18 @@ class InstallerPlanTests(unittest.TestCase):
         self.assertIn("checksum", ctx.exception.english.lower())
         self.assertIn("md5 mismatch", ctx.exception.technical)
 
+    def test_execute_plan_incomplete_download_english(self) -> None:
+        actions = (Action("weights", "whisper", ("whisper-base-en",)),)
+        with patch(
+            "apply.ensure_weight",
+            side_effect=RuntimeError("incomplete download for whisper-base-en (4 B of 125 B)"),
+        ):
+            with self.assertRaises(ApplyError) as ctx:
+                execute_plan(actions, self.target, hw=_strix(), dry_run=False)
+        self.assertIn("incomplete", ctx.exception.english.lower())
+        self.assertNotIn("checksum", ctx.exception.english.lower())
+        self.assertIn("incomplete download", ctx.exception.technical)
+
     def test_execute_plan_groups_failure_english(self) -> None:
         with patch("apply.dpkg_installed", return_value=True), patch(
             "apply.user_in_group", return_value=False

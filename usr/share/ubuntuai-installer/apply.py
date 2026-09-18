@@ -449,10 +449,16 @@ def execute_plan(
                         )
                     except Exception as exc:  # noqa: BLE001
                         detail = str(exc)
-                        if "mismatch" in detail.lower():
+                        low = detail.lower()
+                        if "mismatch" in low:
                             english = (
                                 "A downloaded model file did not match the checksum "
                                 "published on its page. The broken file was not kept."
+                            )
+                        elif "incomplete download" in low or "empty download" in low:
+                            english = (
+                                "A downloaded model file was incomplete or the wrong size. "
+                                "The broken file was not kept."
                             )
                         else:
                             english = "Could not get a required model file."

@@ -13,6 +13,7 @@ from support import PKG
 from domain import CatalogWeight, FileHash
 from weights import (
     _hash_from_hf_row,
+    _size_from_hf_row,
     classify,
     detect_bundle,
     download,
@@ -24,6 +25,7 @@ from weights import (
     parse_named_hash,
     scan,
     scan_roots,
+    verify_download,
 )
 
 
@@ -255,6 +257,8 @@ class HashParseTests(unittest.TestCase):
         self.assertTrue(found.hexdigest.startswith("a03779c8"))
         git_only = {"path": "readme.md", "oid": "87c664c563ef3ff52424dd4fa925cf95b306dba6"}
         self.assertIsNone(_hash_from_hf_row(git_only, "readme.md"))
+        self.assertEqual(_size_from_hf_row(row, "ggml-base.en.bin"), 147964211)
+        self.assertEqual(_size_from_hf_row(git_only, "readme.md"), 0)
 
 
 class CatalogTests(unittest.TestCase):
@@ -313,6 +317,221 @@ class CatalogTests(unittest.TestCase):
                     download(model, store, expected=FileHash("md5", "0" * 32))
         finally:
             httpd.shutdown()
+
+    def test_download_rejects_truncated_without_checksum(self) -> None:
+        payload = b"w" * (32 * 1024)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, fmt, *args):
+                return
+
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_address[1]
+            model = CatalogWeight(
+                id="probe-short",
+                title="probe",
+                summary="",
+                subdir="gguf",
+                filename="probe-short.gguf",
+                url=f"http://127.0.0.1:{port}/probe-short.gguf",
+                bytes=len(payload) * 8,
+                workflows=(),
+            )
+            with TemporaryDirectory() as tmp:
+                store = Path(tmp)
+                with self.assertRaises(RuntimeError) as ctx:
+                    download(model, store)
+                self.assertIn("incomplete download", str(ctx.exception))
+                dest = store / "gguf" / "probe-short.gguf"
+                self.assertFalse(dest.exists())
+                self.assertFalse(dest.with_name(dest.name + ".part").exists())
+        finally:
+            httpd.shutdown()
+
+    def test_download_rejects_zero_byte_without_checksum(self) -> None:
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, fmt, *args):
+                return
+
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_address[1]
+            model = CatalogWeight(
+                id="probe-empty",
+                title="probe",
+                summary="",
+                subdir="gguf",
+                filename="probe-empty.gguf",
+                url=f"http://127.0.0.1:{port}/probe-empty.gguf",
+                bytes=128 * 1024,
+                workflows=(),
+            )
+            with TemporaryDirectory() as tmp:
+                store = Path(tmp)
+                with self.assertRaises(RuntimeError) as ctx:
+                    download(model, store)
+                self.assertIn("empty download", str(ctx.exception))
+                dest = store / "gguf" / "probe-empty.gguf"
+                self.assertFalse(dest.exists())
+                self.assertFalse(dest.with_name(dest.name + ".part").exists())
+        finally:
+            httpd.shutdown()
+
+    def test_download_rejects_content_length_that_matches_a_short_body(self) -> None:
+        payload = b"w" * (16 * 1024)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, fmt, *args):
+                return
+
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_address[1]
+            model = CatalogWeight(
+                id="probe-xet",
+                title="probe",
+                summary="",
+                subdir="gguf",
+                filename="probe-xet.gguf",
+                url=f"http://127.0.0.1:{port}/probe-xet.gguf",
+                bytes=len(payload) * 16,
+                workflows=(),
+            )
+            with TemporaryDirectory() as tmp:
+                store = Path(tmp)
+                with self.assertRaises(RuntimeError) as ctx:
+                    download(model, store)
+                self.assertIn("incomplete download", str(ctx.exception))
+                dest = store / "gguf" / "probe-xet.gguf"
+                self.assertFalse(dest.exists())
+        finally:
+            httpd.shutdown()
+
+    def test_download_uses_published_size_not_rounded_catalog(self) -> None:
+        payload = b"w" * (64 * 1024)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, fmt, *args):
+                return
+
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_address[1]
+            model = CatalogWeight(
+                id="probe-lfs",
+                title="probe",
+                summary="",
+                subdir="gguf",
+                filename="probe-lfs.gguf",
+                url=f"http://127.0.0.1:{port}/probe-lfs.gguf",
+                bytes=2684354560,
+                workflows=(),
+            )
+            with TemporaryDirectory() as tmp:
+                store = Path(tmp)
+                with patch(
+                    "weights.lookup_published_meta",
+                    return_value=(None, len(payload)),
+                ):
+                    msg = download(model, store)
+                dest = store / "gguf" / "probe-lfs.gguf"
+                self.assertTrue(dest.is_file())
+                self.assertEqual(dest.stat().st_size, len(payload))
+                self.assertIn("downloaded", msg)
+        finally:
+            httpd.shutdown()
+
+
+class VerifyDownloadTests(unittest.TestCase):
+    def _model(self, **kwargs) -> CatalogWeight:
+        row = {
+            "id": "probe",
+            "title": "probe",
+            "summary": "",
+            "subdir": "gguf",
+            "filename": "probe.gguf",
+            "url": "https://huggingface.co/example/repo/resolve/main/probe.gguf",
+            "bytes": 128 * 1024,
+            "workflows": (),
+        }
+        row.update(kwargs)
+        return CatalogWeight(**row)
+
+    def test_rejects_missing_and_empty(self) -> None:
+        model = self._model()
+        with TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.gguf"
+            with self.assertRaises(RuntimeError) as ctx:
+                verify_download(missing, model)
+            self.assertIn("download missing", str(ctx.exception))
+            empty = Path(tmp) / "empty.gguf"
+            empty.write_bytes(b"")
+            with self.assertRaises(RuntimeError) as ctx:
+                verify_download(empty, model)
+            self.assertIn("empty download", str(ctx.exception))
+
+    def test_size_gate_when_checksum_empty(self) -> None:
+        model = self._model(bytes=128 * 1024)
+        with TemporaryDirectory() as tmp:
+            short = Path(tmp) / "short.gguf"
+            short.write_bytes(b"w" * 4096)
+            with self.assertRaises(RuntimeError) as ctx:
+                verify_download(short, model)
+            self.assertIn("incomplete download", str(ctx.exception))
+            ok = Path(tmp) / "ok.gguf"
+            ok.write_bytes(b"w" * (128 * 1024))
+            verify_download(ok, model)
+
+    def test_published_size_overrides_catalog_bytes(self) -> None:
+        model = self._model(bytes=99)
+        with TemporaryDirectory() as tmp:
+            blob = Path(tmp) / "blob.gguf"
+            blob.write_bytes(b"w" * 4096)
+            verify_download(blob, model, expected_size=4096)
+            with self.assertRaises(RuntimeError):
+                verify_download(blob, model, expected_size=8192)
+
+    def test_hash_is_source_of_truth_when_present(self) -> None:
+        payload = b"w" * 4096
+        digest = hashlib.md5(payload).hexdigest()
+        model = self._model(bytes=99, hash_algo="md5", hash_hex=digest)
+        with TemporaryDirectory() as tmp:
+            blob = Path(tmp) / "blob.gguf"
+            blob.write_bytes(payload)
+            verify_download(blob, model)
+            with self.assertRaises(RuntimeError) as ctx:
+                verify_download(blob, model, expected=FileHash("md5", "0" * 32))
+            self.assertIn("md5 mismatch", str(ctx.exception))
 
 
 if __name__ == "__main__":
