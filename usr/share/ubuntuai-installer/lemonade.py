@@ -456,22 +456,54 @@ def _restart_snap() -> None:
     _run(["snap", "restart", "lemonade-server.daemon"])
 
 
+def gguf_tree_bytes(root: Path) -> int:
+    """Largest real GGUF in root. Numbered shards in one folder count as one file."""
+    try:
+        if not root.is_dir():
+            return 0
+        files = root.rglob("*.gguf")
+    except OSError:
+        return 0
+    biggest = 0
+    shard_dirs: dict[Path, int] = {}
+    for p in files:
+        if p.is_symlink() or not p.is_file():
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        biggest = max(biggest, size)
+        if "-of-" in p.name.lower():
+            shard_dirs[p.parent] = shard_dirs.get(p.parent, 0) + size
+    if shard_dirs:
+        biggest = max(biggest, max(shard_dirs.values()))
+    return biggest
+
+
+def model_gguf_bytes(path: Path) -> int:
+    """Bytes Lemonade would see for one selected file or shard folder."""
+    try:
+        if path.is_symlink() or path.is_file():
+            real = path.resolve()
+            if real.is_dir():
+                return gguf_tree_bytes(real)
+            if not real.is_file():
+                return 0
+            if "-of-" in real.name.lower():
+                return gguf_tree_bytes(real.parent)
+            return real.stat().st_size
+        if path.is_dir():
+            return gguf_tree_bytes(path)
+    except OSError:
+        return 0
+    return 0
+
+
 def largest_gguf_bytes(target: UserTarget) -> int:
     biggest = 0
     for root in gguf_sources(target):
-        shard_dirs: dict[Path, int] = {}
-        for p in root.rglob("*.gguf"):
-            if p.is_symlink() or not p.is_file():
-                continue
-            try:
-                size = p.stat().st_size
-            except OSError:
-                continue
-            biggest = max(biggest, size)
-            if "-of-" in p.name.lower():
-                shard_dirs[p.parent] = shard_dirs.get(p.parent, 0) + size
-        if shard_dirs:
-            biggest = max(biggest, max(shard_dirs.values()))
+        biggest = max(biggest, gguf_tree_bytes(root))
     return biggest
 
 

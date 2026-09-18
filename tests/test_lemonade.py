@@ -25,6 +25,7 @@ from lemonade import (
     is_owned_lemonade_where,
     largest_gguf_bytes,
     leftover_owned_binds,
+    model_gguf_bytes,
     load_risk,
     load_tuning,
     mount_unit_text,
@@ -867,6 +868,17 @@ class LemonadePublishTuningTests(unittest.TestCase):
             (shard / "mmproj.gguf").write_bytes(b"M" * 100)
             size = largest_gguf_bytes(_target(home, extra=(extra,)))
             self.assertEqual(size, 4000)
+
+    def test_model_gguf_bytes_follows_selected_shard_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            shard = Path(tmp) / "Huge"
+            shard.mkdir()
+            first = shard / "huge-00001-of-00002.gguf"
+            first.write_bytes(b"G" * 1000)
+            (shard / "huge-00002-of-00002.gguf").write_bytes(b"G" * 1500)
+            (shard / "other.gguf").write_bytes(b"X" * 50)
+            self.assertEqual(model_gguf_bytes(first), 2500)
+            self.assertEqual(model_gguf_bytes(shard), 2500)
 
 
 if __name__ == "__main__":
