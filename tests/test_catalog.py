@@ -153,7 +153,7 @@ class CatalogTests(unittest.TestCase):
             wf = index[wid]
             self.assertTrue(wf.helpers_only, wid)
             self.assertTrue(is_helpers_only(wf), wid)
-            self.assertFalse(wf.default, wid)
+            self.assertTrue(wf.default, wid)
             self.assertEqual(wf.title, title)
         self.assertFalse(index["ubuntuai-chat"].helpers_only)
         ids = helper_workflow_ids(self.wfs)
