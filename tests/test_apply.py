@@ -14,12 +14,13 @@ from apply import (
     PKG_RE,
     assert_model_root,
     build_plan,
+    ensure_ggml_vulkan,
     execute_plan,
     explain_apt_failure,
     format_failure,
 )
 from catalog import load_workflows
-from domain import Action, Device, Hardware, UserTarget
+from domain import Action, Device, Hardware, UserTarget, Workflow
 
 
 def _hw_strix() -> Hardware:
@@ -31,6 +32,30 @@ def _hw_strix() -> Hardware:
             Device("igpu", "amd", "8060S", "/dev/dri/renderD128", "vulkan"),
             Device("cpu", "cpu", "cpu", None, "cpu"),
         ),
+    )
+
+
+def _wf(
+    wid: str,
+    *,
+    always: bool = False,
+    requires: tuple[str, ...] = (),
+    apt: tuple[str, ...] = (),
+) -> Workflow:
+    return Workflow(
+        id=wid,
+        title=wid,
+        summary=wid,
+        default=False,
+        always=always,
+        requires=requires,
+        apt=apt,
+        groups=(),
+        model_subdirs=(),
+        needs_any_backend=(),
+        hide_unless_backend=(),
+        ports=(),
+        notes="",
     )
 
 
@@ -109,7 +134,80 @@ class ApplyTests(unittest.TestCase):
         kinds = {a.kind: a for a in actions}
         self.assertIn("apt_install", kinds)
         self.assertIn("llama.cpp-tools", kinds["apt_install"].payload)
+        self.assertIn("libggml0-backend-vulkan", kinds["apt_install"].payload)
         self.assertIn("groups", kinds)
+
+    def test_ensure_ggml_vulkan_adds_backend_for_llama_and_whisper(self) -> None:
+        self.assertEqual(
+            ensure_ggml_vulkan(["llama.cpp-tools"]),
+            ["llama.cpp-tools", "libggml0-backend-vulkan"],
+        )
+        self.assertEqual(
+            ensure_ggml_vulkan(["whisper.cpp"]),
+            ["whisper.cpp", "libggml0-backend-vulkan"],
+        )
+        both = ensure_ggml_vulkan(["llama.cpp-tools", "libggml0-backend-vulkan"])
+        self.assertEqual(both.count("libggml0-backend-vulkan"), 1)
+        self.assertIn("llama.cpp-tools", both)
+        self.assertEqual(ensure_ggml_vulkan(["rhvoice"]), ["rhvoice"])
+
+    def test_plan_adds_vulkan_when_catalog_omits_it(self) -> None:
+        wfs = (
+            _wf("ubuntuai-core", always=True, apt=("pciutils",)),
+            _wf(
+                "ubuntuai-chat",
+                requires=("ubuntuai-core",),
+                apt=("llama.cpp-tools",),
+            ),
+        )
+        with patch("apply.dpkg_installed", return_value=False), patch(
+            "apply.user_in_group", return_value=True
+        ):
+            actions = build_plan(
+                ("ubuntuai-chat",),
+                _hw_strix(),
+                self.target,
+                wfs,
+            )
+        pkgs = next(a.payload for a in actions if a.kind == "apt_install")
+        self.assertIn("llama.cpp-tools", pkgs)
+        self.assertIn("libggml0-backend-vulkan", pkgs)
+
+    def test_plan_adds_vulkan_when_whisper_catalog_omits_it(self) -> None:
+        wfs = (
+            _wf("ubuntuai-core", always=True, apt=("pciutils",)),
+            _wf(
+                "ubuntuai-stt-whisper",
+                requires=("ubuntuai-core",),
+                apt=("whisper.cpp",),
+            ),
+        )
+        with patch("apply.dpkg_installed", return_value=False), patch(
+            "apply.user_in_group", return_value=True
+        ):
+            actions = build_plan(
+                ("ubuntuai-stt-whisper",),
+                _hw_strix(),
+                self.target,
+                wfs,
+            )
+        pkgs = next(a.payload for a in actions if a.kind == "apt_install")
+        self.assertIn("whisper.cpp", pkgs)
+        self.assertIn("libggml0-backend-vulkan", pkgs)
+
+    def test_whisper_plan_requires_vulkan_backend(self) -> None:
+        with patch("apply.dpkg_installed", return_value=False), patch(
+            "apply.user_in_group", return_value=True
+        ):
+            actions = build_plan(
+                ("ubuntuai-stt-whisper",),
+                _hw_strix(),
+                self.target,
+                self.wfs,
+            )
+        pkgs = next(a.payload for a in actions if a.kind == "apt_install")
+        self.assertIn("whisper.cpp", pkgs)
+        self.assertIn("libggml0-backend-vulkan", pkgs)
 
     def test_openmoss_plan_installs_runtime_and_weights(self) -> None:
         with patch("apply.dpkg_installed", return_value=True), patch(
@@ -144,6 +242,19 @@ class ApplyTests(unittest.TestCase):
                 weight_ids.extend(a.payload)
         self.assertIn("whisper-base-en", weight_ids)
 
+    def test_explain_apt_unable_to_locate_mentions_universe(self) -> None:
+        for output in (
+            "E: Unable to locate package llama.cpp-tools",
+            "E: Package 'whisper.cpp' has no installation candidate",
+        ):
+            with self.subTest(output=output):
+                msg = explain_apt_failure(output, 100)
+                lower = msg.lower()
+                self.assertIn("universe", lower)
+                self.assertIn("apt update", lower)
+                self.assertIn("26.04", msg)
+                self.assertNotIn("100", msg)
+
     def test_explain_apt_lock_is_english(self) -> None:
         msg = explain_apt_failure(
             "E: Could not get lock /var/lib/dpkg/lock-frontend",
@@ -174,7 +285,9 @@ class ApplyTests(unittest.TestCase):
             with self.assertRaises(ApplyError) as ctx:
                 execute_plan(actions, self.target, hw=_hw_strix(), dry_run=False)
         err = ctx.exception
-        self.assertIn("does not know", err.english)
+        self.assertIn("universe", err.english.lower())
+        self.assertIn("apt update", err.english.lower())
+        self.assertIn("26.04", err.english)
         self.assertIn("Unable to locate package", err.technical)
         self.assertIn("exit: 100", err.technical)
         text = format_failure(err)
