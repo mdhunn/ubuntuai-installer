@@ -461,6 +461,14 @@ def _qt_weights(win, user, status) -> QWidget:
     add_row.addWidget(folder_entry, 1)
     add_row.addWidget(browse_btn)
     add_row.addWidget(add_folder_btn)
+    t0 = target_for(user)
+    hint = QLabel(
+        f"Search known folders plus any you add, then copy into {t0.model_root}. "
+        "Move is offered when the source directory is writable. "
+        "Downloads are opt-in and go into the same store."
+    )
+    hint.setWordWrap(True)
+    layout.addWidget(hint)
     layout.addWidget(QLabel("Folders"))
     layout.addWidget(folder_scroll)
     layout.addLayout(add_row)

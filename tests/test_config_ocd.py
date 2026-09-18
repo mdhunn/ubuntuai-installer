@@ -328,6 +328,10 @@ class ConfigHealthAndCliTests(unittest.TestCase):
             self.assertNotIn("Hybrid not detected", src)
             self.assertNotIn("Bind {", src)
             self.assertNotIn("No GGUF chat files", src)
+            self.assertIn("then copy into", src)
+            self.assertNotIn("then symlink into", src)
+            self.assertNotIn('"Symlink"', src)
+            self.assertNotIn("mode = \"link\"", src)
 
     def test_help_lists_explain_and_chat_model(self) -> None:
         buf = io.StringIO()

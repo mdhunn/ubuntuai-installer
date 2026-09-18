@@ -411,5 +411,19 @@ class InstallerTwinWarnTests(unittest.TestCase):
             self.assertNotIn("This model may strain this computer", src)
 
 
+class InstallerTwinOrganizeTests(unittest.TestCase):
+    def test_gtk_qt_organize_offers_copy_not_link(self) -> None:
+        gtk = (PKG / "ui" / "gtk_ui.py").read_text(encoding="utf-8")
+        qt = (PKG / "ui" / "qt_ui.py").read_text(encoding="utf-8")
+        for src in (gtk, qt):
+            self.assertIn("then copy into", src)
+            self.assertTrue(
+                'label="Copy"' in src or 'QRadioButton("Copy")' in src
+            )
+            self.assertNotIn("then symlink into", src)
+            self.assertNotIn('"Symlink"', src)
+            self.assertNotIn('mode = "link"', src)
+
+
 if __name__ == "__main__":
     unittest.main()
