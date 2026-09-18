@@ -476,8 +476,9 @@ def installer_main(argv: list[str] | None = None) -> int:
         return 0
     if args.publish_lemonade:
         from apply import run_privileged
+        from lemonade import APPLY_PUBLISH_VERB
 
-        rc, out = run_privileged("lemonade-publish", [user], dry_run=args.dry_run)
+        rc, out = run_privileged(APPLY_PUBLISH_VERB, [user], dry_run=args.dry_run)
         if rc != 0:
             print(out or "lemonade publish failed", file=sys.stderr)
             return 1

@@ -17,6 +17,10 @@ PROFILE_FILE = Path("/etc/profile.d/ubuntuai.sh")
 LIMITS_FILE = Path("/etc/security/limits.d/30-ubuntuai.conf")
 USER_CONFIG_NAME = Path("ubuntuai") / "config.json"
 
+# Lemonade snap ProtectHome cannot read /home or follow ~/Models symlinks.
+SNAP_LEMONADE_COMMON = Path("/var/snap/lemonade-server/common")
+SNAP_LEMONADE_MODELS = SNAP_LEMONADE_COMMON / "ubuntuai-models"
+
 HELPER_CANDIDATES = (
     Path("/usr/local/sbin/ubuntuai-installer-helper"),
     Path("/usr/sbin/ubuntuai-installer-helper"),
@@ -36,3 +40,20 @@ def user_config_path(home: Path) -> Path:
     if xdg:
         return Path(xdg) / USER_CONFIG_NAME
     return home / ".config" / USER_CONFIG_NAME
+
+
+def lemonade_extra_models_dir(kind: str) -> Path:
+    """Snap-visible extra_models_dir. Empty when Lemonade is not a snap."""
+    if kind == "snap":
+        return SNAP_LEMONADE_MODELS
+    return Path()
+
+
+def is_home_path(path: Path) -> bool:
+    """True when path is under /home. The snap cannot use that as extra_models_dir."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    parts = resolved.parts
+    return len(parts) >= 2 and parts[0] == "/" and parts[1] == "home"
