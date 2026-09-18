@@ -22,11 +22,13 @@ from runtime import (
     app_statuses,
     backend_choices,
     chat_models,
+    chat_weight_ids,
     endpoint_for,
     explain_setup,
     is_present,
     listen_words,
     machine_words,
+    no_chat_gguf,
     workflow_row_title,
 )
 from users import load_saved_bind, load_saved_model_root
@@ -172,6 +174,9 @@ class ConfigAppContractTests(unittest.TestCase):
             names = chat_models(root)
             self.assertEqual(names, ("hf-style", "model.gguf"))
             self.assertEqual(chat_models(root / "missing"), ())
+            self.assertFalse(no_chat_gguf(root))
+            self.assertTrue(no_chat_gguf(root / "missing"))
+        self.assertIn("qwen3-0.6b-q8_0", chat_weight_ids(self.wfs))
 
 
 class ConfigStoreTests(unittest.TestCase):
@@ -310,6 +315,8 @@ class ConfigHealthAndCliTests(unittest.TestCase):
             self.assertIn("CHAT_MODEL_CTA", src)
             self.assertIn("CHAT_MODEL_NEEDED_CONFIG", src)
             self.assertIn("HELPERS_SECTION", src)
+            self.assertIn("prepare_chat_download", src)
+            self.assertIn("no_chat_gguf", src)
             self.assertIn("This computer only", src)
             self.assertNotIn("Backends:", src)
             self.assertNotIn("Hybrid available", src)

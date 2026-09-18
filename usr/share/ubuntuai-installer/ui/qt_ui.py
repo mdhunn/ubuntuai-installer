@@ -60,8 +60,10 @@ from runtime import (
     app_statuses,
     backend_choices,
     chat_models,
+    chat_weight_ids,
     listen_words,
     machine_words,
+    no_chat_gguf,
     workflow_row_title,
 )
 from validate import collect, format_checks, format_health
@@ -122,8 +124,19 @@ def _installer_widget(win: QMainWindow) -> QWidget:
     tabs = QTabWidget()
     status = QLabel("")
     status.setWordWrap(True)
-    tabs.addTab(_qt_workflows(win, hw, user, workflows, status), "Workflows")
-    tabs.addTab(_qt_weights(win, user, status), "Weights")
+    wt_page = _qt_weights(win, user, status)
+
+    def show_chat_download() -> None:
+        tabs.setCurrentWidget(wt_page)
+        prepare = getattr(wt_page, "prepare_chat_download", None)
+        if prepare:
+            prepare()
+
+    tabs.addTab(
+        _qt_workflows(win, hw, user, workflows, status, show_chat_download),
+        "Workflows",
+    )
+    tabs.addTab(wt_page, "Weights")
     tabs.addTab(_qt_upgrade(win, user, status), "Updates")
     tabs.addTab(_qt_repair(win, user, status), "Repair")
     layout.addWidget(tabs, 1)
@@ -198,7 +211,7 @@ def _show_failure(win, english: str, technical: str = "") -> None:
     box.exec()
 
 
-def _qt_workflows(win, hw, user, workflows, status) -> QWidget:
+def _qt_workflows(win, hw, user, workflows, status, show_chat_download) -> QWidget:
     page = QWidget()
     layout = QVBoxLayout(page)
     checks: dict[str, QCheckBox] = {}
@@ -244,6 +257,11 @@ def _qt_workflows(win, hw, user, workflows, status) -> QWidget:
     scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     scroller.setWidget(inner)
     layout.addWidget(scroller, 1)
+    cta = QPushButton(CHAT_MODEL_CTA)
+    cta.setDefault(True)
+    cta.setVisible(no_chat_gguf(target_for(user).model_root))
+    cta.clicked.connect(show_chat_download)
+    layout.addWidget(cta)
     row = QHBoxLayout()
     exit_btn = QPushButton("Exit")
     dry = QPushButton("Dry run")
@@ -272,6 +290,13 @@ def _qt_workflows(win, hw, user, workflows, status) -> QWidget:
         def drain() -> None:
             while pending:
                 ev = pending.pop(0)
+                if isinstance(ev, tuple) and ev and ev[0] == "chat-cta":
+                    cta.setVisible(True)
+                    _show_chat_model_cta(win, show_chat_download)
+                    continue
+                if isinstance(ev, tuple) and ev and ev[0] == "chat-cta-hide":
+                    cta.setVisible(False)
+                    continue
                 update(ev)
                 if isinstance(ev, ProgressEvent) and ev.failed:
                     status.setText(ev.english)
@@ -294,6 +319,9 @@ def _qt_workflows(win, hw, user, workflows, status) -> QWidget:
                 record_installed(user, expand_selection(ids, workflows, hw))
                 report = collect(t, hw)
                 extra = "\nLog out and back in if group membership just changed."
+                need_model = no_chat_gguf(t.model_root)
+                if need_model:
+                    extra += "\n" + CHAT_MODEL_NEEDED
                 pending.append(
                     ProgressEvent(
                         "Finished.",
@@ -302,6 +330,10 @@ def _qt_workflows(win, hw, user, workflows, status) -> QWidget:
                         done=True,
                     )
                 )
+                if need_model:
+                    pending.append(("chat-cta",))
+                else:
+                    pending.append(("chat-cta-hide",))
             except ApplyError as exc:
                 pending.append(
                     ProgressEvent(exc.english, exc.technical, failed=True)
@@ -548,9 +580,25 @@ def _qt_weights(win, user, status) -> QWidget:
     add_folder_btn.clicked.connect(lambda: do_add_folder(folder_entry.text()))
     folder_entry.returnPressed.connect(lambda: do_add_folder(folder_entry.text()))
     browse_btn.clicked.connect(do_browse)
+    def prepare_chat_download() -> None:
+        refill_downloads()
+        needed = chat_weight_ids()
+        for model in load_weight_catalog():
+            want = model.id in needed or (
+                model.default and "ubuntuai-chat" in model.workflows
+            )
+            if not want:
+                continue
+            box = dl_checks.get(model.id)
+            if box is not None and box.isEnabled():
+                box.setChecked(True)
+        dl_btn.setFocus()
+        status.setText(CHAT_MODEL_NEEDED)
+
     refill_folders()
     refill_found()
     refill_downloads()
+    page.prepare_chat_download = prepare_chat_download
     return page
 
 

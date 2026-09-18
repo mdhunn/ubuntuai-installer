@@ -43,8 +43,10 @@ from runtime import (
     app_statuses,
     backend_choices,
     chat_models,
+    chat_weight_ids,
     listen_words,
     machine_words,
+    no_chat_gguf,
     workflow_row_title,
 )
 from validate import collect, format_checks, format_health, worst
@@ -117,8 +119,17 @@ def _installer_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
     outer.append(switcher)
 
     status = Gtk.Label(label="", xalign=0, wrap=True)
-    wf_page = _workflows_page(win, hw, user, workflows, checks, status)
     wt_page = _weights_page(win, user, status)
+
+    def show_chat_download() -> None:
+        stack.set_visible_child_name("weights")
+        prepare = getattr(wt_page, "prepare_chat_download", None)
+        if prepare:
+            prepare()
+
+    wf_page = _workflows_page(
+        win, hw, user, workflows, checks, status, show_chat_download
+    )
     rp_page = _repair_page(win, user, status)
     up_page = _upgrade_page(win, user, status)
     stack.add_titled(wf_page, "workflows", "Workflows")
@@ -279,7 +290,7 @@ def _scroller(child: Gtk.Widget) -> Gtk.ScrolledWindow:
     return scroller
 
 
-def _workflows_page(win, hw, user, workflows, checks, status) -> Gtk.Widget:
+def _workflows_page(win, hw, user, workflows, checks, status, show_chat_download) -> Gtk.Widget:
     page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     helpers = helper_workflow_ids(workflows)
     rec = recommended_ids(workflows, hw)
@@ -320,6 +331,14 @@ def _workflows_page(win, hw, user, workflows, checks, status) -> Gtk.Widget:
         for wf in helper_wfs:
             helper_box.append(fill_row(wf))
         page.append(_scroller(helper_box))
+    cta = Gtk.Button(label=CHAT_MODEL_CTA)
+    cta.add_css_class("suggested-action")
+    cta.connect("clicked", lambda *_: show_chat_download())
+    if no_chat_gguf(target_for(user).model_root):
+        cta.set_visible(True)
+    else:
+        cta.set_visible(False)
+    page.append(cta)
     buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     exit_btn = Gtk.Button(label="Exit")
     dry = Gtk.Button(label="Dry run")
@@ -366,7 +385,15 @@ def _workflows_page(win, hw, user, workflows, checks, status) -> Gtk.Widget:
             extra = ""
             if any(c.name.startswith("group:") for c in report):
                 extra = "\nLog out and back in if group membership just changed."
+            need_model = no_chat_gguf(t.model_root)
+            if need_model:
+                extra += "\n" + CHAT_MODEL_NEEDED
             GLib.idle_add(status.set_text, format_checks(report) + extra)
+            if need_model:
+                GLib.idle_add(cta.set_visible, True)
+                GLib.idle_add(_show_chat_model_cta, win, show_chat_download)
+            else:
+                GLib.idle_add(cta.set_visible, False)
             if worst(report) == "fail":
                 GLib.idle_add(apply_btn.add_css_class, "destructive-action")
 
@@ -673,9 +700,26 @@ def _weights_page(win, user, status) -> Gtk.Widget:
         "activate", lambda *_: do_add_folder(folder_entry.get_text())
     )
     browse_btn.connect("clicked", lambda *_: do_browse())
+
+    def prepare_chat_download() -> None:
+        refill_downloads()
+        needed = chat_weight_ids()
+        for model in load_weight_catalog():
+            want = model.id in needed or (
+                model.default and "ubuntuai-chat" in model.workflows
+            )
+            if not want:
+                continue
+            cb = dl_checks.get(model.id)
+            if cb is not None and cb.get_sensitive():
+                cb.set_active(True)
+        dl_btn.grab_focus()
+        status.set_text(CHAT_MODEL_NEEDED)
+
     refill_folders()
     refill_found()
     refill_downloads()
+    page.prepare_chat_download = prepare_chat_download
     return page
 
 

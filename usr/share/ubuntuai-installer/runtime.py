@@ -169,6 +169,19 @@ def chat_models(model_root: Path) -> tuple[str, ...]:
     return tuple(names)
 
 
+def no_chat_gguf(model_root: Path) -> bool:
+    return not chat_models(model_root)
+
+
+def chat_weight_ids(workflows: tuple[Workflow, ...] | None = None) -> frozenset[str]:
+    wfs = workflows if workflows is not None else load_workflows()
+    ids: set[str] = set()
+    for wf in wfs:
+        if wf.id == "ubuntuai-chat":
+            ids.update(wf.required_weights)
+    return frozenset(ids)
+
+
 def backend_choices(hw: Hardware) -> tuple[str, ...]:
     order = ("vulkan", "rocm", "cuda", "xdna", "cpu")
     have = hw.installable_backends()
