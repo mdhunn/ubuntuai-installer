@@ -75,6 +75,28 @@ class RepairTests(unittest.TestCase):
         )
         self.assertFalse(any(s.get("kind") == "redownload" for s in plan["steps"]))
 
+    def test_classical_fastflowlm_missing_is_note_not_chat(self) -> None:
+        diag = {
+            "checks": [
+                {
+                    "name": "fastflowlm",
+                    "status": "warn",
+                    "detail": (
+                        "XDNA2 present. flm is not on PATH. "
+                        "Hybrid engine is missing. Chat still uses llama.cpp."
+                    ),
+                }
+            ],
+            "bind": "127.0.0.1",
+            "checksums": [],
+        }
+        plan = classical_plan(diag)
+        self.assertTrue(any(s.get("kind") == "note" for s in plan["steps"]))
+        self.assertFalse(
+            any(s.get("kind") == "install_workflow" for s in plan["steps"])
+        )
+        self.assertFalse(any(s.get("id") == "ubuntuai-chat" for s in plan["steps"]))
+
     def test_classical_notes_missing_groups(self) -> None:
         diag = {
             "checks": [

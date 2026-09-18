@@ -118,6 +118,10 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("ubuntuai-tts-rhvoice", rec)
         self.assertIn("ubuntuai-stt-whisper", rec)
         self.assertNotIn("ubuntuai-tts-espeak", rec)
+        self.assertIn("ubuntuai-chat", rec)
+        chat = by_id(self.wfs)["ubuntuai-chat"]
+        self.assertEqual(chat.runtime_bins, ())
+        self.assertTrue(chat.offered(hw))
         alias = expand_selection(("ubuntuai-speech",), self.wfs, hw)
         self.assertIn("ubuntuai-tts-rhvoice", alias)
         self.assertIn("ubuntuai-stt-whisper", alias)

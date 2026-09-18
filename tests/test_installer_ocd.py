@@ -150,6 +150,19 @@ class InstallerCatalogContractTests(unittest.TestCase):
         self.assertIn("ubuntuai-core", rec_cpu)
         self.assertNotIn("ubuntuai-hybrid", rec_cpu)
 
+    def test_chat_is_not_gated_on_flm(self) -> None:
+        chat = self.index["ubuntuai-chat"]
+        self.assertEqual(chat.runtime_bins, ())
+        self.assertNotIn("flm", chat.apt)
+        self.assertEqual(chat.hide_unless_backend, ())
+        rec = recommended_ids(self.wfs, _strix())
+        self.assertIn("ubuntuai-chat", rec)
+        self.assertTrue(chat.offered(_strix()))
+        self.assertTrue(chat.eligible(_strix()))
+        hybrid = self.index["ubuntuai-hybrid"]
+        self.assertEqual(hybrid.hide_unless_backend, ("xdna",))
+        self.assertTrue(hybrid.offered(_strix()))
+
 
 class InstallerPlanTests(unittest.TestCase):
     def setUp(self) -> None:
