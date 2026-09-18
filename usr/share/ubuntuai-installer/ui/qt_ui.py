@@ -466,13 +466,11 @@ def _qt_weights(win, user, status) -> QWidget:
     layout.addWidget(found_scroll, 1)
     layout.addWidget(QLabel("Download"))
     layout.addWidget(dl_scroll, 1)
-    link = QRadioButton("Symlink")
     copy = QRadioButton("Copy")
     move = QRadioButton("Move")
-    link.setChecked(True)
+    copy.setChecked(True)
     remove_src = QCheckBox("Remove original after checksum match")
     mode_row = QHBoxLayout()
-    mode_row.addWidget(link)
     mode_row.addWidget(copy)
     mode_row.addWidget(move)
     mode_row.addStretch(1)
@@ -480,16 +478,12 @@ def _qt_weights(win, user, status) -> QWidget:
     layout.addWidget(remove_src)
 
     def on_mode(_checked: bool = False) -> None:
-        if link.isChecked():
-            remove_src.setEnabled(False)
-            remove_src.setChecked(False)
-        elif move.isChecked():
+        if move.isChecked():
             remove_src.setEnabled(False)
             remove_src.setChecked(True)
         else:
             remove_src.setEnabled(True)
 
-    link.toggled.connect(on_mode)
     copy.toggled.connect(on_mode)
     move.toggled.connect(on_mode)
     on_mode()
@@ -558,12 +552,7 @@ def _qt_weights(win, user, status) -> QWidget:
         if not picked:
             status.setText("No new weights selected.")
             return
-        if copy.isChecked():
-            mode = "copy"
-        elif move.isChecked():
-            mode = "move"
-        else:
-            mode = "link"
+        mode = "move" if move.isChecked() else "copy"
         log = organize(
             picked,
             t.model_root,

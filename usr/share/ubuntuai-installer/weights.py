@@ -1,4 +1,4 @@
-"""Find, classify, link or move, and download model weights."""
+"""Find, classify, copy or move, and download model weights."""
 
 from __future__ import annotations
 
@@ -826,19 +826,15 @@ def organize(
     items: tuple[FoundWeight, ...],
     model_root: Path,
     *,
-    mode: str = "link",
+    mode: str = "copy",
     remove_source: bool = False,
     uid: int | None = None,
     gid: int | None = None,
     dry_run: bool = False,
 ) -> list[str]:
-    if mode not in {"link", "copy", "move"}:
-        raise ValueError("mode must be link, copy, or move")
-    want_remove = False
-    if mode == "copy":
-        want_remove = remove_source
-    elif mode == "move":
-        want_remove = True
+    if mode not in {"copy", "move"}:
+        raise ValueError("mode must be copy or move")
+    want_remove = mode == "move" or remove_source
     log: list[str] = []
     try:
         store = model_root.resolve()
@@ -863,31 +859,24 @@ def organize(
             log.append(f"skip {dest} (appeared)")
             continue
         parent_writable = os.access(item.path.parent, os.W_OK)
-        if mode in {"copy", "move"} and (mode == "copy" or parent_writable):
-            algo = integrity_algo_for(item)
-            src_hash = hash_path(item.path, algo)
-            _copy_into_store(item, dest, uid, gid)
-            dest_hash = hash_path(dest, algo)
-            if dest_hash != src_hash:
-                _remove_source(dest, item.kind)
-                log.append(f"checksum mismatch after {mode} {item.path} -> {dest} ({algo})")
-                continue
-            verb = "copied" if mode == "copy" else "moved"
-            log.append(f"{verb} {item.path} -> {dest} {algo}={dest_hash[:12]}")
-            if want_remove:
-                if not parent_writable:
-                    log.append(f"kept source {item.path} (not writable)")
-                elif _under(item.path, store):
-                    log.append(f"kept source {item.path} (inside store)")
-                else:
-                    _remove_source(item.path, item.kind)
-                    log.append(f"removed source {item.path} after checksum match")
+        algo = integrity_algo_for(item)
+        src_hash = hash_path(item.path, algo)
+        _copy_into_store(item, dest, uid, gid)
+        dest_hash = hash_path(dest, algo)
+        if dest_hash != src_hash:
+            _remove_source(dest, item.kind)
+            log.append(f"checksum mismatch after {mode} {item.path} -> {dest} ({algo})")
             continue
-        dest.symlink_to(item.path)
-        if uid is not None and gid is not None:
-            os.lchown(dest, uid, gid)
-        why = "link" if mode == "link" else "link (source not writable)"
-        log.append(f"{why} {item.path} -> {dest}")
+        verb = "copied" if mode == "copy" else "moved"
+        log.append(f"{verb} {item.path} -> {dest} {algo}={dest_hash[:12]}")
+        if want_remove:
+            if not parent_writable:
+                log.append(f"kept source {item.path} (not writable)")
+            elif _under(item.path, store):
+                log.append(f"kept source {item.path} (inside store)")
+            else:
+                _remove_source(item.path, item.kind)
+                log.append(f"removed source {item.path} after checksum match")
     return log
 
 

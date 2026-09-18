@@ -460,8 +460,8 @@ def _weights_page(win, user, status) -> Gtk.Widget:
     t0 = target_for(user)
     hint = Gtk.Label(
         label=(
-            f"Search known folders plus any you add, then symlink into {t0.model_root}. "
-            "Move is offered when the source directory is writable. "
+            f"Search known folders plus any you add, then copy into {t0.model_root}. "
+            "Move removes the original after the checksum matches. "
             "Downloads are opt-in and go into the same store."
         ),
         xalign=0,
@@ -627,28 +627,22 @@ def _weights_page(win, user, status) -> Gtk.Widget:
     page.append(_scroller(dl_box))
 
     mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-    link = Gtk.CheckButton(label="Symlink")
-    copy = Gtk.CheckButton(label="Copy", group=link)
-    move = Gtk.CheckButton(label="Move", group=link)
-    link.set_active(True)
+    copy = Gtk.CheckButton(label="Copy")
+    move = Gtk.CheckButton(label="Move", group=copy)
+    copy.set_active(True)
     remove_src = Gtk.CheckButton(label="Remove original after checksum match")
-    mode_row.append(link)
     mode_row.append(copy)
     mode_row.append(move)
     page.append(mode_row)
     page.append(remove_src)
 
     def on_mode(*_args) -> None:
-        if link.get_active():
-            remove_src.set_sensitive(False)
-            remove_src.set_active(False)
-        elif move.get_active():
+        if move.get_active():
             remove_src.set_sensitive(False)
             remove_src.set_active(True)
         else:
             remove_src.set_sensitive(True)
 
-    link.connect("toggled", on_mode)
     copy.connect("toggled", on_mode)
     move.connect("toggled", on_mode)
     on_mode()
@@ -674,12 +668,7 @@ def _weights_page(win, user, status) -> Gtk.Widget:
         if not picked:
             status.set_text("No new weights selected.")
             return
-        if copy.get_active():
-            mode = "copy"
-        elif move.get_active():
-            mode = "move"
-        else:
-            mode = "link"
+        mode = "move" if move.get_active() else "copy"
         log = organize(
             picked,
             t.model_root,

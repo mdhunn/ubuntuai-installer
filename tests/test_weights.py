@@ -69,10 +69,14 @@ class ClassifyTests(unittest.TestCase):
             self.assertEqual(dirs[0].subdir, "hf")
             self.assertEqual(dirs[0].fmt, "safetensors")
             self.assertFalse(any(f.path.name == "model.safetensors" for f in files))
-            log = organize(tuple(dirs), store, mode="link")
+            log = organize(tuple(dirs), store)
             dest = store / "hf" / "Qwen3-4B"
-            self.assertTrue(dest.is_symlink())
-            self.assertTrue(any(line.startswith("link ") for line in log))
+            self.assertTrue(dest.is_dir())
+            self.assertFalse(dest.is_symlink())
+            self.assertTrue((dest / "config.json").is_file())
+            self.assertTrue((dest / "model.safetensors").is_file())
+            self.assertTrue((repo / "config.json").is_file())
+            self.assertTrue(any("copied" in line for line in log))
 
     def test_detect_diffusers_bundle(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -86,7 +90,7 @@ class ClassifyTests(unittest.TestCase):
 
 
 class ScanOrganizeTests(unittest.TestCase):
-    def test_scan_and_link(self) -> None:
+    def test_scan_and_copy(self) -> None:
         with TemporaryDirectory() as tmp:
             home = Path(tmp)
             src_dir = home / "AI models" / "Dolphin"
@@ -102,11 +106,14 @@ class ScanOrganizeTests(unittest.TestCase):
             self.assertIn("gguf", kinds)
             self.assertIn("mmproj", kinds)
             self.assertTrue(all(f.state == "new" for f in found))
-            log = organize(found, store, mode="link")
+            log = organize(found, store)
             dest = store / "gguf" / "Dolphin.Q8_0.gguf"
-            self.assertTrue(dest.is_symlink())
-            self.assertEqual(dest.resolve(), blob.resolve())
-            self.assertTrue(any(line.startswith("link ") for line in log))
+            self.assertTrue(dest.is_file())
+            self.assertFalse(dest.is_symlink())
+            self.assertNotEqual(dest.resolve(), blob.resolve())
+            self.assertEqual(dest.read_bytes(), blob.read_bytes())
+            self.assertTrue(blob.exists())
+            self.assertTrue(any("copied" in line for line in log))
             again = scan((src_dir.parent, store), store)
             self.assertTrue(any(f.state == "already" for f in again))
 
@@ -154,7 +161,7 @@ class ScanOrganizeTests(unittest.TestCase):
             self.assertTrue(any("removed source" in line for line in log))
             self.assertTrue(any("moved" in line for line in log))
 
-    def test_link_ignores_remove_source(self) -> None:
+    def test_rejects_link_mode(self) -> None:
         with TemporaryDirectory() as tmp:
             src_dir = Path(tmp) / "Downloads"
             src_dir.mkdir()
@@ -162,10 +169,29 @@ class ScanOrganizeTests(unittest.TestCase):
             blob.write_bytes(b"g" * (128 * 1024))
             store = Path(tmp) / "Models"
             found = scan((src_dir,), store)
-            organize(found, store, mode="link", remove_source=True)
+            with self.assertRaises(ValueError) as ctx:
+                organize(found, store, mode="link")
+            self.assertIn("copy or move", str(ctx.exception))
             dest = store / "gguf" / "keep-link.gguf"
-            self.assertTrue(dest.is_symlink())
+            self.assertFalse(dest.exists())
             self.assertTrue(blob.exists())
+
+    def test_move_not_writable_does_not_symlink(self) -> None:
+        with TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "Downloads"
+            src_dir.mkdir()
+            blob = src_dir / "keep-move.gguf"
+            blob.write_bytes(b"g" * (128 * 1024))
+            store = Path(tmp) / "Models"
+            found = scan((src_dir,), store)
+            with patch("weights.os.access", return_value=False):
+                log = organize(found, store, mode="move")
+            dest = store / "gguf" / "keep-move.gguf"
+            self.assertTrue(dest.is_file())
+            self.assertFalse(dest.is_symlink())
+            self.assertTrue(blob.exists())
+            self.assertTrue(any("moved" in line for line in log))
+            self.assertTrue(any("kept source" in line for line in log))
 
     def test_copy_hash_mismatch_keeps_source(self) -> None:
         with TemporaryDirectory() as tmp:
