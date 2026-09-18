@@ -22,6 +22,8 @@ from weights import ensure_weight, load_catalog as load_weight_catalog
 
 PKG_RE = re.compile(r"^[a-zA-Z0-9.+-]+$")
 USER_RE = re.compile(r"^[a-z_][a-z0-9_-]*[$]?$")
+GGML_VULKAN_PKG = "libggml0-backend-vulkan"
+GGML_VULKAN_APPS = frozenset({"llama.cpp-tools", "whisper.cpp"})
 
 
 def dpkg_installed(name: str) -> bool:
@@ -58,6 +60,14 @@ def _assert_user(name: str) -> str:
     if not USER_RE.match(name):
         raise ValueError(f"illegal user name {name!r}")
     return name
+
+
+def ensure_ggml_vulkan(packages: list[str] | tuple[str, ...]) -> list[str]:
+    """Keep llama.cpp and whisper.cpp from landing as silent CPU-only installs."""
+    pkgs = list(packages)
+    if any(p in GGML_VULKAN_APPS for p in pkgs) and GGML_VULKAN_PKG not in pkgs:
+        pkgs.append(GGML_VULKAN_PKG)
+    return pkgs
 
 
 def assert_model_root(user: str, model_root: Path) -> Path:
@@ -105,6 +115,7 @@ def build_plan(
         groups.extend(wf.groups)
         subdirs.extend(wf.model_subdirs)
 
+    apt = ensure_ggml_vulkan(apt)
     missing_apt = []
     for pkg in dict.fromkeys(apt):
         _assert_pkg(pkg)
@@ -204,7 +215,8 @@ def explain_apt_failure(output: str, rc: int) -> str:
     if "unable to locate package" in text or "has no installation candidate" in text:
         return (
             "Could not install the Ubuntu packages. "
-            "apt does not know one of the package names."
+            "apt cannot find one of them. Enable the universe repository. "
+            "Run apt update. Confirm this machine is Ubuntu 26.04 or newer."
         )
     if "network" in text or "temporary failure resolving" in text or "404" in text:
         return "Could not install the Ubuntu packages. A download or network step failed."
