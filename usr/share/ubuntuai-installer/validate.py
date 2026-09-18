@@ -12,6 +12,13 @@ from pathlib import Path
 from apply import dpkg_installed, user_in_group
 from catalog import by_id, load_workflows
 from domain import Check, Hardware, UserTarget, Workflow
+from lemonade import (
+    detect as lemonade_detect,
+    largest_gguf_bytes,
+    load_risk,
+    load_tuning,
+    risk_english,
+)
 from paths import ENV_FILE, LIMITS_FILE
 from probe import (
     APT_NAME,
@@ -320,6 +327,16 @@ def collect(
         if n == HYBRID_FLM_MISSING:
             continue
         checks.append(_warn("note", n))
+    if lemonade_detect():
+        largest = largest_gguf_bytes(target)
+        settings = load_tuning(hw, largest)
+        frac = largest / max(int(hw.ram_bytes) or 1, 1)
+        risk = load_risk(
+            frac, largest, str(settings.get("llamacpp_backend") or "")
+        )
+        text = risk_english(risk, ram_bytes=hw.ram_bytes)
+        if text:
+            checks.append(_warn("lemonade-load", text))
     return tuple(checks)
 
 

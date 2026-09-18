@@ -21,13 +21,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from domain import UserTarget
+from probe import probe
 from paths import (
     SNAP_LEMONADE_COMMON,
     SNAP_LEMONADE_MODELS,
     is_home_path,
     lemonade_extra_models_dir,
 )
-from weights import UA
+from weights import UA, human_bytes
 
 SNAP_COMMON = SNAP_LEMONADE_COMMON
 SNAP_EXTRA = SNAP_LEMONADE_MODELS
@@ -35,6 +36,20 @@ LEMONADE_API = "http://127.0.0.1:13305"
 APPLY_PUBLISH_VERB = "lemonade-publish"
 OWNED_UNIT_DESC = "Ubuntu AI models for Lemonade"
 SYSTEM_UNIT_DIR = Path("/etc/systemd/system")
+
+# Mark HITL. This PR warns only. Flip the string if a later change should refuse.
+LOAD_RISK_POLICY = "warn_only"
+WARN_FRAC = 0.35
+STRONG_FRAC = 0.50
+# 105G-class GGUF/shard trees. Big-RAM boxes still flag these.
+HUGE_GGUF_BYTES = 80 * 1024**3
+# Lemonade has no load-mode key. /internal/set uses llamacpp_args.
+LLAMACPP_MMAP_ARGS = "--load-mode mmap"
+CLI_TUNING_KEYS = {
+    "llamacpp_backend": "llamacpp.backend",
+    "llamacpp_args": "llamacpp.args",
+    "llamacpp_vulkan_args": "llamacpp.vulkan_args",
+}
 
 
 @dataclass(frozen=True)
@@ -460,6 +475,65 @@ def largest_gguf_bytes(target: UserTarget) -> int:
     return biggest
 
 
+def _is_large(frac: float, largest_bytes: int) -> bool:
+    return frac >= WARN_FRAC or int(largest_bytes) >= HUGE_GGUF_BYTES
+
+
+def _igpu_vulkan_path(hw) -> bool:
+    backends = hw.backends() if hasattr(hw, "backends") else set()
+    if "vulkan" in backends:
+        return True
+    if hasattr(hw, "strix_halo_class") and hw.strix_halo_class():
+        return True
+    for device in getattr(hw, "devices", ()):
+        if getattr(device, "kind", "") != "igpu":
+            continue
+        if getattr(device, "backend", "") == "vulkan":
+            return True
+        if getattr(device, "vendor", "") in {"amd", "intel"}:
+            return True
+    return False
+
+
+def load_risk(
+    frac: float, bytes: int, backend: str | None = None
+) -> dict[str, object]:
+    """Detect huge loads. Policy is warn-only. Callers must not refuse."""
+    level = "ok"
+    if frac >= STRONG_FRAC or int(bytes) >= HUGE_GGUF_BYTES:
+        level = "strong"
+    elif frac >= WARN_FRAC:
+        level = "warn"
+    return {
+        "level": level,
+        "policy": LOAD_RISK_POLICY,
+        "action": "warn",
+        "frac": frac,
+        "bytes": int(bytes),
+        "backend": backend or "",
+    }
+
+
+def risk_english(risk: dict[str, object], ram_bytes: int = 0) -> str:
+    level = str(risk.get("level") or "ok")
+    if level == "ok":
+        return ""
+    size = human_bytes(int(risk.get("bytes") or 0))
+    ram = human_bytes(ram_bytes) if ram_bytes else "this machine's RAM"
+    if level == "strong":
+        return (
+            f"Strong warning. Largest GGUF is {size} on {ram}. "
+            "Vulkan can lose the GPU when a file this large is loaded. "
+            "Lemonade will keep one model, shrink context, and memory-map the file. "
+            "Publish and updates continue."
+        )
+    return (
+        f"Warning. Largest GGUF is {size} on {ram}. "
+        "That is a large share of RAM. "
+        "Lemonade will keep one model and shrink context."
+    )
+
+
 def load_tuning(hw, largest_bytes: int) -> dict[str, object]:
     ram = max(int(getattr(hw, "ram_bytes", 0) or 0), 1)
     frac = largest_bytes / ram
@@ -484,12 +558,129 @@ def load_tuning(hw, largest_bytes: int) -> dict[str, object]:
     elif frac >= 0.35:
         ctx = 8192
         timeout = 1200
-    return {
+    # mmap is the primary large+vulkan/iGPU mitigation. llama.cpp#27360.
+    mmap = _is_large(frac, largest_bytes) and _igpu_vulkan_path(hw)
+    settings: dict[str, object] = {
         "ctx_size": ctx,
         "global_timeout": timeout,
         "max_loaded_models": 1,
         "llamacpp_backend": backend,
     }
+    if mmap:
+        settings["llamacpp_args"] = LLAMACPP_MMAP_ARGS
+    return settings
+
+
+def cli_tuning_parts(settings: dict[str, object]) -> list[str]:
+    parts = []
+    for key, value in settings.items():
+        parts.append(f"{CLI_TUNING_KEYS.get(key, key)}={value}")
+    args = str(settings.get("llamacpp_args") or "")
+    if LLAMACPP_MMAP_ARGS in args and not any(
+        item.startswith("llamacpp.vulkan_args=") for item in parts
+    ):
+        parts.append(f"llamacpp.vulkan_args={args}")
+    return parts
+
+
+def _flatten_config(data: dict) -> dict[str, object]:
+    flat: dict[str, object] = dict(data)
+    nested = data.get("llamacpp")
+    if isinstance(nested, dict):
+        if "backend" in nested and "llamacpp_backend" not in flat:
+            flat["llamacpp_backend"] = nested["backend"]
+        if "args" in nested and "llamacpp_args" not in flat:
+            flat["llamacpp_args"] = nested["args"]
+        if "vulkan_args" in nested:
+            flat["llamacpp_vulkan_args"] = nested["vulkan_args"]
+    return flat
+
+
+def _as_int(value: object) -> int | None:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _mmap_in_config(actual: dict) -> bool | None:
+    flat = _flatten_config(actual)
+    seen = False
+    for key in ("llamacpp_args", "llamacpp_vulkan_args"):
+        if key not in flat:
+            continue
+        seen = True
+        if LLAMACPP_MMAP_ARGS in str(flat.get(key) or ""):
+            return True
+    if not seen:
+        return None
+    return False
+
+
+def read_config() -> dict:
+    req = urllib.request.Request(
+        f"{LEMONADE_API}/internal/config",
+        headers={"User-Agent": UA},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if isinstance(data, dict):
+            return data
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        pass
+    exe = shutil.which("lemonade-server") or shutil.which("lemonade")
+    if not exe:
+        return {}
+    p = _run([exe, "config"])
+    text = (p.stdout or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    out: dict[str, object] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        out[key.strip()] = value.strip()
+    return out
+
+
+def verify_tuning(
+    expected: dict[str, object], actual: dict
+) -> tuple[bool, str]:
+    if not actual:
+        return False, (
+            "Lemonade did not return the load settings the installer wrote. "
+            "Models are still published."
+        )
+    flat = _flatten_config(actual)
+    misses: list[str] = []
+    if _as_int(flat.get("max_loaded_models")) != 1:
+        misses.append("max_loaded_models")
+    want_ctx = _as_int(expected.get("ctx_size"))
+    if want_ctx is not None and _as_int(flat.get("ctx_size")) != want_ctx:
+        misses.append("ctx_size")
+    want_timeout = _as_int(expected.get("global_timeout"))
+    if (
+        want_timeout is not None
+        and _as_int(flat.get("global_timeout")) != want_timeout
+    ):
+        misses.append("global_timeout")
+    if expected.get("llamacpp_args") and _mmap_in_config(actual) is False:
+        misses.append("llamacpp_args")
+    if misses:
+        return False, (
+            "Lemonade did not keep the load settings the installer wrote "
+            f"({', '.join(misses)}). Models are still published."
+        )
+    return True, ""
 
 
 def apply_tuning(settings: dict[str, object]) -> str:
@@ -500,24 +691,47 @@ def apply_tuning(settings: dict[str, object]) -> str:
         headers={"Content-Type": "application/json", "User-Agent": UA},
         method="POST",
     )
+    wrote = False
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=3) as resp:
             json.loads(resp.read().decode("utf-8"))
-        return "lemonade load settings updated"
+        wrote = True
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         pass
-    exe = shutil.which("lemonade-server") or shutil.which("lemonade")
-    if not exe:
-        raise RuntimeError("lemonade-server is not on PATH")
-    parts = [f"{key}={value}" for key, value in settings.items()]
-    # CLI wants dotted backend key.
-    parts = [
-        p.replace("llamacpp_backend=", "llamacpp.backend=") for p in parts
-    ]
-    p = _run([exe, "config", "set", *parts])
-    if p.returncode != 0:
-        raise RuntimeError((p.stderr or p.stdout or "lemonade config set failed").strip())
+    if not wrote:
+        exe = shutil.which("lemonade-server") or shutil.which("lemonade")
+        if not exe:
+            raise RuntimeError("lemonade-server is not on PATH")
+        p = _run([exe, "config", "set", *cli_tuning_parts(settings)])
+        if p.returncode != 0:
+            raise RuntimeError(
+                (p.stderr or p.stdout or "lemonade config set failed").strip()
+            )
+    ok, miss = verify_tuning(settings, read_config())
+    if not ok:
+        return miss
     return "lemonade load settings updated"
+
+
+def report_load_tuning(target: UserTarget, hw=None) -> str:
+    hw = hw or probe()
+    largest = largest_gguf_bytes(target)
+    settings = load_tuning(hw, largest)
+    ram = int(getattr(hw, "ram_bytes", 0) or 0)
+    frac = largest / max(ram, 1)
+    risk = load_risk(frac, largest, str(settings.get("llamacpp_backend") or ""))
+    lines: list[str] = []
+    try:
+        lines.append(apply_tuning(settings))
+    except RuntimeError:
+        lines.append(
+            "Lemonade did not accept the load settings. "
+            "Models are still published."
+        )
+    warn = risk_english(risk, ram_bytes=ram)
+    if warn:
+        lines.append(warn)
+    return "\n".join(line for line in lines if line)
 
 
 def check_model_updates() -> str:
@@ -551,8 +765,13 @@ def publish(target: UserTarget) -> str:
         _set_extra_models_dir(dest)
         _restart_snap()
         if len(mounts) == 1:
-            return f"lemonade extra_models_dir={dest} via {unit}"
-        return f"lemonade extra_models_dir={dest} ({len(mounts)} trees)"
+            prefix = f"lemonade extra_models_dir={dest} via {unit}"
+        else:
+            prefix = f"lemonade extra_models_dir={dest} ({len(mounts)} trees)"
+        extra = report_load_tuning(target)
+        return f"{prefix}\n{extra}" if extra else prefix
     dest = sources[0]
     _set_extra_models_dir(dest)
-    return f"lemonade extra_models_dir={dest}"
+    prefix = f"lemonade extra_models_dir={dest}"
+    extra = report_load_tuning(target)
+    return f"{prefix}\n{extra}" if extra else prefix

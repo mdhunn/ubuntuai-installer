@@ -10,11 +10,13 @@ import urllib.request
 from pathlib import Path
 
 from lemonade import (
-    apply_tuning,
     check_model_updates,
     detect as lemonade_detect,
     largest_gguf_bytes,
+    load_risk,
     load_tuning,
+    report_load_tuning,
+    risk_english,
 )
 from probe import probe
 from users import target_for
@@ -143,6 +145,12 @@ def diagnose(user: str) -> dict:
     largest = largest_gguf_bytes(t)
     tuning = load_tuning(hw, largest) if lemonade_detect() else {}
     lemon_updates = check_model_updates() if lemonade_detect() else ""
+    risk: dict = {}
+    if lemonade_detect():
+        frac = largest / max(int(hw.ram_bytes) or 1, 1)
+        risk = load_risk(
+            frac, largest, str(tuning.get("llamacpp_backend") or "")
+        )
     return {
         "user": t.name,
         "ram_bytes": hw.ram_bytes,
@@ -151,6 +159,7 @@ def diagnose(user: str) -> dict:
         "models": models,
         "lemonade": lemonade_detect(),
         "tuning": tuning,
+        "load_risk": risk,
         "lemonade_updates": lemon_updates,
     }
 
@@ -201,16 +210,19 @@ def classical_plan(diag: dict) -> dict:
         largest = int(diag.get("largest_gguf_bytes") or 0)
         ram = int(diag.get("ram_bytes") or 0)
         if tuning:
-            steps.append(
-                {
-                    "kind": "lemonade_optimize",
-                    "why": (
-                        f"Largest GGUF tree is {human_bytes(largest)} on {human_bytes(ram)} RAM. "
-                        f"Set context {tuning.get('ctx_size')}, timeout {tuning.get('global_timeout')}s, "
-                        f"backend {tuning.get('llamacpp_backend')}."
-                    ),
-                }
+            why = (
+                f"Largest GGUF tree is {human_bytes(largest)} on {human_bytes(ram)} RAM. "
+                f"Set context {tuning.get('ctx_size')}, timeout {tuning.get('global_timeout')}s, "
+                f"backend {tuning.get('llamacpp_backend')}."
             )
+            if tuning.get("llamacpp_args"):
+                why += f" Memory-map with {tuning['llamacpp_args']}."
+            steps.append({"kind": "lemonade_optimize", "why": why})
+        risk = diag.get("load_risk") or {}
+        if risk.get("level") in {"warn", "strong"}:
+            text = risk_english(risk, ram_bytes=ram)
+            if text:
+                steps.append({"kind": "note", "text": text})
         text = str(diag.get("lemonade_updates") or "")
         low = text.lower()
         if text and any(tok in low for tok in ("update", "newer", "available")) and "no update" not in low:
@@ -405,8 +417,8 @@ def execute_plan_steps(user: str, plan: dict | None, *, dry_run: bool = False) -
             )
             continue
         if kind == "lemonade_optimize":
-            settings = plan.get("tuning") or load_tuning(hw, largest_gguf_bytes(t))
-            log.append(apply_tuning(settings))
+            text = report_load_tuning(t, hw)
+            log.extend(line for line in text.splitlines() if line)
             continue
         if kind == "lemonade_update_models":
             exe = shutil.which("lemonade-server") or shutil.which("lemonade")

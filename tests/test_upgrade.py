@@ -6,10 +6,30 @@ from tempfile import TemporaryDirectory
 
 from support import PKG  # noqa: F401
 
-from domain import Device, Hardware
+from unittest.mock import patch
+
+from domain import Device, Hardware, UserTarget
 from lemonade import load_tuning
-from upgrade import _sanitize, classical_plan, format_plan, step_english
+from upgrade import (
+    _sanitize,
+    classical_plan,
+    execute_plan_steps,
+    format_plan,
+    step_english,
+)
 from weights import detect_shard_bundle, scan
+
+
+def _target_stub() -> UserTarget:
+    return UserTarget(
+        name="owner",
+        uid=1000,
+        gid=1000,
+        home=Path("/tmp/ubuntuai-owner"),
+        model_root=Path("/tmp/ubuntuai-owner/Models"),
+        extra_model_paths=(),
+        bind="127.0.0.1",
+    )
 
 
 def _strix(ram_gib: int = 122) -> Hardware:
@@ -51,11 +71,13 @@ class TuningTests(unittest.TestCase):
         self.assertEqual(tun["llamacpp_backend"], "vulkan")
         self.assertEqual(tun["ctx_size"], 4096)
         self.assertGreaterEqual(int(tun["global_timeout"]), 1800)
+        self.assertEqual(tun["llamacpp_args"], "--load-mode mmap")
 
     def test_small_model_keeps_auto_context(self) -> None:
         hw = _strix(122)
         tun = load_tuning(hw, 2 * 1024**3)
         self.assertEqual(tun["ctx_size"], -1)
+        self.assertNotIn("llamacpp_args", tun)
 
     def test_navi_dgpu_keeps_rocm_tuning(self) -> None:
         hw = Hardware(
@@ -130,3 +152,59 @@ class UpgradePlanTests(unittest.TestCase):
         self.assertIn("What this means", text)
         self.assertIn("Nothing will change until you approve", text)
         self.assertIn("openmoss", step_english(plan["steps"][0]))
+
+    def test_classical_plan_warns_without_blocking(self) -> None:
+        diag = {
+            "ram_bytes": 122 * 1024**3,
+            "largest_gguf_bytes": 105 * 1024**3,
+            "vendors": [],
+            "models": [],
+            "lemonade": "snap",
+            "tuning": {
+                "ctx_size": 2048,
+                "global_timeout": 2400,
+                "max_loaded_models": 1,
+                "llamacpp_backend": "vulkan",
+                "llamacpp_args": "--load-mode mmap",
+            },
+            "load_risk": {
+                "level": "strong",
+                "policy": "warn_only",
+                "action": "warn",
+                "frac": 0.86,
+                "bytes": 105 * 1024**3,
+                "backend": "vulkan",
+            },
+            "lemonade_updates": "",
+        }
+        plan = classical_plan(diag)
+        kinds = [s["kind"] for s in plan["steps"]]
+        self.assertIn("lemonade_optimize", kinds)
+        self.assertIn("note", kinds)
+        notes = [s["text"] for s in plan["steps"] if s.get("kind") == "note"]
+        self.assertTrue(any("Strong warning" in text for text in notes))
+        self.assertTrue(any("continue" in text.lower() for text in notes))
+        why = next(s["why"] for s in plan["steps"] if s["kind"] == "lemonade_optimize")
+        self.assertIn("--load-mode mmap", why)
+        self.assertNotIn("refuse", format_plan(plan).lower())
+
+    def test_execute_optimize_uses_live_tuning(self) -> None:
+        target = _target_stub()
+        with (
+            patch("upgrade.target_for", return_value=target),
+            patch("upgrade.probe", return_value=_strix()),
+            patch(
+                "upgrade.report_load_tuning",
+                return_value="lemonade load settings updated\nStrong warning. continue.",
+            ) as report,
+        ):
+            log = execute_plan_steps(
+                target.name,
+                {
+                    "steps": [{"kind": "lemonade_optimize", "why": "tune"}],
+                    "tuning": {"max_loaded_models": 1},
+                },
+            )
+        report.assert_called_once()
+        self.assertIn("lemonade load settings updated", log)
+        self.assertTrue(any("Strong warning" in line for line in log))
