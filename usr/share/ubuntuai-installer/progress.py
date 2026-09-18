@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +27,42 @@ def apply_log_dir(home: Path) -> Path:
     return home / ".local" / "share" / "ubuntuai" / "logs"
 
 
-def new_apply_log(home: Path) -> Path:
+def _log_owner(uid: int | None, gid: int | None) -> tuple[int, int]:
+    if uid is not None and gid is not None:
+        return uid, gid
+    from users import guess_user, target_for
+
+    try:
+        target = target_for(guess_user())
+    except (RuntimeError, KeyError, OSError):
+        return os.getuid(), os.getgid()
+    return target.uid, target.gid
+
+
+def _own_log_paths(path: Path, last: Path, folder: Path, home: Path, uid: int, gid: int) -> None:
+    os.chown(path, uid, gid)
+    if last.exists() and not last.is_symlink():
+        os.chown(last, uid, gid)
+    home_r = home.resolve()
+    cur = folder
+    while True:
+        try:
+            cur.resolve().relative_to(home_r)
+        except ValueError:
+            break
+        if cur.resolve() == home_r:
+            break
+        os.chown(cur, uid, gid)
+        nxt = cur.parent
+        if nxt == cur:
+            break
+        cur = nxt
+
+
+def new_apply_log(
+    home: Path, uid: int | None = None, gid: int | None = None
+) -> Path:
+    owner_uid, owner_gid = _log_owner(uid, gid)
     folder = apply_log_dir(home)
     folder.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -39,6 +75,8 @@ def new_apply_log(home: Path) -> Path:
     except OSError:
         last.write_text("", encoding="utf-8")
     path.write_text("", encoding="utf-8")
+    # Apply may run as root. Own the tree as the desktop user from guess_user().
+    _own_log_paths(path, last, folder, home, owner_uid, owner_gid)
     return path
 
 

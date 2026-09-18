@@ -4,6 +4,7 @@ import os
 import pwd
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from support import PKG
@@ -219,6 +220,24 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(rp.call_args[0][0], APPLY_PUBLISH_VERB)
         self.assertEqual(rp.call_args[0][1], [self.target.name])
         self.assertTrue(any("lemonade" in line.lower() for line in log))
+
+    def test_execute_plan_creates_log_owned_by_target(self) -> None:
+        with TemporaryDirectory() as tmp:
+            log_file = Path(tmp) / "apply.log"
+            log_file.write_text("", encoding="utf-8")
+            with patch("apply.new_apply_log", return_value=log_file) as nlog, patch(
+                "apply._write_user_config"
+            ):
+                execute_plan(
+                    (Action("skip", "skip unused", ("unused",)),),
+                    self.target,
+                    hw=_hw_strix(),
+                    dry_run=False,
+                )
+            nlog.assert_called_once_with(
+                self.target.home, uid=self.target.uid, gid=self.target.gid
+            )
+            self.assertIn("Finished.", log_file.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
