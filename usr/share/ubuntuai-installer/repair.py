@@ -207,6 +207,8 @@ def classical_plan(diag: dict) -> dict:
                 steps.append({"kind": "note", "text": detail})
         elif name in {"env", "memlock-file"}:
             steps.append({"kind": "write_core", "why": detail})
+        elif name == "npu-firmware":
+            steps.append({"kind": "note", "text": detail})
         elif name.startswith("group:"):
             steps.append(
                 {
