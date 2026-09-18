@@ -40,6 +40,8 @@ Hybrid is first class on Strix Halo-class APUs. NPU (FastFlowLM) and iGPU (llama
 
 This machine is the existence proof. Ryzen AI MAX+ 395. Radeon 8060S. XDNA2 at `/dev/accel/accel0`. 122 GiB RAM. Ubuntu 26.04. Kernel 7.0.
 
+Canonical-supported Ubuntu releases and flavors are in scope. The Strix Halo existence-proof machine does not narrow silicon or release support.
+
 ## Studio mappings we keep
 
 | Studio | This project |
