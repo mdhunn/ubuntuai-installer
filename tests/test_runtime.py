@@ -51,6 +51,23 @@ class RuntimeTests(unittest.TestCase):
             ):
                 self.assertTrue(is_present(chat, "alice", t))
 
+    def test_chat_present_when_flm_missing(self) -> None:
+        def fake_which(name: str) -> str | None:
+            if name == "llama-server":
+                return "/usr/bin/llama-server"
+            return None
+
+        with TemporaryDirectory() as tmp:
+            t = _target(Path(tmp))
+            wfs = load_workflows()
+            chat = next(w for w in wfs if w.id == "ubuntuai-chat")
+            hybrid = next(w for w in wfs if w.id == "ubuntuai-hybrid")
+            with patch("runtime.recorded_ids", return_value=frozenset()), patch(
+                "runtime.shutil.which", side_effect=fake_which
+            ), patch("runtime.dpkg_installed", return_value=False):
+                self.assertTrue(is_present(chat, "alice", t))
+                self.assertFalse(is_present(hybrid, "alice", t))
+
     def test_chat_models_lists_gguf(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

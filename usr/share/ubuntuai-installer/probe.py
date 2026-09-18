@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +16,22 @@ NPU_FIRMWARE_LINK = Path("/lib/firmware/amdnpu/17f0_11/npu.sbin.zst")
 NPU_FIRMWARE_LINK_PLAIN = Path("/lib/firmware/amdnpu/17f0_11/npu.sbin")
 NPU_ACCEL_NODE = Path("/dev/accel/accel0")
 _FW_VERSION_RE = re.compile(r"(?<![0-9])(\d+\.\d+\.\d+\.\d+)(?![0-9])")
+
+HYBRID_FLM_MISSING = (
+    "XDNA2 present. flm is not on PATH. Hybrid engine is missing. Chat still uses llama.cpp."
+)
+
+
+def bind_which(
+    which: Callable[[str], str | None] | None = None,
+    path: str | None = None,
+) -> Callable[[str], str | None]:
+    if which is not None:
+        return which
+    if path is None:
+        return shutil.which
+    return lambda name: shutil.which(name, path=path)
+
 
 NVIDIA = "10de"
 AMD_GPU = "1002"
@@ -358,9 +375,15 @@ def _notes(
     *,
     rocminfo: bool = False,
     gfx: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    path: str | None = None,
 ) -> tuple[str, ...]:
+    find = bind_which(which, path)
     notes: list[str] = []
     gfx_strix = _gfx_is_strix_halo(gfx)
+    # Hybrid engine is FastFlowLM. Missing flm does not hide Chat.
+    if any(d.backend == "xdna" for d in devices) and not find("flm"):
+        notes.append(HYBRID_FLM_MISSING)
     for d in devices:
         vulkan_first = (
             d.vendor == "amd"
@@ -476,6 +499,8 @@ def probe(
     npu_accel_node: Path | None = None,
     rocminfo: bool | None = None,
     gfx: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    path: str | None = None,
 ) -> Hardware:
     cpu = _cpu_name(cpuinfo)
     ram = _ram_bytes(meminfo)
@@ -492,6 +517,6 @@ def probe(
         cpu_name=cpu,
         ram_bytes=ram,
         devices=tuple(devices),
-        notes=_notes(devices, rocminfo=have_rocminfo, gfx=gfx),
+        notes=_notes(devices, rocminfo=have_rocminfo, gfx=gfx, which=which, path=path),
         gfx=gfx or "",
     )

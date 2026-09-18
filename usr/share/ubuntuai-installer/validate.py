@@ -6,6 +6,7 @@ import grp
 import os
 import pwd
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 from apply import dpkg_installed, user_in_group
@@ -14,9 +15,11 @@ from domain import Check, Hardware, UserTarget, Workflow
 from paths import ENV_FILE, LIMITS_FILE
 from probe import (
     APT_NAME,
+    HYBRID_FLM_MISSING,
     apt_cache_policy,
     apt_candidate,
     apt_sources_text,
+    bind_which,
     probe,
     split_apt_policies,
     universe_in_sources,
@@ -165,14 +168,33 @@ def archive_gate_checks(
     return tuple(checks)
 
 
+# Missing flm is the Hybrid lane, not Chat. Chat stays on llama.cpp.
+def hybrid_engine_check(
+    hw: Hardware,
+    *,
+    which: Callable[[str], str | None] | None = None,
+    path: str | None = None,
+) -> Check | None:
+    find = bind_which(which, path)
+    found = find("flm")
+    if found:
+        return _ok("fastflowlm", found)
+    if "xdna" in hw.backends():
+        return _warn("fastflowlm", HYBRID_FLM_MISSING)
+    return None
+
+
 def collect(
     target: UserTarget,
     hw: Hardware | None = None,
     *,
     apt_policy: str | dict[str, str] | None = None,
     apt_sources: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    path: str | None = None,
 ) -> tuple[Check, ...]:
-    hw = hw or probe()
+    find = bind_which(which, path)
+    hw = hw or probe(which=find)
     checks: list[Check] = []
     checks.append(
         _ok(
@@ -254,7 +276,7 @@ def collect(
         if extra.exists():
             checks.append(_ok("extra-models", str(extra)))
 
-    if shutil.which("llama-server") or dpkg_installed("llama.cpp-tools"):
+    if find("llama-server") or dpkg_installed("llama.cpp-tools"):
         checks.append(_ok("llama.cpp", "llama.cpp-tools present"))
     else:
         checks.append(_warn("llama.cpp", "llama.cpp-tools not installed"))
@@ -264,34 +286,28 @@ def collect(
     elif "vulkan" in hw.backends():
         checks.append(_warn("ggml-vulkan", "Vulkan GPU found. ggml Vulkan backend not installed"))
 
-    if shutil.which("flm"):
-        checks.append(_ok("fastflowlm", shutil.which("flm") or "flm"))
-    elif "xdna" in hw.backends():
-        checks.append(
-            _warn(
-                "fastflowlm",
-                "XDNA2 present. flm is not on PATH. Hybrid engine is missing.",
-            )
-        )
+    engine = hybrid_engine_check(hw, which=find)
+    if engine is not None:
+        checks.append(engine)
 
-    if shutil.which("whisper-cli") or dpkg_installed("whisper.cpp"):
-        checks.append(_ok("whisper.cpp", shutil.which("whisper-cli") or "whisper.cpp"))
+    if find("whisper-cli") or dpkg_installed("whisper.cpp"):
+        checks.append(_ok("whisper.cpp", find("whisper-cli") or "whisper.cpp"))
     else:
         checks.append(_warn("whisper.cpp", "whisper-cli not installed"))
 
-    if shutil.which("RHVoice-test") or dpkg_installed("rhvoice"):
-        checks.append(_ok("rhvoice", shutil.which("RHVoice-test") or "rhvoice"))
+    if find("RHVoice-test") or dpkg_installed("rhvoice"):
+        checks.append(_ok("rhvoice", find("RHVoice-test") or "rhvoice"))
 
-    if shutil.which("espeak-ng") or dpkg_installed("espeak-ng"):
-        checks.append(_ok("espeak-ng", shutil.which("espeak-ng") or "espeak-ng"))
+    if find("espeak-ng") or dpkg_installed("espeak-ng"):
+        checks.append(_ok("espeak-ng", find("espeak-ng") or "espeak-ng"))
 
     moss_bin = next(
-        (p for p in ("moss-tts-cli", "moss-tts-server", "moss-tts") if shutil.which(p)),
+        (p for p in ("moss-tts-cli", "moss-tts-server", "moss-tts") if find(p)),
         None,
     )
     moss_dir = target.model_root / "openmoss"
     if moss_bin:
-        checks.append(_ok("openmoss", shutil.which(moss_bin) or moss_bin))
+        checks.append(_ok("openmoss", find(moss_bin) or moss_bin))
     elif moss_dir.exists():
         checks.append(
             _warn(
@@ -301,6 +317,8 @@ def collect(
         )
 
     for n in hw.notes:
+        if n == HYBRID_FLM_MISSING:
+            continue
         checks.append(_warn("note", n))
     return tuple(checks)
 

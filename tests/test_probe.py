@@ -28,6 +28,7 @@ class ProbeTests(unittest.TestCase):
             cpuinfo=CPUINFO,
             meminfo=MEMINFO,
             rocminfo=False,
+            which=lambda name: None,
         )
         self.assertIn("xdna", hw.backends())
         self.assertIn("vulkan", hw.backends())
@@ -41,6 +42,10 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("igpu", kinds)
         self.assertGreater(hw.ram_bytes, 100 * 1024**3)
         self.assertTrue(any("Vulkan" in n for n in hw.notes))
+        self.assertIn(
+            "Hybrid engine is missing",
+            " ".join(hw.notes),
+        )
 
     def test_strix_halo_with_rocminfo_stays_vulkan(self) -> None:
         hw = probe(
@@ -48,6 +53,7 @@ class ProbeTests(unittest.TestCase):
             cpuinfo=CPUINFO,
             meminfo=MEMINFO,
             rocminfo=True,
+            which=lambda name: None,
         )
         gpu = _strix_gpu(hw)
         self.assertEqual(gpu.backend, "vulkan")
@@ -61,6 +67,7 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("gfx1150", joined)
         self.assertIn("libgomp", joined)
         self.assertNotIn("rocminfo is not", joined)
+        self.assertIn("Hybrid engine is missing", joined)
 
     def test_strix_gfx1150_injector_stays_vulkan(self) -> None:
         hw = probe(
