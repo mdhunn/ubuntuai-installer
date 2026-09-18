@@ -12,7 +12,7 @@ from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from apply import ApplyError, build_plan, execute_plan, format_plan
 from progress import ProgressEvent
-from catalog import expand_selection, load_workflows, recommended_ids
+from catalog import expand_selection, helper_workflow_ids, load_workflows, recommended_ids
 from configstore import add_scan_folder
 from configstore import load as load_config
 from configstore import record_installed
@@ -35,9 +35,17 @@ from probe import probe
 from users import guess_user, target_for
 from runtime import (
     BACKEND_LABELS,
+    CHAT_MODEL_CTA,
+    CHAT_MODEL_NEEDED,
+    CHAT_MODEL_NEEDED_CONFIG,
+    HELPERS_BLURB,
+    HELPERS_SECTION,
     app_statuses,
     backend_choices,
     chat_models,
+    listen_words,
+    machine_words,
+    workflow_row_title,
 )
 from validate import collect, format_checks, format_health, worst
 from weights import (
@@ -69,13 +77,8 @@ def _on_activate(app: Adw.Application, mode: str) -> None:
 
 
 def _banner(hw) -> Gtk.Widget:
-    backends = ", ".join(sorted(hw.backends()))
     ram = hw.ram_bytes // (1024**3)
-    hybrid = "Hybrid available." if hw.hybrid_ok() else "Hybrid not detected."
-    text = (
-        f"{hw.cpu_name}\n"
-        f"{ram} GiB RAM. Backends: {backends}. {hybrid}"
-    )
+    text = f"{hw.cpu_name}\n{ram} GiB RAM. {machine_words(hw)}"
     label = Gtk.Label(label=text, xalign=0, wrap=True)
     label.add_css_class("title-4")
     return label
@@ -98,7 +101,10 @@ def _installer_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
     outer.append(header)
     outer.append(_banner(hw))
     hint = Gtk.Label(
-        label=f"Acting for {target.name}. Model root {target.model_root}. Bind {target.bind}.",
+        label=(
+            f"Acting for {target.name}. Model folder {target.model_root}. "
+            f"{listen_words(target.bind)}"
+        ),
         xalign=0,
         wrap=True,
     )
@@ -122,6 +128,35 @@ def _installer_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
     outer.append(stack)
     outer.append(status)
     return outer
+
+
+def _show_chat_model_cta(win, on_download, body_text: str = "") -> None:
+    dialog = Gtk.Window(transient_for=win, modal=True, title="Chat needs a model")
+    dialog.set_default_size(520, 220)
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    outer.set_margin_top(16)
+    outer.set_margin_bottom(16)
+    outer.set_margin_start(16)
+    outer.set_margin_end(16)
+    body = Gtk.Label(label=body_text or CHAT_MODEL_NEEDED, wrap=True, xalign=0)
+    outer.append(body)
+    go = Gtk.Button(label=CHAT_MODEL_CTA)
+    go.add_css_class("suggested-action")
+
+    def accept(*_args) -> None:
+        dialog.close()
+        on_download()
+
+    go.connect("clicked", accept)
+    later = Gtk.Button(label="Later")
+    later.connect("clicked", lambda *_: dialog.close())
+    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    row.append(later)
+    row.append(Gtk.Box(hexpand=True))
+    row.append(go)
+    outer.append(row)
+    dialog.set_child(outer)
+    dialog.present()
 
 
 def _check_row(title: str, summary: str, check: Gtk.CheckButton) -> Gtk.Widget:
@@ -246,11 +281,10 @@ def _scroller(child: Gtk.Widget) -> Gtk.ScrolledWindow:
 
 def _workflows_page(win, hw, user, workflows, checks, status) -> Gtk.Widget:
     page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-    listbox = Gtk.ListBox()
-    listbox.set_selection_mode(Gtk.SelectionMode.NONE)
-    listbox.add_css_class("boxed-list")
+    helpers = helper_workflow_ids(workflows)
     rec = recommended_ids(workflows, hw)
-    for wf in workflows:
+
+    def fill_row(wf) -> Gtk.Widget:
         cb = checks[wf.id]
         offered = wf.offered(hw) and wf.satisfied(hw)
         cb.set_active(wf.id in rec)
@@ -262,8 +296,30 @@ def _workflows_page(win, hw, user, workflows, checks, status) -> Gtk.Widget:
             summary = wf.summary + " Unavailable on this hardware."
         elif not wf.ready(hw):
             summary = wf.summary + " Apply will install the missing GPU packages."
-        listbox.append(_check_row(wf.title, summary, cb))
+        title = workflow_row_title(wf.title, wf.id, helpers)
+        return _check_row(title, summary, cb)
+
+    mains = [wf for wf in workflows if wf.id not in helpers]
+    helper_wfs = [wf for wf in workflows if wf.id in helpers]
+    listbox = Gtk.ListBox()
+    listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+    listbox.add_css_class("boxed-list")
+    for wf in mains:
+        listbox.append(fill_row(wf))
     page.append(_scroller(listbox))
+    if helper_wfs:
+        helpers_head = Gtk.Label(label=HELPERS_SECTION, xalign=0)
+        helpers_head.add_css_class("heading")
+        page.append(helpers_head)
+        helpers_blurb = Gtk.Label(label=HELPERS_BLURB, xalign=0, wrap=True)
+        helpers_blurb.add_css_class("dim-label")
+        page.append(helpers_blurb)
+        helper_box = Gtk.ListBox()
+        helper_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        helper_box.add_css_class("boxed-list")
+        for wf in helper_wfs:
+            helper_box.append(fill_row(wf))
+        page.append(_scroller(helper_box))
     buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     exit_btn = Gtk.Button(label="Exit")
     dry = Gtk.Button(label="Dry run")
@@ -885,18 +941,25 @@ def _config_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
     outer.append(switcher)
 
     overview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    helpers = helper_workflow_ids(load_workflows())
     installed = [a for a in apps if a.present]
-    missing = [a for a in apps if not a.present]
+    products = [a for a in installed if a.id not in helpers]
+    helper_apps = [a for a in installed if a.id in helpers]
+    missing = [
+        a
+        for a in apps
+        if not a.present and a.id != "ubuntuai-core" and a.id not in helpers
+    ]
     inst_label = Gtk.Label(label="Installed", xalign=0)
     inst_label.add_css_class("heading")
     overview.append(inst_label)
-    if installed:
-        for app in installed:
+    if products:
+        for app in products:
             line = app.title
             if app.endpoint:
                 line += f"\n{app.endpoint}"
             overview.append(Gtk.Label(label=line, xalign=0, wrap=True))
-    else:
+    elif not helper_apps:
         overview.append(
             Gtk.Label(
                 label="Nothing from the installer is on this computer yet.",
@@ -904,6 +967,16 @@ def _config_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
                 wrap=True,
             )
         )
+    if helper_apps:
+        help_head = Gtk.Label(label=HELPERS_SECTION, xalign=0)
+        help_head.add_css_class("heading")
+        overview.append(help_head)
+        overview.append(Gtk.Label(label=HELPERS_BLURB, xalign=0, wrap=True))
+        for app in helper_apps:
+            line = workflow_row_title(app.title, app.id, helpers)
+            if app.endpoint:
+                line += f"\n{app.endpoint}"
+            overview.append(Gtk.Label(label=line, xalign=0, wrap=True))
     if missing:
         miss = Gtk.Label(
             label="Not installed. Open Ubuntu AI Installer to add: "
@@ -944,13 +1017,17 @@ def _config_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
     chat_combo = _combo(chat_pairs, str(data.get("chat_model") or "auto"))
     settings.append(chat_combo)
     if not models:
-        none = Gtk.Label(
-            label="No GGUF chat files in the model folder yet. Use the installer Weights tab.",
-            xalign=0,
-            wrap=True,
-        )
-        none.add_css_class("dim-label")
+        none = Gtk.Label(label=CHAT_MODEL_NEEDED_CONFIG, xalign=0, wrap=True)
         settings.append(none)
+        cta = Gtk.Button(label=CHAT_MODEL_CTA)
+        cta.add_css_class("suggested-action")
+        cta.connect(
+            "clicked",
+            lambda *_: _show_chat_model_cta(
+                win, lambda: None, CHAT_MODEL_NEEDED_CONFIG
+            ),
+        )
+        settings.append(cta)
 
     tts_apps = [a for a in installed if a.role == "tts"]
     stt_apps = [a for a in installed if a.role == "stt"]

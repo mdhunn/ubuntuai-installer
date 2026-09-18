@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
 
 from apply import ApplyError, build_plan, execute_plan, format_plan
 from progress import ProgressEvent
-from catalog import expand_selection, load_workflows, recommended_ids
+from catalog import expand_selection, helper_workflow_ids, load_workflows, recommended_ids
 from configstore import add_scan_folder
 from configstore import load as load_config
 from configstore import record_installed
@@ -52,9 +52,17 @@ from probe import probe
 from users import guess_user, target_for
 from runtime import (
     BACKEND_LABELS,
+    CHAT_MODEL_CTA,
+    CHAT_MODEL_NEEDED,
+    CHAT_MODEL_NEEDED_CONFIG,
+    HELPERS_BLURB,
+    HELPERS_SECTION,
     app_statuses,
     backend_choices,
     chat_models,
+    listen_words,
+    machine_words,
+    workflow_row_title,
 )
 from validate import collect, format_checks, format_health
 from weights import (
@@ -85,12 +93,8 @@ def run(mode: str) -> int:
 
 
 def _banner(hw) -> QLabel:
-    backends = ", ".join(sorted(hw.backends()))
     ram = hw.ram_bytes // (1024**3)
-    hybrid = "Hybrid available." if hw.hybrid_ok() else "Hybrid not detected."
-    lab = QLabel(
-        f"{hw.cpu_name}\n{ram} GiB RAM. Backends: {backends}. {hybrid}"
-    )
+    lab = QLabel(f"{hw.cpu_name}\n{ram} GiB RAM. {machine_words(hw)}")
     lab.setWordWrap(True)
     return lab
 
@@ -110,7 +114,8 @@ def _installer_widget(win: QMainWindow) -> QWidget:
     layout.addWidget(_banner(hw))
     layout.addWidget(
         QLabel(
-            f"Acting for {target.name}. Model root {target.model_root}. Bind {target.bind}."
+            f"Acting for {target.name}. Model folder {target.model_root}. "
+            f"{listen_words(target.bind)}"
         )
     )
 
@@ -170,6 +175,19 @@ def _open_apply_progress(win) -> tuple[QDialog, object]:
     return dialog, update
 
 
+def _show_chat_model_cta(win, on_download, body_text: str = "") -> None:
+    box = QMessageBox(win)
+    box.setIcon(QMessageBox.Icon.Information)
+    box.setWindowTitle("Chat needs a model")
+    box.setText(body_text or CHAT_MODEL_NEEDED)
+    go = box.addButton(CHAT_MODEL_CTA, QMessageBox.ButtonRole.AcceptRole)
+    box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(go)
+    box.exec()
+    if box.clickedButton() is go:
+        on_download()
+
+
 def _show_failure(win, english: str, technical: str = "") -> None:
     box = QMessageBox(win)
     box.setIcon(QMessageBox.Icon.Critical)
@@ -187,8 +205,10 @@ def _qt_workflows(win, hw, user, workflows, status) -> QWidget:
     inner = QWidget()
     inner_l = QVBoxLayout(inner)
     inner_l.setContentsMargins(8, 8, 24, 8)
+    helpers = helper_workflow_ids(workflows)
     rec = recommended_ids(workflows, hw)
-    for wf in workflows:
+
+    def add_row(wf) -> None:
         offered = wf.offered(hw) and wf.satisfied(hw)
         summary = wf.summary
         if wf.id in rec and wf.role:
@@ -197,11 +217,28 @@ def _qt_workflows(win, hw, user, workflows, status) -> QWidget:
             summary = wf.summary + " Unavailable on this hardware."
         elif not wf.ready(hw):
             summary = wf.summary + " Apply will install the missing GPU packages."
-        box = QCheckBox(f"{wf.title}\n{summary}")
+        title = workflow_row_title(wf.title, wf.id, helpers)
+        box = QCheckBox(f"{title}\n{summary}")
         box.setChecked(wf.id in rec)
         box.setEnabled(offered and not wf.always)
         checks[wf.id] = box
         inner_l.addWidget(box)
+
+    for wf in workflows:
+        if wf.id not in helpers:
+            add_row(wf)
+    helper_wfs = [wf for wf in workflows if wf.id in helpers]
+    if helper_wfs:
+        head = QLabel(HELPERS_SECTION)
+        font = head.font()
+        font.setBold(True)
+        head.setFont(font)
+        inner_l.addWidget(head)
+        blurb = QLabel(HELPERS_BLURB)
+        blurb.setWordWrap(True)
+        inner_l.addWidget(blurb)
+        for wf in helper_wfs:
+            add_row(wf)
     scroller = QScrollArea()
     scroller.setWidgetResizable(True)
     scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -211,6 +248,7 @@ def _qt_workflows(win, hw, user, workflows, status) -> QWidget:
     exit_btn = QPushButton("Exit")
     dry = QPushButton("Dry run")
     apply_btn = QPushButton("Apply")
+    apply_btn.setDefault(True)
     row.addWidget(exit_btn)
     row.addStretch(1)
     row.addWidget(dry)
@@ -727,19 +765,38 @@ def _config_widget(win: QMainWindow) -> QWidget:
 
     overview = QWidget()
     ov = QVBoxLayout(overview)
+    helpers = helper_workflow_ids(load_workflows())
     installed = [a for a in apps if a.present]
-    missing = [a for a in apps if not a.present]
+    products = [a for a in installed if a.id not in helpers]
+    helper_apps = [a for a in installed if a.id in helpers]
+    missing = [
+        a
+        for a in apps
+        if not a.present and a.id != "ubuntuai-core" and a.id not in helpers
+    ]
     ov.addWidget(QLabel("Installed"))
-    if installed:
-        for app in installed:
+    if products:
+        for app in products:
             line = app.title
             if app.endpoint:
                 line += f"\n{app.endpoint}"
             lab = QLabel(line)
             lab.setWordWrap(True)
             ov.addWidget(lab)
-    else:
+    elif not helper_apps:
         ov.addWidget(QLabel("Nothing from the installer is on this computer yet."))
+    if helper_apps:
+        ov.addWidget(QLabel(HELPERS_SECTION))
+        help_blurb = QLabel(HELPERS_BLURB)
+        help_blurb.setWordWrap(True)
+        ov.addWidget(help_blurb)
+        for app in helper_apps:
+            line = workflow_row_title(app.title, app.id, helpers)
+            if app.endpoint:
+                line += f"\n{app.endpoint}"
+            lab = QLabel(line)
+            lab.setWordWrap(True)
+            ov.addWidget(lab)
     if missing:
         miss = QLabel(
             "Not installed. Open Ubuntu AI Installer to add: "
@@ -781,11 +838,15 @@ def _config_widget(win: QMainWindow) -> QWidget:
     st.addWidget(QLabel("Chat model"))
     st.addWidget(chat_combo)
     if not models:
-        none = QLabel(
-            "No GGUF chat files in the model folder yet. Use the installer Weights tab."
-        )
+        none = QLabel(CHAT_MODEL_NEEDED_CONFIG)
         none.setWordWrap(True)
         st.addWidget(none)
+        cta = QPushButton(CHAT_MODEL_CTA)
+        cta.setDefault(True)
+        cta.clicked.connect(
+            lambda: _show_chat_model_cta(win, lambda: None, CHAT_MODEL_NEEDED_CONFIG)
+        )
+        st.addWidget(cta)
     tts_combo = None
     stt_combo = None
     tts_apps = [a for a in installed if a.role == "tts"]

@@ -56,6 +56,17 @@ def by_id(workflows: tuple[Workflow, ...]) -> dict[str, Workflow]:
     return {w.id: w for w in workflows}
 
 
+def is_helpers_only(wf: Workflow) -> bool:
+    if wf.helpers_only:
+        return True
+    blob = f"{wf.title} {wf.summary}".lower()
+    return "(helpers)" in blob or "helpers-only" in blob or "helpers only" in blob
+
+
+def helper_workflow_ids(workflows: tuple[Workflow, ...]) -> frozenset[str]:
+    return frozenset(w.id for w in workflows if is_helpers_only(w))
+
+
 def pick_role_winners(
     workflows: tuple[Workflow, ...], hw: Hardware
 ) -> dict[str, str]:

@@ -255,6 +255,22 @@ class ApplyTests(unittest.TestCase):
                 self.assertIn("26.04", msg)
                 self.assertNotIn("100", msg)
 
+    def test_chat_plan_requires_default_gguf(self) -> None:
+        with patch("apply.dpkg_installed", return_value=True), patch(
+            "apply.user_in_group", return_value=True
+        ):
+            actions = build_plan(
+                ("ubuntuai-chat",),
+                _hw_strix(),
+                self.target,
+                self.wfs,
+            )
+        weight_ids = []
+        for a in actions:
+            if a.kind == "weights":
+                weight_ids.extend(a.payload)
+        self.assertIn("qwen3-0.6b-q8_0", weight_ids)
+
     def test_explain_apt_lock_is_english(self) -> None:
         msg = explain_apt_failure(
             "E: Could not get lock /var/lib/dpkg/lock-frontend",

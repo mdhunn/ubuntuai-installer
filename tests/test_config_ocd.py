@@ -25,6 +25,9 @@ from runtime import (
     endpoint_for,
     explain_setup,
     is_present,
+    listen_words,
+    machine_words,
+    workflow_row_title,
 )
 from users import load_saved_bind, load_saved_model_root
 from validate import format_health
@@ -131,6 +134,11 @@ class ConfigAppContractTests(unittest.TestCase):
         self.assertIn("Installed", text)
         self.assertIn("Not installed", text)
         self.assertIn("Open Ubuntu AI Installer", text)
+        missing = text.split("Not installed", 1)[1]
+        self.assertNotIn("Image", missing)
+        self.assertNotIn("Video", missing)
+        self.assertNotIn("RAG", missing)
+        self.assertNotIn("Coding", missing)
 
     def test_explain_lan_bind(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -260,6 +268,54 @@ class ConfigHealthAndCliTests(unittest.TestCase):
         self.assertIn("model_root", data)
         self.assertIn("installed_workflows", data)
         self.assertIn(data["bind"], {"127.0.0.1", "0.0.0.0"})
+
+    def test_listen_and_machine_words_are_plain(self) -> None:
+        self.assertEqual(listen_words("127.0.0.1"), "This computer only.")
+        self.assertIn("home network", listen_words("0.0.0.0"))
+        self.assertNotIn("127.0.0.1", listen_words("127.0.0.1"))
+        cpu = machine_words(_cpu())
+        self.assertIn("CPU", cpu)
+        self.assertNotIn("Backend", cpu)
+        self.assertNotIn("Hybrid", cpu)
+        npu = Hardware(
+            cpu_name="strix",
+            ram_bytes=16 * 1024**3,
+            devices=(
+                Device("npu", "amd", "xdna", "/dev/accel/accel0", "xdna"),
+                Device("igpu", "amd", "radeon", "/dev/dri/renderD128", "vulkan"),
+                Device("cpu", "cpu", "cpu", None, "cpu"),
+            ),
+        )
+        together = machine_words(npu)
+        self.assertIn("NPU and GPU can work together", together)
+        self.assertEqual(
+            workflow_row_title("Image", "ubuntuai-image", frozenset({"ubuntuai-image"})),
+            "Image (helpers only)",
+        )
+        self.assertEqual(
+            workflow_row_title(
+                "Image helpers", "ubuntuai-image", frozenset({"ubuntuai-image"})
+            ),
+            "Image helpers",
+        )
+
+    def test_gtk_qt_twins_share_presentment(self) -> None:
+        from support import PKG
+
+        gtk = (PKG / "ui" / "gtk_ui.py").read_text(encoding="utf-8")
+        qt = (PKG / "ui" / "qt_ui.py").read_text(encoding="utf-8")
+        for src in (gtk, qt):
+            self.assertIn("listen_words", src)
+            self.assertIn("machine_words", src)
+            self.assertIn("CHAT_MODEL_CTA", src)
+            self.assertIn("CHAT_MODEL_NEEDED_CONFIG", src)
+            self.assertIn("HELPERS_SECTION", src)
+            self.assertIn("This computer only", src)
+            self.assertNotIn("Backends:", src)
+            self.assertNotIn("Hybrid available", src)
+            self.assertNotIn("Hybrid not detected", src)
+            self.assertNotIn("Bind {", src)
+            self.assertNotIn("No GGUF chat files", src)
 
     def test_help_lists_explain_and_chat_model(self) -> None:
         buf = io.StringIO()
