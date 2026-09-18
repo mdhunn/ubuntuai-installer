@@ -380,9 +380,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--organize-weights",
         nargs="?",
-        const="link",
-        choices=("link", "copy", "move"),
-        help="symlink (default), copy, or move discovered weights into the model root",
+        const="copy",
+        choices=("copy", "move"),
+        help="copy (default) or move discovered weights into the model root",
     )
     p.add_argument(
         "--remove-source",

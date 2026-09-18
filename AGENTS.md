@@ -47,7 +47,7 @@ GUI needs a session bus and a display. CLI must remain complete without either.
 | `usr/share/ubuntuai-installer/weights.json` | Weight catalog. Required ids are fetched on apply if missing. |
 | `usr/share/ubuntuai-installer/vendors.json` | Pinned vendor runtimes. URL, archive flavor, binaries. |
 | `usr/share/ubuntuai-installer/vendor.py` | Download, extract, wrap vendor binaries into `~/.local`. |
-| `usr/share/ubuntuai-installer/weights.py` | Scan, classify, symlink/copy/move, download, ensure required weights. |
+| `usr/share/ubuntuai-installer/weights.py` | Scan, classify, copy/move, download, ensure required weights. |
 | `usr/share/ubuntuai-installer/repair.py` | Diagnose, plan, human-approved repair of config, vendors, and checksums. |
 | `usr/share/ubuntuai-installer/upgrade.py` | Human-approved vendor, catalog, and Lemonade load updates. |
 | `usr/share/ubuntuai-installer/lemonade.py` | Publish GGUF trees to Lemonade. Tune large-model load. |
@@ -68,7 +68,7 @@ Install copies `usr/` into `PREFIX`. Keep runtime paths working from a source tr
 3. Apply is idempotent. A second run converges to the same files and groups.
 4. Privileged writes go through the helper. Package names must match `^[a-zA-Z0-9.+-]+$`. `model_root` must stay under the target user's home.
 5. Bind defaults to `127.0.0.1`. `0.0.0.0` needs an explicit config choice.
-6. No model weights in git. Organize offers symlink, copy, or move. Copy/move may delete the original only after a checksum match. Do not assume SHA-256. Use the algorithm the download page or API publishes. No unpinned `curl | sh`. No `pip install torch` on system Python.
+6. No model weights in git. Organize offers copy or move. Copy is the default. Copy/move may delete the original only after a checksum match. Do not assume SHA-256. Use the algorithm the download page or API publishes. No unpinned `curl | sh`. No `pip install torch` on system Python.
 7. Firmware is a matched pair. Never half-update NPU firmware from the installer.
 8. Grey out a workflow only when the required silicon cannot exist on this machine. Missing archive packages are Apply's job. Serve and Train stay available when an AMD or NVIDIA GPU is present. Apply installs ROCm or CUDA from Ubuntu. An NPU-only or CPU-only box still hides them. Do not pip-install PyTorch.
 9. Speech engines have `role` `tts` or `stt`. Defaults come from `pick_role_winners`. `ubuntuai-speech` is a CLI alias for those winners.

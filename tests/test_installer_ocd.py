@@ -23,7 +23,7 @@ from apply import (
 )
 from catalog import by_id, expand_selection, load_workflows, recommended_ids
 from domain import Action, Device, Hardware, UserTarget, Workflow
-from main import installer_main
+from main import _parser, installer_main
 from weights import KNOWN_SUBDIRS, load_catalog
 
 
@@ -365,8 +365,13 @@ class InstallerCliTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 installer_main(["--help"])
         self.assertEqual(ctx.exception.code, 0)
-        self.assertIn("--install", buf.getvalue())
-        self.assertIn("--repair", buf.getvalue())
+        text = buf.getvalue()
+        self.assertIn("--install", text)
+        self.assertIn("--repair", text)
+        self.assertIn("--organize-weights", text)
+        self.assertIn("copy (default)", text)
+        self.assertNotIn("symlink (default)", text)
+        self.assertNotIn("choices: {link", text)
 
     def test_list_marks_serve_install_on_amd_gpu(self) -> None:
         buf = io.StringIO()
@@ -378,6 +383,20 @@ class InstallerCliTests(unittest.TestCase):
         self.assertRegex(text, r"ubuntuai-serve\s+install")
         self.assertNotRegex(text, r"ubuntuai-serve\s+unavailable")
         self.assertRegex(text, r"ubuntuai-hybrid\s+on")
+
+    def test_organize_cli_is_copy_or_move(self) -> None:
+        action = next(
+            a for a in _parser()._actions if "--organize-weights" in a.option_strings
+        )
+        self.assertEqual(action.const, "copy")
+        self.assertEqual(tuple(action.choices), ("copy", "move"))
+
+    def test_organize_ui_has_no_symlink_option(self) -> None:
+        gtk = (PKG / "ui" / "gtk_ui.py").read_text(encoding="utf-8")
+        qt = (PKG / "ui" / "qt_ui.py").read_text(encoding="utf-8")
+        self.assertNotIn('label="Symlink"', gtk)
+        self.assertNotIn('QRadioButton("Symlink")', qt)
+        self.assertNotIn("then symlink into", gtk)
 
 
 class InstallerTwinWarnTests(unittest.TestCase):
