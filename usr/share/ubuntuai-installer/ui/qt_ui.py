@@ -28,6 +28,14 @@ from PyQt6.QtWidgets import (
 )
 
 from apply import ApplyError, build_plan, execute_plan, format_plan
+from lemonade import detect as lemonade_detect
+from load_warn import (
+    CANCEL,
+    LoadWarn,
+    plan_publishes_lemonade,
+    warn_for_chat_model,
+    warn_for_publish,
+)
 from progress import ProgressEvent
 from catalog import expand_selection, helper_workflow_ids, load_workflows, recommended_ids
 from configstore import add_scan_folder
@@ -188,6 +196,21 @@ def _open_apply_progress(win) -> tuple[QDialog, object]:
     return dialog, update
 
 
+def _confirm_load_warn(win, warn: LoadWarn, on_continue) -> None:
+    if not warn.should_prompt:
+        on_continue()
+        return
+    box = QMessageBox(win)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle(warn.title)
+    box.setText(warn.body)
+    go = box.addButton(warn.primary, QMessageBox.ButtonRole.AcceptRole)
+    box.addButton(CANCEL, QMessageBox.ButtonRole.RejectRole)
+    box.exec()
+    if box.clickedButton() is go:
+        on_continue()
+
+
 def _show_chat_model_cta(win, on_download, body_text: str = "") -> None:
     box = QMessageBox(win)
     box.setIcon(QMessageBox.Icon.Information)
@@ -282,66 +305,72 @@ def _qt_workflows(win, hw, user, workflows, status, show_chat_download) -> QWidg
             return
         import threading
 
-        _dialog, update = _open_apply_progress(win)
-        pending: list[object] = []
-        timer = QTimer(_dialog)
-        timer.setInterval(80)
+        def start_apply() -> None:
+            _dialog, update = _open_apply_progress(win)
+            pending: list[object] = []
+            timer = QTimer(_dialog)
+            timer.setInterval(80)
 
-        def drain() -> None:
-            while pending:
-                ev = pending.pop(0)
-                if isinstance(ev, tuple) and ev and ev[0] == "chat-cta":
-                    cta.setVisible(True)
-                    _show_chat_model_cta(win, show_chat_download)
-                    continue
-                if isinstance(ev, tuple) and ev and ev[0] == "chat-cta-hide":
-                    cta.setVisible(False)
-                    continue
-                update(ev)
-                if isinstance(ev, ProgressEvent) and ev.failed:
-                    status.setText(ev.english)
-                    _show_failure(win, ev.english, ev.technical)
-                elif isinstance(ev, ProgressEvent) and ev.done:
-                    status.setText(ev.english)
+            def drain() -> None:
+                while pending:
+                    ev = pending.pop(0)
+                    if isinstance(ev, tuple) and ev and ev[0] == "chat-cta":
+                        cta.setVisible(True)
+                        _show_chat_model_cta(win, show_chat_download)
+                        continue
+                    if isinstance(ev, tuple) and ev and ev[0] == "chat-cta-hide":
+                        cta.setVisible(False)
+                        continue
+                    update(ev)
+                    if isinstance(ev, ProgressEvent) and ev.failed:
+                        status.setText(ev.english)
+                        _show_failure(win, ev.english, ev.technical)
+                    elif isinstance(ev, ProgressEvent) and ev.done:
+                        status.setText(ev.english)
 
-        timer.timeout.connect(drain)
-        timer.start()
+            timer.timeout.connect(drain)
+            timer.start()
 
-        def work() -> None:
-            try:
-                execute_plan(
-                    actions,
-                    t,
-                    hw=hw,
-                    dry_run=False,
-                    on_progress=pending.append,
-                )
-                record_installed(user, expand_selection(ids, workflows, hw))
-                report = collect(t, hw)
-                extra = "\nLog out and back in if group membership just changed."
-                need_model = no_chat_gguf(t.model_root)
-                if need_model:
-                    extra += "\n" + CHAT_MODEL_NEEDED
-                pending.append(
-                    ProgressEvent(
-                        "Finished.",
-                        format_checks(report) + extra,
-                        1.0,
-                        done=True,
+            def work() -> None:
+                try:
+                    execute_plan(
+                        actions,
+                        t,
+                        hw=hw,
+                        dry_run=False,
+                        on_progress=pending.append,
                     )
-                )
-                if need_model:
-                    pending.append(("chat-cta",))
-                else:
-                    pending.append(("chat-cta-hide",))
-            except ApplyError as exc:
-                pending.append(
-                    ProgressEvent(exc.english, exc.technical, failed=True)
-                )
-            except Exception as exc:  # noqa: BLE001
-                pending.append(ProgressEvent("Apply failed.", str(exc), failed=True))
+                    record_installed(user, expand_selection(ids, workflows, hw))
+                    report = collect(t, hw)
+                    extra = "\nLog out and back in if group membership just changed."
+                    need_model = no_chat_gguf(t.model_root)
+                    if need_model:
+                        extra += "\n" + CHAT_MODEL_NEEDED
+                    pending.append(
+                        ProgressEvent(
+                            "Finished.",
+                            format_checks(report) + extra,
+                            1.0,
+                            done=True,
+                        )
+                    )
+                    if need_model:
+                        pending.append(("chat-cta",))
+                    else:
+                        pending.append(("chat-cta-hide",))
+                except ApplyError as exc:
+                    pending.append(
+                        ProgressEvent(exc.english, exc.technical, failed=True)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    pending.append(ProgressEvent("Apply failed.", str(exc), failed=True))
 
-        threading.Thread(target=work, daemon=True).start()
+            threading.Thread(target=work, daemon=True).start()
+
+        if plan_publishes_lemonade(actions):
+            _confirm_load_warn(win, warn_for_publish(t, hw), start_apply)
+        else:
+            start_apply()
 
     exit_btn.clicked.connect(win.close)
     dry.clicked.connect(lambda: do_apply(True))
@@ -978,25 +1007,37 @@ def _config_widget(win: QMainWindow) -> QWidget:
         if not uri and any(a.id == "ubuntuai-chat" and a.present for a in apps):
             host = "127.0.0.1" if bind != "0.0.0.0" else bind
             uri = f"http://{host}:8080/v1"
-        try:
-            path = save_config(
-                user,
-                {
-                    "bind": bind,
-                    "model_root": root_entry.text().strip(),
-                    "chat_model": _combo_value(chat_combo),
-                    "primary_backend": _combo_value(backend_combo),
-                    "tts_engine": _combo_value(tts_combo),
-                    "stt_engine": _combo_value(stt_combo),
-                    "openai_base_url": uri,
-                    "openai_api_key": key_entry.text().strip(),
-                },
+        chat = _combo_value(chat_combo)
+
+        def write() -> None:
+            try:
+                path = save_config(
+                    user,
+                    {
+                        "bind": bind,
+                        "model_root": root_entry.text().strip(),
+                        "chat_model": chat,
+                        "primary_backend": _combo_value(backend_combo),
+                        "tts_engine": _combo_value(tts_combo),
+                        "stt_engine": _combo_value(stt_combo),
+                        "openai_base_url": uri,
+                        "openai_api_key": key_entry.text().strip(),
+                    },
+                )
+            except ValueError as exc:
+                _show_failure(win, str(exc), "")
+                status.setText(str(exc))
+                return
+            status.setText(f"Saved {path}")
+
+        if lemonade_detect():
+            _confirm_load_warn(
+                win,
+                warn_for_chat_model(target_for(user), hw, chat),
+                write,
             )
-        except ValueError as exc:
-            _show_failure(win, str(exc), "")
-            status.setText(str(exc))
             return
-        status.setText(f"Saved {path}")
+        write()
 
     def do_validate() -> None:
         refresh_health()

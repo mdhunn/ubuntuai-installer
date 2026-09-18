@@ -380,5 +380,17 @@ class InstallerCliTests(unittest.TestCase):
         self.assertRegex(text, r"ubuntuai-hybrid\s+on")
 
 
+class InstallerTwinWarnTests(unittest.TestCase):
+    def test_gtk_qt_warn_before_lemonade_publish(self) -> None:
+        gtk = (PKG / "ui" / "gtk_ui.py").read_text(encoding="utf-8")
+        qt = (PKG / "ui" / "qt_ui.py").read_text(encoding="utf-8")
+        for src in (gtk, qt):
+            self.assertIn("warn_for_publish", src)
+            self.assertIn("plan_publishes_lemonade", src)
+            self.assertIn("_confirm_load_warn", src)
+            self.assertNotIn("action\": \"refuse\"", src)
+            self.assertNotIn("This model may strain this computer", src)
+
+
 if __name__ == "__main__":
     unittest.main()

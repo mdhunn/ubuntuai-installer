@@ -11,6 +11,14 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from apply import ApplyError, build_plan, execute_plan, format_plan
+from lemonade import detect as lemonade_detect
+from load_warn import (
+    CANCEL,
+    LoadWarn,
+    plan_publishes_lemonade,
+    warn_for_chat_model,
+    warn_for_publish,
+)
 from progress import ProgressEvent
 from catalog import expand_selection, helper_workflow_ids, load_workflows, recommended_ids
 from configstore import add_scan_folder
@@ -139,6 +147,39 @@ def _installer_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
     outer.append(stack)
     outer.append(status)
     return outer
+
+
+def _confirm_load_warn(win, warn: LoadWarn, on_continue) -> None:
+    if not warn.should_prompt:
+        on_continue()
+        return
+    dialog = Gtk.Window(transient_for=win, modal=True, title=warn.title)
+    dialog.set_default_size(520, 280)
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    outer.set_margin_top(16)
+    outer.set_margin_bottom(16)
+    outer.set_margin_start(16)
+    outer.set_margin_end(16)
+    body = Gtk.Label(label=warn.body, wrap=True, xalign=0)
+    body.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+    outer.append(body)
+
+    def accept(*_args) -> None:
+        dialog.close()
+        on_continue()
+
+    go = Gtk.Button(label=warn.primary)
+    go.add_css_class("suggested-action")
+    go.connect("clicked", accept)
+    cancel = Gtk.Button(label=CANCEL)
+    cancel.connect("clicked", lambda *_: dialog.close())
+    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    row.append(cancel)
+    row.append(Gtk.Box(hexpand=True))
+    row.append(go)
+    outer.append(row)
+    dialog.set_child(outer)
+    dialog.present()
 
 
 def _show_chat_model_cta(win, on_download, body_text: str = "") -> None:
@@ -361,43 +402,50 @@ def _workflows_page(win, hw, user, workflows, checks, status, show_chat_download
         if dry_run:
             status.set_text("Dry run\n" + format_plan(actions))
             return
-        _dialog, update = _open_apply_progress(win)
 
-        def work() -> None:
-            try:
-                execute_plan(
-                    actions,
-                    t,
-                    hw=hw,
-                    dry_run=False,
-                    on_progress=lambda ev: GLib.idle_add(update, ev),
-                )
-            except ApplyError as exc:
-                GLib.idle_add(status.set_text, exc.english)
-                GLib.idle_add(_show_failure, win, exc.english, exc.technical)
-                return
-            except Exception as exc:  # noqa: BLE001
-                GLib.idle_add(status.set_text, f"Apply failed. {exc}")
-                GLib.idle_add(_show_failure, win, "Apply failed.", str(exc))
-                return
-            record_installed(user, expand_selection(selected_ids(), workflows, hw))
-            report = collect(t, hw)
-            extra = ""
-            if any(c.name.startswith("group:") for c in report):
-                extra = "\nLog out and back in if group membership just changed."
-            need_model = no_chat_gguf(t.model_root)
-            if need_model:
-                extra += "\n" + CHAT_MODEL_NEEDED
-            GLib.idle_add(status.set_text, format_checks(report) + extra)
-            if need_model:
-                GLib.idle_add(cta.set_visible, True)
-                GLib.idle_add(_show_chat_model_cta, win, show_chat_download)
-            else:
-                GLib.idle_add(cta.set_visible, False)
-            if worst(report) == "fail":
-                GLib.idle_add(apply_btn.add_css_class, "destructive-action")
+        def start_apply() -> None:
+            _dialog, update = _open_apply_progress(win)
 
-        threading.Thread(target=work, daemon=True).start()
+            def work() -> None:
+                try:
+                    execute_plan(
+                        actions,
+                        t,
+                        hw=hw,
+                        dry_run=False,
+                        on_progress=lambda ev: GLib.idle_add(update, ev),
+                    )
+                except ApplyError as exc:
+                    GLib.idle_add(status.set_text, exc.english)
+                    GLib.idle_add(_show_failure, win, exc.english, exc.technical)
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    GLib.idle_add(status.set_text, f"Apply failed. {exc}")
+                    GLib.idle_add(_show_failure, win, "Apply failed.", str(exc))
+                    return
+                record_installed(user, expand_selection(selected_ids(), workflows, hw))
+                report = collect(t, hw)
+                extra = ""
+                if any(c.name.startswith("group:") for c in report):
+                    extra = "\nLog out and back in if group membership just changed."
+                need_model = no_chat_gguf(t.model_root)
+                if need_model:
+                    extra += "\n" + CHAT_MODEL_NEEDED
+                GLib.idle_add(status.set_text, format_checks(report) + extra)
+                if need_model:
+                    GLib.idle_add(cta.set_visible, True)
+                    GLib.idle_add(_show_chat_model_cta, win, show_chat_download)
+                else:
+                    GLib.idle_add(cta.set_visible, False)
+                if worst(report) == "fail":
+                    GLib.idle_add(apply_btn.add_css_class, "destructive-action")
+
+            threading.Thread(target=work, daemon=True).start()
+
+        if plan_publishes_lemonade(actions):
+            _confirm_load_warn(win, warn_for_publish(t, hw), start_apply)
+        else:
+            start_apply()
 
     exit_btn.connect("clicked", lambda *_: win.close())
     dry.connect("clicked", lambda *_: do_apply(True))
@@ -1185,25 +1233,37 @@ def _config_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
         if not uri and any(a.id == "ubuntuai-chat" and a.present for a in apps):
             host = "127.0.0.1" if bind != "0.0.0.0" else bind
             uri = f"http://{host}:8080/v1"
-        try:
-            path = save_config(
-                user,
-                {
-                    "bind": bind,
-                    "model_root": root_entry.get_text().strip(),
-                    "chat_model": combo_value(chat_combo),
-                    "primary_backend": combo_value(backend_combo),
-                    "tts_engine": combo_value(tts_combo),
-                    "stt_engine": combo_value(stt_combo),
-                    "openai_base_url": uri,
-                    "openai_api_key": key_entry.get_text().strip(),
-                },
+        chat = combo_value(chat_combo)
+
+        def write() -> None:
+            try:
+                path = save_config(
+                    user,
+                    {
+                        "bind": bind,
+                        "model_root": root_entry.get_text().strip(),
+                        "chat_model": chat,
+                        "primary_backend": combo_value(backend_combo),
+                        "tts_engine": combo_value(tts_combo),
+                        "stt_engine": combo_value(stt_combo),
+                        "openai_base_url": uri,
+                        "openai_api_key": key_entry.get_text().strip(),
+                    },
+                )
+            except ValueError as exc:
+                _show_failure(win, str(exc), "")
+                status.set_text(str(exc))
+                return
+            status.set_text(f"Saved {path}")
+
+        if lemonade_detect():
+            _confirm_load_warn(
+                win,
+                warn_for_chat_model(target_for(user), hw, chat),
+                write,
             )
-        except ValueError as exc:
-            _show_failure(win, str(exc), "")
-            status.set_text(str(exc))
             return
-        status.set_text(f"Saved {path}")
+        write()
 
     def do_validate() -> None:
         refresh_health()
