@@ -124,7 +124,7 @@ The desktop user is never a literal in the tree. `guess_user()` reads the enviro
 
 Prefer Ubuntu archive packages. On 26.04 that includes `llama.cpp-tools`, `libggml0-backend-vulkan`, `libggml0-backend-hip`, `rocminfo`, `whisper.cpp`, `rhvoice`, and `espeak-ng`.
 
-Lemonade (snap) is a separate server on `127.0.0.1:13305`. Store organize defaults to copy. The snap cannot follow symlinks and cannot use `~/Models` as `extra_models_dir`. Apply bind-mounts the real GGUF trees into snap common and sets `extra_models_dir`.
+Lemonade (snap) is a separate server on `127.0.0.1:13305`. Store organize defaults to copy. The snap cannot follow those links and cannot use `~/Models` as `extra_models_dir`. Apply bind-mounts the real GGUF trees into snap common and sets `extra_models_dir`.
 
 Vendor tarballs (OpenMOSS) and catalog models upgrade through the Updates tab. Diagnose, then Approve. Numbered GGUF shards (`-00001-of-00004`) stay one directory. On a 122 GiB APU, a model that uses more than half of RAM gets a small context, a long first-load timeout, and a single loaded model.
 
