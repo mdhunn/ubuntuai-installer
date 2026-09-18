@@ -75,6 +75,7 @@ class Workflow:
     vendor: str = ""
     required_weights: tuple[str, ...] = ()
     apt_for_backend: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    helpers_only: bool = False
 
     def offered(self, hw: Hardware) -> bool:
         if not self.hide_unless_backend:

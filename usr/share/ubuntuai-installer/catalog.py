@@ -41,6 +41,7 @@ def load_workflows(path: Path | None = None) -> tuple[Workflow, ...]:
                 (str(backend), tuple(pkgs or ()))
                 for backend, pkgs in (row.get("apt_for_backend") or {}).items()
             ),
+            helpers_only=bool(row.get("helpers_only") or False),
         )
         if wf.id in seen:
             raise ValueError(f"duplicate workflow id {wf.id}")
