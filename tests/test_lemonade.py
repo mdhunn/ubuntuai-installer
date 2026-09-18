@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from support import PKG  # noqa: F401
@@ -11,11 +12,16 @@ from domain import Action, UserTarget
 from lemonade import (
     APPLY_PUBLISH_VERB,
     BindMount,
+    OWNED_UNIT_DESC,
+    _drop_bind_unit,
     bind_mounts,
     detect,
     extra_dir,
     gguf_sources,
+    is_owned_lemonade_where,
+    leftover_owned_binds,
     mount_unit_text,
+    owned_bind_wheres,
     publish,
     quote_unit_path,
 )
@@ -45,6 +51,21 @@ def _target(
 def _write_gguf(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"G" * 2048)
+    return path
+
+
+def _seed_unit(
+    unit_dir: Path,
+    what: Path,
+    where: Path,
+    name: str,
+    ours: bool = True,
+) -> Path:
+    text = mount_unit_text(what, where)
+    if not ours:
+        text = text.replace(f"Description={OWNED_UNIT_DESC}", "Description=User bind")
+    path = unit_dir / name
+    path.write_text(text, encoding="utf-8")
     return path
 
 
@@ -346,6 +367,281 @@ class LemonadePublishTests(unittest.TestCase):
             with patch("lemonade.detect", return_value=""):
                 msg = publish(_target(home))
             self.assertEqual(msg, "lemonade not installed")
+
+    def test_owned_where_is_dest_or_srcn(self) -> None:
+        dest = Path("/var/snap/lemonade-server/common/ubuntuai-models")
+        self.assertTrue(is_owned_lemonade_where(dest, dest))
+        self.assertTrue(is_owned_lemonade_where(dest, dest / "chat" / "src0"))
+        self.assertTrue(is_owned_lemonade_where(dest, dest / "chat" / "src12"))
+        self.assertFalse(is_owned_lemonade_where(dest, dest / "chat" / "src"))
+        self.assertFalse(is_owned_lemonade_where(dest, dest / "chat" / "custom"))
+        self.assertFalse(is_owned_lemonade_where(dest, dest / "chat" / "src0" / "nested"))
+        self.assertFalse(is_owned_lemonade_where(dest, Path("/mnt/other")))
+
+    def test_leftover_nested_src_under_collapsed_dest(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "ubuntuai-models"
+            extra = Path(tmp) / "AI models"
+            nested = extra / "Models" / "gguf"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            src0 = dest / "chat" / "src0"
+            src1 = dest / "chat" / "src1"
+            _seed_unit(unit_dir, extra, src0, "src0.mount")
+            _seed_unit(unit_dir, nested, src1, "src1.mount")
+            plan = bind_mounts((extra, nested), dest)
+            self.assertEqual(plan, (BindMount(extra.resolve(), dest),))
+            leftovers = leftover_owned_binds(
+                dest, plan, unit_dir=unit_dir, mounted=(src0, src1)
+            )
+            self.assertEqual(leftovers, (src0.resolve(), src1.resolve()))
+            self.assertNotIn(dest.resolve(), leftovers)
+
+    def test_leftover_not_in_plan_goes_away(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "ubuntuai-models"
+            extra = Path(tmp) / "AI models"
+            store = Path(tmp) / "Models" / "gguf"
+            other = Path(tmp) / "Downloads"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            src0 = dest / "chat" / "src0"
+            src1 = dest / "chat" / "src1"
+            src2 = dest / "chat" / "src2"
+            _seed_unit(unit_dir, extra, src0, "src0.mount")
+            _seed_unit(unit_dir, store, src1, "src1.mount")
+            _seed_unit(unit_dir, other, src2, "src2.mount")
+            plan = (
+                BindMount(extra, src0),
+                BindMount(store, src1),
+            )
+            leftovers = leftover_owned_binds(dest, plan, unit_dir=unit_dir)
+            self.assertEqual(leftovers, (src2.resolve(),))
+            self.assertNotIn(src0.resolve(), leftovers)
+            self.assertNotIn(src1.resolve(), leftovers)
+
+    def test_leftover_unrelated_mount_is_untouched(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "ubuntuai-models"
+            extra = Path(tmp) / "AI models"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            src1 = dest / "chat" / "src1"
+            foreign = dest / "chat" / "src9"
+            custom = dest / "chat" / "custom"
+            other = Path("/mnt/other")
+            _seed_unit(unit_dir, extra, src1, "src1.mount")
+            _seed_unit(unit_dir, extra, foreign, "src9.mount", ours=False)
+            _seed_unit(unit_dir, extra, other, "other.mount")
+            plan = (BindMount(extra, dest),)
+            mounted = (src1, foreign, custom, other)
+            leftovers = leftover_owned_binds(
+                dest, plan, unit_dir=unit_dir, mounted=mounted
+            )
+            self.assertEqual(leftovers, (src1.resolve(),))
+            owned = owned_bind_wheres(dest, unit_dir, mounted)
+            self.assertNotIn(other.resolve(), owned)
+            self.assertNotIn(foreign.resolve(), owned)
+            self.assertNotIn(custom.resolve(), owned)
+
+    def test_leftover_fallback_mount_without_unit(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "ubuntuai-models"
+            src1 = dest / "chat" / "src1"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            plan = (BindMount(Path(tmp) / "AI models", dest),)
+            leftovers = leftover_owned_binds(
+                dest, plan, unit_dir=unit_dir, mounted=(src1,)
+            )
+            self.assertEqual(leftovers, (src1.resolve(),))
+
+    def test_leftover_dest_when_plan_uses_srcn(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "ubuntuai-models"
+            extra = Path(tmp) / "AI models"
+            store = Path(tmp) / "Models" / "gguf"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            _seed_unit(unit_dir, extra, dest, "dest.mount")
+            plan = bind_mounts((extra, store), dest)
+            leftovers = leftover_owned_binds(dest, plan, unit_dir=unit_dir)
+            self.assertEqual(leftovers, (dest.resolve(),))
+            self.assertTrue(leftovers[0].parts[-1] != "src0")
+
+    def test_leftover_innermost_first(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "ubuntuai-models"
+            extra = Path(tmp) / "AI models"
+            store = Path(tmp) / "Models" / "gguf"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            src0 = dest / "chat" / "src0"
+            _seed_unit(unit_dir, extra, dest, "dest.mount")
+            _seed_unit(unit_dir, store, src0, "src0.mount")
+            leftovers = leftover_owned_binds(dest, (), unit_dir=unit_dir)
+            self.assertEqual(leftovers, (src0.resolve(), dest.resolve()))
+
+    def test_publish_snap_drops_nested_leftover_srcn(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "AI models"
+            _write_gguf(extra / "outer.gguf")
+            store = extra / "Models"
+            _write_gguf(store / "gguf" / "inner.gguf")
+            dest = Path(tmp) / "snap-common" / "ubuntuai-models"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            src0 = dest / "chat" / "src0"
+            src1 = dest / "chat" / "src1"
+            _seed_unit(unit_dir, extra, src0, "src0.mount")
+            _seed_unit(unit_dir, store / "gguf", src1, "src1.mount")
+            _seed_unit(unit_dir, extra, Path("/mnt/other"), "other.mount")
+            _seed_unit(unit_dir, extra, dest / "chat" / "src9", "src9.mount", ours=False)
+            dropped: list[Path] = []
+            binds: list[tuple[Path, Path]] = []
+
+            def record_drop(where: Path, dest_arg: Path) -> None:
+                dropped.append(where)
+
+            def record_bind(what: Path, where: Path) -> str:
+                binds.append((what, where))
+                return "unit.mount"
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                patch(
+                    "lemonade._mounted_wheres",
+                    return_value=(
+                        src0,
+                        src1,
+                        dest / "chat" / "src9",
+                        Path("/mnt/other"),
+                        dest / "chat" / "custom",
+                    ),
+                ),
+                patch("lemonade._drop_bind_unit", side_effect=record_drop),
+                patch("lemonade._write_bind_unit", side_effect=record_bind),
+                patch("lemonade._set_extra_models_dir"),
+                patch("lemonade._restart_snap"),
+            ):
+                publish(_target(home, extra=(extra,), model_root=store))
+            self.assertEqual(binds, [(extra.resolve(), dest)])
+            self.assertEqual(
+                [path.resolve() for path in dropped],
+                [src0.resolve(), src1.resolve()],
+            )
+            self.assertNotIn(dest.resolve(), {path.resolve() for path in dropped})
+            self.assertNotIn(Path("/mnt/other"), dropped)
+            self.assertFalse(any(path.name == "src9" for path in dropped))
+            self.assertFalse(any(path.name == "custom" for path in dropped))
+
+    def test_publish_snap_keeps_sibling_srcn_drops_extra(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "AI models"
+            store = home / "Models" / "gguf"
+            _write_gguf(extra / "a.gguf")
+            _write_gguf(store / "b.gguf")
+            dest = Path(tmp) / "snap-common" / "ubuntuai-models"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            src0 = dest / "chat" / "src0"
+            src1 = dest / "chat" / "src1"
+            src2 = dest / "chat" / "src2"
+            _seed_unit(unit_dir, extra, src0, "src0.mount")
+            _seed_unit(unit_dir, store, src1, "src1.mount")
+            _seed_unit(unit_dir, home / "Downloads", src2, "src2.mount")
+            dropped: list[Path] = []
+
+            def record_drop(where: Path, dest_arg: Path) -> None:
+                dropped.append(where)
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                patch("lemonade._mounted_wheres", return_value=(src0, src1, src2)),
+                patch("lemonade._drop_bind_unit", side_effect=record_drop),
+                patch("lemonade._write_bind_unit", return_value="unit.mount"),
+                patch("lemonade._set_extra_models_dir"),
+                patch("lemonade._restart_snap"),
+            ):
+                publish(_target(home, extra=(extra,), model_root=home / "Models"))
+            self.assertEqual([path.resolve() for path in dropped], [src2.resolve()])
+            self.assertNotIn(src0.resolve(), {path.resolve() for path in dropped})
+            self.assertNotIn(src1.resolve(), {path.resolve() for path in dropped})
+
+    def test_publish_snap_drops_obsolete_dest_when_siblings(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "AI models"
+            store = home / "Models" / "gguf"
+            _write_gguf(extra / "a.gguf")
+            _write_gguf(store / "b.gguf")
+            dest = Path(tmp) / "snap-common" / "ubuntuai-models"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            _seed_unit(unit_dir, extra, dest, "dest.mount")
+            dropped: list[Path] = []
+            binds: list[tuple[Path, Path]] = []
+
+            def record_drop(where: Path, dest_arg: Path) -> None:
+                dropped.append(where)
+
+            def record_bind(what: Path, where: Path) -> str:
+                binds.append((what, where))
+                return "unit.mount"
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                patch("lemonade._mounted_wheres", return_value=(dest,)),
+                patch("lemonade._drop_bind_unit", side_effect=record_drop),
+                patch("lemonade._write_bind_unit", side_effect=record_bind),
+                patch("lemonade._set_extra_models_dir"),
+                patch("lemonade._restart_snap"),
+            ):
+                publish(_target(home, extra=(extra,), model_root=home / "Models"))
+            self.assertEqual([path.resolve() for path in dropped], [dest.resolve()])
+            self.assertEqual(
+                binds,
+                [
+                    (extra.resolve(), dest / "chat" / "src0"),
+                    (store.resolve(), dest / "chat" / "src1"),
+                ],
+            )
+
+    def test_drop_bind_unit_disables_ours_and_unmounts(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "ubuntuai-models"
+            src1 = dest / "chat" / "src1"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            unit = _seed_unit(unit_dir, Path(tmp) / "AI models", src1, "src1.mount")
+            cmds: list[list[str]] = []
+
+            def record_run(cmd: list[str]) -> SimpleNamespace:
+                cmds.append(cmd)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                patch("lemonade._run", side_effect=record_run),
+            ):
+                _drop_bind_unit(src1, dest)
+            self.assertFalse(unit.exists())
+            self.assertIn(["systemctl", "disable", "--now", "src1.mount"], cmds)
+            self.assertIn(["umount", str(src1)], cmds)
+
+    def test_drop_bind_unit_skips_unrelated(self) -> None:
+        cmds: list[list[str]] = []
+        with patch("lemonade._run", side_effect=lambda cmd: cmds.append(cmd)):
+            _drop_bind_unit(Path("/mnt/other"), Path("/tmp/ubuntuai-models"))
+        self.assertEqual(cmds, [])
 
     def test_apply_publish_verb(self) -> None:
         self.assertEqual(APPLY_PUBLISH_VERB, "lemonade-publish")

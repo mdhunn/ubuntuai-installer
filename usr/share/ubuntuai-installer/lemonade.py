@@ -33,6 +33,8 @@ SNAP_COMMON = SNAP_LEMONADE_COMMON
 SNAP_EXTRA = SNAP_LEMONADE_MODELS
 LEMONADE_API = "http://127.0.0.1:13305"
 APPLY_PUBLISH_VERB = "lemonade-publish"
+OWNED_UNIT_DESC = "Ubuntu AI models for Lemonade"
+SYSTEM_UNIT_DIR = Path("/etc/systemd/system")
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,75 @@ def bind_mounts(sources: tuple[Path, ...], dest: Path) -> tuple[BindMount, ...]:
     )
 
 
+def is_owned_lemonade_where(dest: Path, where: Path) -> bool:
+    """True for dest itself or dest/chat/srcN. Those are the only bind targets we create."""
+    dest = _resolve(dest)
+    where = _resolve(where)
+    if where == dest:
+        return True
+    try:
+        rel = where.relative_to(dest)
+    except ValueError:
+        return False
+    return len(rel.parts) == 2 and rel.parts[0] == "chat" and _is_srcn(rel.parts[1])
+
+
+def leftover_owned_binds(
+    dest: Path,
+    plan: tuple[BindMount, ...],
+    *,
+    unit_dir: Path,
+    mounted: tuple[Path, ...] = (),
+) -> tuple[Path, ...]:
+    """ubuntuai-owned dest / dest/chat/srcN binds that the collapsed plan no longer uses."""
+    planned = {_resolve(mount.where) for mount in plan}
+    leftovers = [
+        where
+        for where in owned_bind_wheres(dest, unit_dir, mounted)
+        if _resolve(where) not in planned
+    ]
+    leftovers.sort(key=lambda path: (-len(_resolve(path).parts), str(_resolve(path))))
+    return tuple(leftovers)
+
+
+def owned_bind_wheres(
+    dest: Path,
+    unit_dir: Path,
+    mounted: tuple[Path, ...] = (),
+) -> tuple[Path, ...]:
+    """Discover dest and dest/chat/srcN locations we created. Skip foreign units."""
+    dest = _resolve(dest)
+    found: list[Path] = []
+    seen: set[Path] = set()
+    foreign: set[Path] = set()
+
+    def add(where: Path) -> None:
+        where = _resolve(where)
+        if where in seen or where in foreign:
+            return
+        if not is_owned_lemonade_where(dest, where):
+            return
+        seen.add(where)
+        found.append(where)
+
+    if unit_dir.is_dir():
+        for path in sorted(unit_dir.glob("*.mount")):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            where = _where_from_unit(text)
+            if where is None:
+                continue
+            if _unit_is_ours(path):
+                add(where)
+            elif is_owned_lemonade_where(dest, where):
+                foreign.add(_resolve(where))
+    for where in mounted:
+        add(where)
+    return tuple(found)
+
+
 def quote_unit_path(path: Path) -> str:
     # Spaces in ~/AI models must survive the systemd unit parser.
     text = str(path).replace("\\", "\\\\").replace('"', '\\"')
@@ -89,7 +160,7 @@ def quote_unit_path(path: Path) -> str:
 def mount_unit_text(what: Path, where: Path) -> str:
     return (
         "[Unit]\n"
-        "Description=Ubuntu AI models for Lemonade\n"
+        f"Description={OWNED_UNIT_DESC}\n"
         "After=local-fs.target\n"
         "Before=snap.lemonade-server.daemon.service\n"
         "\n"
@@ -231,6 +302,87 @@ def _collapse(trees: tuple[Path, ...]) -> tuple[Path, ...]:
             continue
         kept.append(tree)
     return tuple(kept)
+
+
+def _is_srcn(name: str) -> bool:
+    return name.startswith("src") and name[3:].isdigit()
+
+
+def _unit_is_ours(path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return f"Description={OWNED_UNIT_DESC}" in text
+
+
+def _where_from_unit(text: str) -> Path | None:
+    for line in text.splitlines():
+        if not line.startswith("Where="):
+            continue
+        raw = line.split("=", 1)[1].strip()
+        if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+            raw = raw[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        return Path(raw) if raw else None
+    return None
+
+
+def _owned_unit_path(where: Path) -> Path | None:
+    where = _resolve(where)
+    if not SYSTEM_UNIT_DIR.is_dir():
+        return None
+    for path in SYSTEM_UNIT_DIR.glob("*.mount"):
+        if not _unit_is_ours(path):
+            continue
+        parsed = _where_from_unit(path.read_text(encoding="utf-8"))
+        if parsed is not None and _resolve(parsed) == where:
+            return path
+    return None
+
+
+def _mounted_wheres() -> tuple[Path, ...]:
+    info = Path("/proc/self/mountinfo")
+    try:
+        text = info.read_text(encoding="utf-8")
+    except OSError:
+        return ()
+    found: list[Path] = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        mountpoint = parts[4].replace("\\040", " ").replace("\\011", "\t")
+        found.append(Path(mountpoint))
+    return tuple(found)
+
+
+def _drop_bind_unit(where: Path, dest: Path) -> None:
+    if not is_owned_lemonade_where(dest, where):
+        return
+    path = _owned_unit_path(where)
+    if path is not None:
+        _run(["systemctl", "disable", "--now", path.name])
+        path.unlink(missing_ok=True)
+        _run(["systemctl", "daemon-reload"])
+    else:
+        try:
+            unit = _escape_mount(where)
+        except RuntimeError:
+            unit = ""
+        if unit:
+            _run(["systemctl", "disable", "--now", unit])
+    _run(["umount", str(where)])
+
+
+def _drop_obsolete_owned_binds(
+    dest: Path, plan: tuple[BindMount, ...]
+) -> tuple[Path, ...]:
+    leftovers = leftover_owned_binds(
+        dest, plan, unit_dir=SYSTEM_UNIT_DIR, mounted=_mounted_wheres()
+    )
+    for where in leftovers:
+        _drop_bind_unit(where, dest)
+    return leftovers
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -391,6 +543,8 @@ def publish(target: UserTarget) -> str:
                 "snap extra_models_dir must be under /var/snap/lemonade-server/common"
             )
         mounts = bind_mounts(sources, dest)
+        # Drop dest before writing dest/chat/srcN. A leftover dest bind would write chat/ into the user's tree.
+        _drop_obsolete_owned_binds(dest, mounts)
         unit = ""
         for mount in mounts:
             unit = _write_bind_unit(mount.what, mount.where)
