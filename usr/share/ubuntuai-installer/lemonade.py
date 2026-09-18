@@ -1,4 +1,14 @@
-"""Point Lemonade at GGUF files the installer already downloaded."""
+"""Publish installer GGUF trees to Lemonade.
+
+The snap cannot follow ~/Models symlinks and cannot read /home as
+extra_models_dir. Bind the real trees into SNAP_LEMONADE_MODELS and set
+extra_models_dir to that snap-common path.
+
+Apply runs helper verb lemonade-publish after weights. That verb calls
+publish(target_for(USER)). CLI --publish-lemonade is the same verb.
+Weights owns source resolution and bind targets. Apply owns privilege
+and order.
+"""
 
 from __future__ import annotations
 
@@ -7,14 +17,28 @@ import shutil
 import subprocess
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 from domain import UserTarget
+from paths import (
+    SNAP_LEMONADE_COMMON,
+    SNAP_LEMONADE_MODELS,
+    is_home_path,
+    lemonade_extra_models_dir,
+)
 from weights import UA
 
-SNAP_COMMON = Path("/var/snap/lemonade-server/common")
-SNAP_EXTRA = SNAP_COMMON / "ubuntuai-models"
+SNAP_COMMON = SNAP_LEMONADE_COMMON
+SNAP_EXTRA = SNAP_LEMONADE_MODELS
 LEMONADE_API = "http://127.0.0.1:13305"
+APPLY_PUBLISH_VERB = "lemonade-publish"
+
+
+@dataclass(frozen=True)
+class BindMount:
+    what: Path
+    where: Path
 
 
 def detect() -> str:
@@ -28,35 +52,173 @@ def detect() -> str:
 
 
 def extra_dir(kind: str) -> Path:
-    if kind == "snap":
-        return SNAP_EXTRA
-    return Path()
+    return lemonade_extra_models_dir(kind)
 
 
 def gguf_sources(target: UserTarget) -> tuple[Path, ...]:
-    out: list[Path] = []
+    """Real GGUF trees. Store symlinks are followed. HF and Diffusers stay put."""
+    trees: list[Path] = []
     seen: set[Path] = set()
-    for raw in (*target.extra_model_paths, target.model_root / "gguf"):
+    for root in _search_roots(target):
+        for tree in _trees_in(root, target):
+            if tree in seen or _too_wide(tree, target.home):
+                continue
+            seen.add(tree)
+            trees.append(tree)
+    return _collapse(tuple(trees))
+
+
+def bind_mounts(sources: tuple[Path, ...], dest: Path) -> tuple[BindMount, ...]:
+    """Map real trees onto dest. One source binds on dest. Many bind under dest/chat."""
+    if not sources:
+        return ()
+    if len(sources) == 1:
+        return (BindMount(sources[0], dest),)
+    return tuple(
+        BindMount(src, dest / "chat" / f"src{i}") for i, src in enumerate(sources)
+    )
+
+
+def quote_unit_path(path: Path) -> str:
+    # Spaces in ~/AI models must survive the systemd unit parser.
+    text = str(path).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{text}"'
+
+
+def mount_unit_text(what: Path, where: Path) -> str:
+    return (
+        "[Unit]\n"
+        "Description=Ubuntu AI models for Lemonade\n"
+        "After=local-fs.target\n"
+        "Before=snap.lemonade-server.daemon.service\n"
+        "\n"
+        "[Mount]\n"
+        f"What={quote_unit_path(what)}\n"
+        f"Where={quote_unit_path(where)}\n"
+        "Type=none\n"
+        "Options=bind\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
+def _search_roots(target: UserTarget) -> tuple[Path, ...]:
+    roots: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(raw: Path) -> None:
         try:
             path = raw.resolve()
         except OSError:
-            continue
+            return
         if not path.is_dir() or path in seen:
-            continue
-        if not _has_real_gguf(path):
-            continue
+            return
         seen.add(path)
-        out.append(path)
-    return tuple(out)
+        roots.append(path)
+
+    for extra in target.extra_model_paths:
+        add(extra)
+    add(target.model_root / "gguf")
+    gguf = target.model_root / "gguf"
+    if not _any_gguf(gguf):
+        add(target.model_root)
+    return tuple(roots)
 
 
-def _has_real_gguf(root: Path) -> bool:
-    for p in root.rglob("*.gguf"):
-        if p.is_symlink():
-            continue
-        if p.is_file():
+def _any_gguf(root: Path) -> bool:
+    try:
+        path = root.resolve()
+    except OSError:
+        return False
+    if not path.is_dir():
+        return False
+    try:
+        found = path.rglob("*.gguf")
+    except OSError:
+        return False
+    for p in found:
+        if p.is_file() or p.is_symlink():
             return True
     return False
+
+
+def _trees_in(root: Path, target: UserTarget) -> tuple[Path, ...]:
+    try:
+        files = list(root.rglob("*.gguf"))
+    except OSError:
+        return ()
+    has_real_here = False
+    escaped: list[Path] = []
+    for p in files:
+        try:
+            if p.is_symlink():
+                real = p.resolve()
+                if real.is_file():
+                    escaped.append(real)
+            elif p.is_file():
+                has_real_here = True
+        except OSError:
+            continue
+    found: list[Path] = []
+    if has_real_here:
+        found.append(root)
+    seen: set[Path] = set()
+    for real in escaped:
+        tree = _lift(real, root, target)
+        if tree in seen:
+            continue
+        seen.add(tree)
+        found.append(tree)
+    return tuple(found)
+
+
+def _lift(real_file: Path, search_root: Path, target: UserTarget) -> Path:
+    candidates: list[Path] = []
+    for extra in target.extra_model_paths:
+        try:
+            candidates.append(extra.resolve())
+        except OSError:
+            continue
+    try:
+        candidates.append(search_root.resolve())
+    except OSError:
+        pass
+    for cand in candidates:
+        try:
+            real_file.relative_to(cand)
+            return cand
+        except ValueError:
+            continue
+    return real_file.parent
+
+
+def _too_wide(path: Path, home: Path) -> bool:
+    try:
+        path = path.resolve()
+        home = home.resolve()
+    except OSError:
+        return True
+    banned = {Path("/"), Path("/home"), Path("/var"), Path("/usr"), Path("/etc")}
+    return path in banned or path == home
+
+
+def _collapse(trees: tuple[Path, ...]) -> tuple[Path, ...]:
+    kept: list[Path] = []
+    for tree in trees:
+        nested = False
+        for other in trees:
+            if other == tree:
+                continue
+            try:
+                tree.relative_to(other)
+            except ValueError:
+                continue
+            nested = True
+            break
+        if not nested:
+            kept.append(tree)
+    return tuple(kept)
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -74,21 +236,7 @@ def _escape_mount(where: Path) -> str:
 def _write_bind_unit(what: Path, where: Path) -> str:
     where.mkdir(parents=True, exist_ok=True)
     unit = _escape_mount(where)
-    text = (
-        "[Unit]\n"
-        "Description=Ubuntu AI models for Lemonade\n"
-        "After=local-fs.target\n"
-        "Before=snap.lemonade-server.daemon.service\n"
-        "\n"
-        "[Mount]\n"
-        f"What={what}\n"
-        f"Where={where}\n"
-        "Type=none\n"
-        "Options=bind\n"
-        "\n"
-        "[Install]\n"
-        "WantedBy=multi-user.target\n"
-    )
+    text = mount_unit_text(what, where)
     path = Path("/etc/systemd/system") / unit
     path.write_text(text, encoding="utf-8")
     _run(["systemctl", "daemon-reload"])
@@ -214,6 +362,7 @@ def check_model_updates() -> str:
 
 
 def publish(target: UserTarget) -> str:
+    """Bind real GGUF trees and set extra_models_dir. Snap dest is never /home."""
     kind = detect()
     if not kind:
         return "lemonade not installed"
@@ -222,18 +371,18 @@ def publish(target: UserTarget) -> str:
         return "no real GGUF files to publish (Lemonade cannot follow store symlinks)"
     if kind == "snap":
         dest = extra_dir(kind)
-        if len(sources) == 1:
-            unit = _write_bind_unit(sources[0], dest)
-            _set_extra_models_dir(dest)
-            _restart_snap()
-            return f"lemonade extra_models_dir={dest} via {unit}"
-        dest.mkdir(parents=True, exist_ok=True)
-        chat = dest / "chat"
-        chat.mkdir(exist_ok=True)
-        for i, src in enumerate(sources):
-            _write_bind_unit(src, chat / f"src{i}")
+        if dest == Path() or is_home_path(dest):
+            raise RuntimeError(
+                "snap extra_models_dir must be under /var/snap/lemonade-server/common"
+            )
+        mounts = bind_mounts(sources, dest)
+        unit = ""
+        for mount in mounts:
+            unit = _write_bind_unit(mount.what, mount.where)
         _set_extra_models_dir(dest)
         _restart_snap()
+        if len(sources) == 1:
+            return f"lemonade extra_models_dir={dest} via {unit}"
         return f"lemonade extra_models_dir={dest} ({len(sources)} trees)"
     dest = sources[0]
     _set_extra_models_dir(dest)

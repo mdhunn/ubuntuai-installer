@@ -16,7 +16,7 @@ from configstore import saved_scan_folders
 from domain import Action, Hardware, UserTarget, Workflow
 from paths import ENV_FILE, LIMITS_FILE, LIMITS_TEMPLATE, PROFILE_FILE, helper_path
 from progress import ProgressEvent, emit, english_for_action, new_apply_log
-from lemonade import detect as lemonade_detect
+from lemonade import APPLY_PUBLISH_VERB, detect as lemonade_detect
 from vendor import install_vendor
 from weights import ensure_weight, load_catalog as load_weight_catalog
 
@@ -460,7 +460,7 @@ def execute_plan(
                     log.append(msg)
             elif action.kind == "lemonade":
                 rc, out = run_privileged(
-                    "lemonade-publish",
+                    APPLY_PUBLISH_VERB,
                     [target.name],
                     dry_run=dry_run,
                 )

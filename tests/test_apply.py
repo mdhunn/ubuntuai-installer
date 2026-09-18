@@ -9,6 +9,7 @@ from unittest.mock import patch
 from support import PKG
 
 from apply import (
+    APPLY_PUBLISH_VERB,
     ApplyError,
     PKG_RE,
     assert_model_root,
@@ -18,7 +19,7 @@ from apply import (
     format_failure,
 )
 from catalog import load_workflows
-from domain import Device, Hardware, UserTarget
+from domain import Action, Device, Hardware, UserTarget
 
 
 def _hw_strix() -> Hardware:
@@ -190,6 +191,34 @@ class ApplyTests(unittest.TestCase):
             log = execute_plan(actions, t, dry_run=True)
         self.assertTrue(log)
         hp.assert_not_called()
+
+    def test_plan_publishes_lemonade_when_snap(self) -> None:
+        with patch("apply.dpkg_installed", return_value=True), patch(
+            "apply.user_in_group", return_value=True
+        ), patch("apply.lemonade_detect", return_value="snap"):
+            actions = build_plan(
+                ("ubuntuai-core",),
+                _hw_strix(),
+                self.target,
+                self.wfs,
+            )
+        lemon = [a for a in actions if a.kind == "lemonade"]
+        self.assertEqual(len(lemon), 1)
+        self.assertEqual(lemon[0].payload, (self.target.name,))
+        self.assertEqual(APPLY_PUBLISH_VERB, "lemonade-publish")
+
+    def test_execute_lemonade_calls_publish_verb(self) -> None:
+        actions = (
+            Action("lemonade", "publish GGUF files to Lemonade", (self.target.name,)),
+        )
+        with patch(
+            "apply.run_privileged", return_value=(0, "lemonade extra_models_dir=/var/snap")
+        ) as rp:
+            log = execute_plan(actions, self.target, hw=_hw_strix(), dry_run=True)
+        rp.assert_called_once()
+        self.assertEqual(rp.call_args[0][0], APPLY_PUBLISH_VERB)
+        self.assertEqual(rp.call_args[0][1], [self.target.name])
+        self.assertTrue(any("lemonade" in line.lower() for line in log))
 
 
 if __name__ == "__main__":
