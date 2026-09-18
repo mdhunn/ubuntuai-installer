@@ -6,6 +6,15 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Strix Halo / gfx115x iGPU. Chat stays on Vulkan even when rocminfo exists.
+# llama.cpp HIP still misses gfx1150. libgomp on this silicon is a known pain.
+_STRIX_HALO_MARKERS = ("strix", "8060s", "8050s", "gfx115", "radeon 80")
+
+
+def strix_halo_name(text: str) -> bool:
+    lower = (text or "").lower()
+    return any(tok in lower for tok in _STRIX_HALO_MARKERS)
+
 
 @dataclass(frozen=True)
 class Device:
@@ -23,6 +32,7 @@ class Hardware:
     ram_bytes: int
     devices: tuple[Device, ...]
     notes: tuple[str, ...] = ()
+    gfx: str = ""
 
     def backends(self) -> frozenset[str]:
         found = {d.backend for d in self.devices}
@@ -44,8 +54,21 @@ class Hardware:
         kinds = {d.kind for d in self.devices}
         return "npu" in kinds and bool(kinds & {"igpu", "dgpu"})
 
+    def strix_halo_class(self) -> bool:
+        if strix_halo_name(self.cpu_name) or strix_halo_name(self.gfx):
+            return True
+        return any(
+            d.vendor == "amd"
+            and d.kind in {"igpu", "dgpu"}
+            and strix_halo_name(d.name)
+            for d in self.devices
+        )
+
     def primary_backend(self) -> str:
+        # Chat on Strix Halo-class iGPU stays Vulkan. Do not rank ROCm first.
         order = ("cuda", "rocm", "xdna", "vulkan", "cpu")
+        if self.strix_halo_class():
+            order = ("cuda", "xdna", "vulkan", "rocm", "cpu")
         have = self.backends()
         for b in order:
             if b in have:

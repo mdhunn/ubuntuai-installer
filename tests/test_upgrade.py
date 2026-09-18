@@ -48,7 +48,7 @@ class TuningTests(unittest.TestCase):
         huge = int(0.6 * hw.ram_bytes)
         tun = load_tuning(hw, huge)
         self.assertEqual(tun["max_loaded_models"], 1)
-        self.assertEqual(tun["llamacpp_backend"], "rocm")
+        self.assertEqual(tun["llamacpp_backend"], "vulkan")
         self.assertEqual(tun["ctx_size"], 4096)
         self.assertGreaterEqual(int(tun["global_timeout"]), 1800)
 
@@ -56,6 +56,18 @@ class TuningTests(unittest.TestCase):
         hw = _strix(122)
         tun = load_tuning(hw, 2 * 1024**3)
         self.assertEqual(tun["ctx_size"], -1)
+
+    def test_navi_dgpu_keeps_rocm_tuning(self) -> None:
+        hw = Hardware(
+            cpu_name="amd",
+            ram_bytes=32 * 1024**3,
+            devices=(
+                Device("dgpu", "amd", "Radeon RX 7900 XT", "/dev/dri/renderD128", "rocm"),
+                Device("cpu", "cpu", "cpu", None, "cpu"),
+            ),
+        )
+        tun = load_tuning(hw, 2 * 1024**3)
+        self.assertEqual(tun["llamacpp_backend"], "rocm")
 
 
 class UpgradePlanTests(unittest.TestCase):
