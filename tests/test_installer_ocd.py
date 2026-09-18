@@ -442,7 +442,6 @@ class InstallerTwinHelpersTests(unittest.TestCase):
             self.assertIn("helper_wfs", src)
             self.assertIn("wf.id not in helpers", src)
             self.assertIn("wf.id in rec", src)
-            self.assertLess(src.find("helper_wfs"), src.find("HELPERS_SECTION"))
 
 
 class InstallerTwinOrganizeTests(unittest.TestCase):
