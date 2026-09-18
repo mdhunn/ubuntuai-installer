@@ -1,8 +1,9 @@
-"""Hardware probe. Reads lspci, sysfs, and a few binaries. Never installs."""
+"""Hardware probe. Reads lspci, sysfs, apt-cache policy, and a few binaries. Never installs."""
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -13,6 +14,9 @@ NVIDIA = "10de"
 AMD_GPU = "1002"
 AMD_SYS = "1022"
 NPU_DEV = "17f0"
+APT_NAME = re.compile(r"^[a-zA-Z0-9.+-]+$")
+_SOURCES_LIST = Path("/etc/apt/sources.list")
+_SOURCES_DIR = Path("/etc/apt/sources.list.d")
 
 
 def _run(cmd: list[str]) -> str:
@@ -170,6 +174,68 @@ def _ensure_cpu_device(cpu_name: str, devices: list[Device]) -> list[Device]:
         )
     )
     return devices
+
+
+def apt_cache_policy(names: tuple[str, ...], text: str | None = None) -> str:
+    """Read-only apt-cache policy. Never runs apt-get or update."""
+    if text is not None:
+        return text
+    safe = tuple(n for n in names if APT_NAME.match(n))
+    if not safe:
+        return ""
+    return _run(["apt-cache", "policy", "--", *safe])
+
+
+def split_apt_policies(text: str) -> dict[str, str]:
+    blocks: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        if line and not line[0].isspace() and line.endswith(":"):
+            name = line[:-1].strip()
+            if APT_NAME.match(name):
+                current = name
+                blocks[current] = [line]
+                continue
+        if current is not None:
+            blocks[current].append(line)
+    return {name: "\n".join(lines) for name, lines in blocks.items()}
+
+
+def apt_candidate(policy_text: str) -> str:
+    for line in policy_text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("candidate:"):
+            value = stripped.split(":", 1)[1].strip()
+            if not value or value == "(none)":
+                return ""
+            return value
+    return ""
+
+
+def apt_sources_text(text: str | None = None) -> str:
+    if text is not None:
+        return text
+    parts: list[str] = []
+    if _SOURCES_LIST.is_file():
+        parts.append(_SOURCES_LIST.read_text(encoding="utf-8", errors="replace"))
+    if _SOURCES_DIR.is_dir():
+        for path in sorted(_SOURCES_DIR.iterdir()):
+            if path.suffix in {".list", ".sources"} and path.is_file():
+                parts.append(path.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(parts)
+
+
+def universe_in_sources(text: str) -> bool:
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        lower = line.lower()
+        if lower.startswith("deb") and "universe" in lower:
+            return True
+        if lower.startswith("components:") and "universe" in lower:
+            return True
+    return False
 
 
 def probe(

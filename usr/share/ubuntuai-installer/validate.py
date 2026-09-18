@@ -9,11 +9,22 @@ import shutil
 from pathlib import Path
 
 from apply import dpkg_installed, user_in_group
-from domain import Check, Hardware, UserTarget
+from catalog import by_id, load_workflows
+from domain import Check, Hardware, UserTarget, Workflow
 from paths import ENV_FILE, LIMITS_FILE
-from probe import probe
+from probe import (
+    APT_NAME,
+    apt_cache_policy,
+    apt_candidate,
+    apt_sources_text,
+    probe,
+    split_apt_policies,
+    universe_in_sources,
+)
 from users import target_for
 from weights import store_inventory
+
+CANARY_WORKFLOW_IDS = ("ubuntuai-core", "ubuntuai-chat", "ubuntuai-stt-whisper")
 
 
 def _ok(name: str, detail: str) -> Check:
@@ -54,7 +65,92 @@ def _readable_by_user(path: Path, user: str) -> bool:
     return False
 
 
-def collect(target: UserTarget, hw: Hardware | None = None) -> tuple[Check, ...]:
+def canary_apt_names(workflows: tuple[Workflow, ...] | None = None) -> tuple[str, ...]:
+    catalog = workflows or load_workflows()
+    index = by_id(catalog)
+    names: list[str] = []
+    for wid in CANARY_WORKFLOW_IDS:
+        wf = index.get(wid)
+        if wf is None:
+            continue
+        for pkg in wf.apt:
+            if APT_NAME.match(pkg) and pkg not in names:
+                names.append(pkg)
+    return tuple(names)
+
+
+def _policy_blocks(
+    names: tuple[str, ...],
+    policy: str | dict[str, str] | None,
+) -> dict[str, str] | None:
+    if isinstance(policy, dict):
+        return {name: policy.get(name, "") for name in names}
+    if policy is not None:
+        return split_apt_policies(policy)
+    if shutil.which("apt-cache") is None:
+        return None
+    return split_apt_policies(apt_cache_policy(names))
+
+
+def archive_gate_checks(
+    *,
+    policy_text: str | dict[str, str] | None = None,
+    sources_text: str | None = None,
+    workflows: tuple[Workflow, ...] | None = None,
+) -> tuple[Check, ...]:
+    names = canary_apt_names(workflows)
+    blocks = _policy_blocks(names, policy_text)
+    if blocks is None:
+        return (
+            _warn(
+                "apt-cache",
+                "apt-cache is not on PATH. Archive preflight was skipped.",
+            ),
+        )
+    have_universe = universe_in_sources(apt_sources_text(sources_text))
+    checks: list[Check] = []
+    unknown: list[str] = []
+    for name in names:
+        candidate = apt_candidate(blocks.get(name, ""))
+        if candidate:
+            checks.append(
+                _ok(
+                    f"apt-known:{name}",
+                    f"apt knows {name}. Candidate {candidate} is visible.",
+                )
+            )
+            continue
+        unknown.append(name)
+        if have_universe:
+            detail = (
+                f"apt has no candidate for {name}. "
+                "Refresh apt lists or confirm this Ubuntu suite publishes the package."
+            )
+        else:
+            detail = (
+                f"apt has no candidate for {name}. "
+                "Enable the universe archive or refresh apt lists for this Ubuntu suite."
+            )
+        checks.append(_fail(f"apt-known:{name}", detail))
+    if len(unknown) >= 2 and not have_universe:
+        checks.append(
+            _warn(
+                "apt-universe",
+                "apt does not know several catalog packages. "
+                "Universe is missing from apt sources. "
+                "Enable the universe archive and run apt update.",
+            )
+        )
+    return tuple(checks)
+
+
+def collect(
+    target: UserTarget,
+    hw: Hardware | None = None,
+    *,
+    apt_policy: str | dict[str, str] | None = None,
+    apt_sources: str | None = None,
+) -> tuple[Check, ...]:
     hw = hw or probe()
     checks: list[Check] = []
     checks.append(
@@ -65,6 +161,9 @@ def collect(target: UserTarget, hw: Hardware | None = None) -> tuple[Check, ...]
     )
     backends = ", ".join(sorted(hw.backends()))
     checks.append(_ok("backends", backends))
+    checks.extend(
+        archive_gate_checks(policy_text=apt_policy, sources_text=apt_sources)
+    )
     for d in hw.devices:
         if d.kind == "cpu":
             continue
