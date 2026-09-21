@@ -182,6 +182,14 @@ def chat_weight_ids(workflows: tuple[Workflow, ...] | None = None) -> frozenset[
     return frozenset(ids)
 
 
+def invoke_prepare_chat_download(page) -> bool:
+    prepare = getattr(page, "prepare_chat_download", None)
+    if not callable(prepare):
+        return False
+    prepare()
+    return True
+
+
 def backend_choices(hw: Hardware) -> tuple[str, ...]:
     order = ("vulkan", "rocm", "cuda", "xdna", "cpu")
     have = hw.installable_backends()
