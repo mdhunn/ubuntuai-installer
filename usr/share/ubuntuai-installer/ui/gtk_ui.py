@@ -60,12 +60,16 @@ from runtime import (
 )
 from validate import collect, format_checks, format_health, worst
 from weights import (
+    ANOTHER_DISK,
+    UBUNTU_DISK,
     ForeignMountError,
     catalog_dest,
+    disk_words,
     download,
     foreign_source,
     human_bytes,
     load_catalog as load_weight_catalog,
+    move_off,
     organize,
     scan,
     scan_roots,
@@ -479,7 +483,8 @@ def _weights_page(win, user, status) -> Gtk.Widget:
         label=(
             f"Search known folders plus any you add, then copy into {t0.model_root}. "
             "Move removes the original after the checksum matches. "
-            "A foreign mount is copy only. "
+            f"A file on {ANOTHER_DISK} is copy only. "
+            f"Move is for a file on {UBUNTU_DISK}. "
             "Downloads are opt-in and go into the same store."
         ),
         xalign=0,
@@ -543,7 +548,7 @@ def _weights_page(win, user, status) -> Gtk.Widget:
             found_items[key] = item
             cb.connect("toggled", lambda *_a: apply_foreign_policy())
             title = f"{item.dest_name} ({human_bytes(item.size)})"
-            place = " · foreign mount" if foreign_source(item) else ""
+            place = f" · {disk_words(True)}" if foreign_source(item) else ""
             summary = (
                 f"{item.state} · {item.fmt} · {item.kind} · {item.subdir} · {item.path}{place}"
             )
@@ -674,18 +679,19 @@ def _weights_page(win, user, status) -> Gtk.Widget:
             for key, cb in found_checks.items()
             if cb.get_active()
         ]
-        blocked = any(foreign_source(item) for item in picked)
+        blocked = move_off(picked)
+        off = f"This file is on {disk_words(True)}. Copy only."
         if blocked:
             if move.get_active():
                 copy.set_active(True)
             move.set_sensitive(False)
-            move.set_tooltip_text("Foreign mount. Copy only.")
+            move.set_tooltip_text(off)
             remove_src.set_active(False)
             remove_src.set_sensitive(False)
-            remove_src.set_tooltip_text("Foreign mount. Copy only.")
+            remove_src.set_tooltip_text(off)
             return
         move.set_sensitive(True)
-        move.set_tooltip_text("")
+        move.set_tooltip_text(f"Move a file on {disk_words(False)}.")
         remove_src.set_tooltip_text("")
         on_mode()
 

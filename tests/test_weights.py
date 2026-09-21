@@ -17,15 +17,19 @@ from support import PKG
 from domain import CatalogWeight, FileHash, UserTarget
 from main import installer_main
 from weights import (
+    ANOTHER_DISK,
     FOREIGN_FSTYPES,
+    UBUNTU_DISK,
     ForeignMountError,
     _hash_from_hf_row,
     _size_from_hf_row,
     classify,
     detect_bundle,
+    disk_words,
     download,
     ensure_weight,
     foreign_source,
+    move_off,
     hash_path,
     human_bytes,
     is_foreign_mount,
@@ -576,6 +580,13 @@ class VerifyDownloadTests(unittest.TestCase):
 
 
 class ForeignMountTests(unittest.TestCase):
+    def test_disk_words_are_the_move_signal(self) -> None:
+        self.assertEqual(ANOTHER_DISK, "another disk")
+        self.assertEqual(UBUNTU_DISK, "this computer's Ubuntu disk")
+        self.assertEqual(disk_words(True), ANOTHER_DISK)
+        self.assertEqual(disk_words(False), UBUNTU_DISK)
+        self.assertFalse(move_off(()))
+
     def test_prefix_or_fstype(self) -> None:
         self.assertEqual(
             FOREIGN_FSTYPES, frozenset({"ntfs", "fuseblk", "vfat", "exfat"})
@@ -664,7 +675,8 @@ class ForeignMountTests(unittest.TestCase):
                     organize(found, store, mode="move", dry_run=True)
                 with self.assertRaises(ForeignMountError):
                     organize(found, store, mode="copy", remove_source=True)
-            self.assertIn("copy only", str(ctx.exception))
+            self.assertIn(ANOTHER_DISK, str(ctx.exception))
+            self.assertIn("Copy only", str(ctx.exception))
             self.assertEqual(blob.read_bytes(), payload)
             self.assertFalse((store / "gguf" / "foreign.gguf").exists())
 
@@ -679,6 +691,8 @@ class ForeignMountTests(unittest.TestCase):
             found = tuple(replace(item, foreign=True) for item in scan((src_dir,), store))
             with patch("weights.is_foreign_mount", return_value=False):
                 self.assertTrue(foreign_source(found[0]))
+                self.assertTrue(move_off(found))
+                self.assertEqual(disk_words(found[0].foreign), ANOTHER_DISK)
                 with self.assertRaises(ForeignMountError):
                     organize(found, store, mode="move")
             self.assertTrue(blob.is_file())
@@ -746,7 +760,8 @@ class ForeignMountTests(unittest.TestCase):
                 rc_rm = installer_main(["--organize-weights", "copy", "--remove-source"])
             self.assertEqual(rc_move, 1)
             self.assertEqual(rc_rm, 1)
-            self.assertIn("copy only", err.getvalue())
+            self.assertIn(ANOTHER_DISK, err.getvalue())
+            self.assertIn("Copy only", err.getvalue())
             self.assertEqual(blob.read_bytes(), payload)
             self.assertFalse((store / "gguf" / "usb.gguf").exists())
 

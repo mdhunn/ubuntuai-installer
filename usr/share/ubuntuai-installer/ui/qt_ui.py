@@ -77,12 +77,16 @@ from runtime import (
 )
 from validate import collect, format_checks, format_health
 from weights import (
+    ANOTHER_DISK,
+    UBUNTU_DISK,
     ForeignMountError,
     catalog_dest,
+    disk_words,
     download,
     foreign_source,
     human_bytes,
     load_catalog as load_weight_catalog,
+    move_off,
     organize,
     scan,
     scan_roots,
@@ -446,7 +450,7 @@ def _qt_weights(win, user, status) -> QWidget:
             box.setChecked(item.state == "new")
             box.setEnabled(item.state == "new")
             if foreign_source(item):
-                box.setText(box.text() + "\nforeign mount")
+                box.setText(box.text() + f"\n{disk_words(True)}")
             box.toggled.connect(lambda _checked=False: apply_foreign_policy())
             found_checks[key] = box
             found_items[key] = item
@@ -487,7 +491,8 @@ def _qt_weights(win, user, status) -> QWidget:
     hint = QLabel(
         f"Search known folders plus any you add, then copy into {t0.model_root}. "
         "Move removes the original after the checksum matches. "
-        "A foreign mount is copy only. "
+        f"A file on {ANOTHER_DISK} is copy only. "
+        f"Move is for a file on {UBUNTU_DISK}. "
         "Downloads are opt-in and go into the same store."
     )
     hint.setWordWrap(True)
@@ -527,18 +532,19 @@ def _qt_weights(win, user, status) -> QWidget:
             for key, cb in found_checks.items()
             if cb.isChecked()
         ]
-        blocked = any(foreign_source(item) for item in picked)
+        blocked = move_off(picked)
+        off = f"This file is on {disk_words(True)}. Copy only."
         if blocked:
             move.setChecked(False)
             copy.setChecked(True)
             move.setEnabled(False)
-            move.setToolTip("Foreign mount. Copy only.")
+            move.setToolTip(off)
             remove_src.setChecked(False)
             remove_src.setEnabled(False)
-            remove_src.setToolTip("Foreign mount. Copy only.")
+            remove_src.setToolTip(off)
             return
         move.setEnabled(True)
-        move.setToolTip("")
+        move.setToolTip(f"Move a file on {disk_words(False)}.")
         remove_src.setToolTip("")
         on_mode()
     row = QHBoxLayout()

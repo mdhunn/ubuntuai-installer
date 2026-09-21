@@ -460,9 +460,11 @@ class InstallerTwinOrganizeTests(unittest.TestCase):
             self.assertNotIn('"Symlink"', src)
             self.assertNotIn('mode = "link"', src)
             self.assertIn("foreign_source", src)
+            self.assertIn("move_off", src)
+            self.assertIn("disk_words", src)
+            self.assertIn("ANOTHER_DISK", src)
+            self.assertIn("UBUNTU_DISK", src)
             self.assertIn("apply_foreign_policy", src)
-            self.assertIn("Foreign mount. Copy only.", src)
-            self.assertIn("A foreign mount is copy only.", src)
             self.assertNotIn("Windows", src)
 
 

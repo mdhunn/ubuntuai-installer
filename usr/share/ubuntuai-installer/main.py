@@ -27,6 +27,7 @@ from repair import (
     load_saved_plan,
 )
 from weights import (
+    ANOTHER_DISK,
     ForeignMountError,
     download,
     human_bytes,
@@ -387,12 +388,12 @@ def _parser() -> argparse.ArgumentParser:
         nargs="?",
         const="copy",
         choices=("copy", "move"),
-        help="copy (default) or move discovered weights into the model root. move is refused on a foreign mount",
+        help=f"copy (default) or move discovered weights into the model root. move is refused when a file is on {ANOTHER_DISK}",
     )
     p.add_argument(
         "--remove-source",
         action="store_true",
-        help="after copy, delete the original only if the checksum matches. move always does this. refused on a foreign mount",
+        help=f"after copy, delete the original only if the checksum matches. move always does this. refused when a file is on {ANOTHER_DISK}",
     )
     p.add_argument("--repair", action="store_true", help="diagnose and write a repair plan")
     p.add_argument(

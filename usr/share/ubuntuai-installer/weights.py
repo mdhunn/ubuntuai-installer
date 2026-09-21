@@ -10,6 +10,7 @@ import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable
 from pathlib import Path
 
 from domain import CatalogWeight, FileHash, FoundWeight, UserTarget
@@ -81,6 +82,8 @@ KNOWN_SUBDIRS = {
 UA = "ubuntuai-installer/0.1"
 FOREIGN_FSTYPES = frozenset({"ntfs", "fuseblk", "vfat", "exfat"})
 _FOREIGN_PREFIXES = (Path("/media"), Path("/mnt"))
+ANOTHER_DISK = "another disk"
+UBUNTU_DISK = "this computer's Ubuntu disk"
 HEX_LEN = {
     "md5": 32,
     "sha1": 40,
@@ -907,6 +910,16 @@ def foreign_source(item: FoundWeight) -> bool:
     return bool(item.foreign) or is_foreign_mount(item.path)
 
 
+def disk_words(foreign: bool) -> str:
+    """Place name a Weights tab can bind. True is another disk."""
+    return ANOTHER_DISK if foreign else UBUNTU_DISK
+
+
+def move_off(items: Iterable[FoundWeight]) -> bool:
+    """True when any selected weight is on another disk. Bind Move to the inverse."""
+    return any(foreign_source(item) for item in items)
+
+
 def _refuse_foreign_mutate(
     items: tuple[FoundWeight, ...],
     mode: str,
@@ -921,10 +934,10 @@ def _refuse_foreign_mutate(
             continue
         if mode == "move":
             raise ForeignMountError(
-                f"Move is refused for {item.path}. A foreign mount is copy only."
+                f"Move is refused for {item.path}. The file is on {ANOTHER_DISK}. Copy only."
             )
         raise ForeignMountError(
-            f"Removing the original is refused for {item.path}. A foreign mount is copy only."
+            f"Removing the original is refused for {item.path}. The file is on {ANOTHER_DISK}. Copy only."
         )
 
 
