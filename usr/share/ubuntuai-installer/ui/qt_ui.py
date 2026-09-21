@@ -69,6 +69,7 @@ from runtime import (
     backend_choices,
     chat_models,
     chat_weight_ids,
+    invoke_prepare_chat_download,
     listen_words,
     machine_words,
     no_chat_gguf,
@@ -136,9 +137,7 @@ def _installer_widget(win: QMainWindow) -> QWidget:
 
     def show_chat_download() -> None:
         tabs.setCurrentWidget(wt_page)
-        prepare = getattr(wt_page, "prepare_chat_download", None)
-        if prepare:
-            prepare()
+        invoke_prepare_chat_download(wt_page)
 
     tabs.addTab(
         _qt_workflows(win, hw, user, workflows, status, show_chat_download),
@@ -855,6 +854,13 @@ def _config_widget(win: QMainWindow) -> QWidget:
     layout.addWidget(hint)
     layout.addWidget(_banner(hw))
     tabs = QTabWidget()
+    status = QLabel("")
+    status.setWordWrap(True)
+    wt_page = _qt_weights(win, user, status)
+
+    def show_chat_download() -> None:
+        tabs.setCurrentWidget(wt_page)
+        invoke_prepare_chat_download(wt_page)
 
     overview = QWidget()
     ov = QVBoxLayout(overview)
@@ -937,7 +943,7 @@ def _config_widget(win: QMainWindow) -> QWidget:
         cta = QPushButton(CHAT_MODEL_CTA)
         cta.setDefault(True)
         cta.clicked.connect(
-            lambda: _show_chat_model_cta(win, lambda: None, CHAT_MODEL_NEEDED_CONFIG)
+            lambda: _show_chat_model_cta(win, show_chat_download, CHAT_MODEL_NEEDED_CONFIG)
         )
         st.addWidget(cta)
     tts_combo = None
@@ -966,6 +972,7 @@ def _config_widget(win: QMainWindow) -> QWidget:
     st.addWidget(backend_combo)
     st.addStretch(1)
     tabs.addTab(settings, "Settings")
+    tabs.addTab(wt_page, "Weights")
 
     advanced = QWidget()
     adv = QVBoxLayout(advanced)
@@ -999,8 +1006,6 @@ def _config_widget(win: QMainWindow) -> QWidget:
     tabs.addTab(advanced, "Advanced")
     layout.addWidget(tabs, 1)
 
-    status = QLabel("")
-    status.setWordWrap(True)
     layout.addWidget(status)
     btns = QHBoxLayout()
     exit_btn = QPushButton("Exit")

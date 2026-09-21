@@ -52,6 +52,7 @@ from runtime import (
     backend_choices,
     chat_models,
     chat_weight_ids,
+    invoke_prepare_chat_download,
     listen_words,
     machine_words,
     no_chat_gguf,
@@ -131,9 +132,7 @@ def _installer_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
 
     def show_chat_download() -> None:
         stack.set_visible_child_name("weights")
-        prepare = getattr(wt_page, "prepare_chat_download", None)
-        if prepare:
-            prepare()
+        invoke_prepare_chat_download(wt_page)
 
     wf_page = _workflows_page(
         win, hw, user, workflows, checks, status, show_chat_download
@@ -1037,6 +1036,13 @@ def _config_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
     switcher.set_stack(stack)
     outer.append(switcher)
 
+    status = Gtk.Label(label="", xalign=0, wrap=True)
+    wt_page = _weights_page(win, user, status)
+
+    def show_chat_download() -> None:
+        stack.set_visible_child_name("weights")
+        invoke_prepare_chat_download(wt_page)
+
     overview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     helpers = helper_workflow_ids(load_workflows())
     installed = [a for a in apps if a.present]
@@ -1121,7 +1127,7 @@ def _config_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
         cta.connect(
             "clicked",
             lambda *_: _show_chat_model_cta(
-                win, lambda: None, CHAT_MODEL_NEEDED_CONFIG
+                win, show_chat_download, CHAT_MODEL_NEEDED_CONFIG
             ),
         )
         settings.append(cta)
@@ -1152,6 +1158,7 @@ def _config_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
     )
     settings.append(backend_combo)
     stack.add_titled(_scroller(settings), "settings", "Settings")
+    stack.add_titled(wt_page, "weights", "Weights")
 
     advanced = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     advanced.append(Gtk.Label(label="Model folder", xalign=0))
@@ -1205,7 +1212,6 @@ def _config_box(win: Adw.ApplicationWindow) -> Gtk.Widget:
     advanced.append(raw_view)
     stack.add_titled(_scroller(advanced), "advanced", "Advanced")
 
-    status = Gtk.Label(label="", xalign=0, wrap=True)
     outer.append(stack)
     outer.append(status)
     buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)

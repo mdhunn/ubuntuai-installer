@@ -24,6 +24,7 @@ from runtime import (
     chat_models,
     chat_weight_ids,
     endpoint_for,
+    invoke_prepare_chat_download,
     explain_setup,
     is_present,
     listen_words,
@@ -178,6 +179,19 @@ class ConfigAppContractTests(unittest.TestCase):
             self.assertTrue(no_chat_gguf(root / "missing"))
         self.assertIn("qwen3-0.6b-q8_0", chat_weight_ids(self.wfs))
 
+    def test_invoke_prepare_chat_download(self) -> None:
+        class Page:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def prepare_chat_download(self) -> None:
+                self.calls += 1
+
+        page = Page()
+        self.assertTrue(invoke_prepare_chat_download(page))
+        self.assertEqual(page.calls, 1)
+        self.assertFalse(invoke_prepare_chat_download(object()))
+
 
 class ConfigStoreTests(unittest.TestCase):
     def test_save_rejects_bad_bind_and_escaped_root(self) -> None:
@@ -316,6 +330,10 @@ class ConfigHealthAndCliTests(unittest.TestCase):
             self.assertIn("CHAT_MODEL_NEEDED_CONFIG", src)
             self.assertIn("HELPERS_SECTION", src)
             self.assertIn("prepare_chat_download", src)
+            self.assertIn("invoke_prepare_chat_download", src)
+            self.assertGreaterEqual(src.count("invoke_prepare_chat_download(wt_page)"), 2)
+            self.assertNotIn("lambda: None", src)
+            self.assertIn("show_chat_download, CHAT_MODEL_NEEDED_CONFIG", src)
             self.assertIn("no_chat_gguf", src)
             self.assertIn("warn_for_chat_model", src)
             self.assertIn("warn_for_publish", src)
