@@ -158,6 +158,7 @@ class FoundWeight:
     state: str
     fmt: str = ""
     kind: str = "file"
+    foreign: bool = False
 
 
 @dataclass(frozen=True)

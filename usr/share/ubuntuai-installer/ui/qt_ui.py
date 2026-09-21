@@ -77,10 +77,16 @@ from runtime import (
 )
 from validate import collect, format_checks, format_health
 from weights import (
+    ANOTHER_DISK,
+    UBUNTU_DISK,
+    ForeignMountError,
     catalog_dest,
+    disk_words,
     download,
+    foreign_source,
     human_bytes,
     load_catalog as load_weight_catalog,
+    move_off,
     organize,
     scan,
     scan_roots,
@@ -443,9 +449,13 @@ def _qt_weights(win, user, status) -> QWidget:
             )
             box.setChecked(item.state == "new")
             box.setEnabled(item.state == "new")
+            if foreign_source(item):
+                box.setText(box.text() + f"\n{disk_words(True)}")
+            box.toggled.connect(lambda _checked=False: apply_foreign_policy())
             found_checks[key] = box
             found_items[key] = item
             found_layout.addWidget(box)
+        apply_foreign_policy()
 
     def refill_downloads() -> None:
         t = target_for(user)
@@ -481,6 +491,8 @@ def _qt_weights(win, user, status) -> QWidget:
     hint = QLabel(
         f"Search known folders plus any you add, then copy into {t0.model_root}. "
         "Move removes the original after the checksum matches. "
+        f"A file on {ANOTHER_DISK} is copy only. "
+        f"Move is for a file on {UBUNTU_DISK}. "
         "Downloads are opt-in and go into the same store."
     )
     hint.setWordWrap(True)
@@ -513,6 +525,28 @@ def _qt_weights(win, user, status) -> QWidget:
     copy.toggled.connect(on_mode)
     move.toggled.connect(on_mode)
     on_mode()
+
+    def apply_foreign_policy(*_args) -> None:
+        picked = [
+            found_items[key]
+            for key, cb in found_checks.items()
+            if cb.isChecked()
+        ]
+        blocked = move_off(picked)
+        off = f"This file is on {disk_words(True)}. Copy only."
+        if blocked:
+            move.setChecked(False)
+            copy.setChecked(True)
+            move.setEnabled(False)
+            move.setToolTip(off)
+            remove_src.setChecked(False)
+            remove_src.setEnabled(False)
+            remove_src.setToolTip(off)
+            return
+        move.setEnabled(True)
+        move.setToolTip(f"Move a file on {disk_words(False)}.")
+        remove_src.setToolTip("")
+        on_mode()
     row = QHBoxLayout()
     exit_btn = QPushButton("Exit")
     scan_btn = QPushButton("Scan")
@@ -579,14 +613,18 @@ def _qt_weights(win, user, status) -> QWidget:
             status.setText("No new weights selected.")
             return
         mode = "move" if move.isChecked() else "copy"
-        log = organize(
-            picked,
-            t.model_root,
-            mode=mode,
-            remove_source=remove_src.isChecked(),
-            uid=t.uid,
-            gid=t.gid,
-        )
+        try:
+            log = organize(
+                picked,
+                t.model_root,
+                mode=mode,
+                remove_source=remove_src.isChecked(),
+                uid=t.uid,
+                gid=t.gid,
+            )
+        except ForeignMountError as exc:
+            status.setText(str(exc))
+            return
         status.setText("\n".join(log))
         refill_found()
 
