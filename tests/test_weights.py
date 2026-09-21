@@ -2,23 +2,33 @@ from __future__ import annotations
 
 import hashlib
 import http.server
+import io
+import os
+import pwd
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from support import PKG
 
-from domain import CatalogWeight, FileHash
+from domain import CatalogWeight, FileHash, UserTarget
+from main import installer_main
 from weights import (
+    FOREIGN_FSTYPES,
+    ForeignMountError,
     _hash_from_hf_row,
     _size_from_hf_row,
     classify,
     detect_bundle,
     download,
+    ensure_weight,
+    foreign_source,
     hash_path,
     human_bytes,
+    is_foreign_mount,
     load_catalog,
     normalize_scan_folder,
     organize,
@@ -563,6 +573,209 @@ class VerifyDownloadTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 verify_download(blob, model, expected=FileHash("md5", "0" * 32))
             self.assertIn("md5 mismatch", str(ctx.exception))
+
+
+class ForeignMountTests(unittest.TestCase):
+    def test_prefix_or_fstype(self) -> None:
+        self.assertEqual(
+            FOREIGN_FSTYPES, frozenset({"ntfs", "fuseblk", "vfat", "exfat"})
+        )
+        info = "\n".join(
+            (
+                "194 167 254:32 / / rw - ext4 /dev/vdc rw",
+                "200 194 8:1 / /home/user/Data rw - ntfs /dev/sdb1 rw",
+                "201 194 8:2 / /home/user/Fat rw - vfat /dev/sdc1 rw",
+                "202 194 8:3 / /home/user/Ex rw - exfat /dev/sdd1 rw",
+                "203 194 8:4 / /home/user/Blk rw - fuseblk /dev/sde1 rw",
+                "204 194 8:5 / /home/user/Ext rw - ext4 /dev/sdf1 rw",
+                "205 194 8:6 / /home/user/My\\040Disk rw - ntfs /dev/sdg1 rw",
+                "210 194 8:7 / /opt/models rw,noatime master:1 - fuseblk /dev/sdh1 rw",
+            )
+        )
+
+        def check(path: str, want: bool) -> None:
+            self.assertEqual(is_foreign_mount(Path(path), mountinfo=info), want, path)
+
+        check("/media/disk/model.gguf", True)
+        check("/mnt/disk/model.gguf", True)
+        check("/mnt", True)
+        check("/media", True)
+        check("/mnt2/model.gguf", False)
+        check("/home/user/model.gguf", False)
+        check("/home/user/Data/model.gguf", True)
+        check("/home/user/Fat/model.gguf", True)
+        check("/home/user/Ex/model.gguf", True)
+        check("/home/user/Blk/model.gguf", True)
+        check("/home/user/Ext/model.gguf", False)
+        check("/home/user/My Disk/model.gguf", True)
+        check("/opt/models/a.gguf", True)
+
+    def test_live_mountinfo_matches_explicit_text(self) -> None:
+        path = Path("/tmp")
+        info = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+        self.assertEqual(is_foreign_mount(path), is_foreign_mount(path, mountinfo=info))
+
+    def test_foreign_tree_copy_keeps_source(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "src" / "Qwen"
+            repo.mkdir(parents=True)
+            (repo / "config.json").write_text("{}", encoding="utf-8")
+            blob = repo / "model.safetensors"
+            blob.write_bytes(b"s" * (128 * 1024))
+            alias = repo / "alias.safetensors"
+            alias.symlink_to(blob.name)
+            store = root / "Models"
+            with patch("weights.is_foreign_mount", return_value=True):
+                found = scan((repo.parent,), store)
+                dirs = tuple(f for f in found if f.kind == "dir")
+                self.assertEqual(len(dirs), 1)
+                self.assertTrue(dirs[0].foreign)
+                self.assertTrue(foreign_source(dirs[0]))
+                log = organize(dirs, store, mode="copy")
+            dest = store / "hf" / "Qwen"
+            copied = dest / "model.safetensors"
+            copied_alias = dest / "alias.safetensors"
+            self.assertTrue(copied.is_file())
+            self.assertFalse(copied.is_symlink())
+            self.assertFalse(os.path.samefile(copied, blob))
+            self.assertEqual(copied.read_bytes(), blob.read_bytes())
+            self.assertTrue(copied_alias.is_file())
+            self.assertFalse(copied_alias.is_symlink())
+            self.assertTrue(blob.is_file())
+            self.assertTrue(alias.is_symlink())
+            self.assertTrue((repo / "config.json").is_file())
+            self.assertTrue(any(line.startswith("copied ") for line in log))
+
+    def test_move_refused_on_foreign(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src_dir = root / "Downloads"
+            src_dir.mkdir()
+            blob = src_dir / "foreign.gguf"
+            payload = b"g" * (128 * 1024)
+            blob.write_bytes(payload)
+            store = root / "Models"
+            with patch("weights.is_foreign_mount", return_value=True):
+                found = scan((src_dir,), store)
+                with self.assertRaises(ForeignMountError) as ctx:
+                    organize(found, store, mode="move")
+                with self.assertRaises(ForeignMountError):
+                    organize(found, store, mode="move", dry_run=True)
+                with self.assertRaises(ForeignMountError):
+                    organize(found, store, mode="copy", remove_source=True)
+            self.assertIn("copy only", str(ctx.exception))
+            self.assertEqual(blob.read_bytes(), payload)
+            self.assertFalse((store / "gguf" / "foreign.gguf").exists())
+
+    def test_foreign_flag_blocks_move(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src_dir = root / "Downloads"
+            src_dir.mkdir()
+            blob = src_dir / "flagged.gguf"
+            blob.write_bytes(b"g" * (128 * 1024))
+            store = root / "Models"
+            found = tuple(replace(item, foreign=True) for item in scan((src_dir,), store))
+            with patch("weights.is_foreign_mount", return_value=False):
+                self.assertTrue(foreign_source(found[0]))
+                with self.assertRaises(ForeignMountError):
+                    organize(found, store, mode="move")
+            self.assertTrue(blob.is_file())
+            self.assertFalse((store / "gguf" / "flagged.gguf").exists())
+
+    def test_ensure_weight_copies_foreign_file(self) -> None:
+        model = CatalogWeight(
+            id="foreign-gguf",
+            title="Foreign",
+            summary="",
+            subdir="gguf",
+            filename="foreign.gguf",
+            url="https://example.invalid/foreign.gguf",
+            bytes=128 * 1024,
+            workflows=(),
+        )
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "stash"
+            extra.mkdir()
+            blob = extra / model.filename
+            payload = b"g" * (128 * 1024)
+            blob.write_bytes(payload)
+            store = home / "Models"
+            store.mkdir()
+            target = self._target(home, store)
+            with patch("weights.is_foreign_mount", return_value=True):
+                msg = ensure_weight(model, target, (extra,))
+            dest = store / "gguf" / model.filename
+            self.assertTrue(dest.is_file())
+            self.assertFalse(dest.is_symlink())
+            self.assertFalse(os.path.samefile(dest, blob))
+            self.assertEqual(dest.read_bytes(), payload)
+            self.assertEqual(blob.read_bytes(), payload)
+            self.assertTrue(msg.startswith("copied"))
+
+    def _target(self, home: Path, store: Path) -> UserTarget:
+        return UserTarget(
+            name=pwd.getpwuid(os.getuid()).pw_name,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            home=home,
+            model_root=store,
+        )
+
+    def test_cli_refuses_move_and_remove_source(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            src_dir = home / "Downloads"
+            src_dir.mkdir()
+            blob = src_dir / "usb.gguf"
+            payload = b"g" * (128 * 1024)
+            blob.write_bytes(payload)
+            store = home / "Models"
+            store.mkdir()
+            target = self._target(home, store)
+            err = io.StringIO()
+            with (
+                patch("main.target_for", return_value=target),
+                patch("main.saved_scan_folders", return_value=()),
+                patch("weights.is_foreign_mount", return_value=True),
+                patch("sys.stderr", err),
+            ):
+                rc_move = installer_main(["--organize-weights", "move"])
+                rc_rm = installer_main(["--organize-weights", "copy", "--remove-source"])
+            self.assertEqual(rc_move, 1)
+            self.assertEqual(rc_rm, 1)
+            self.assertIn("copy only", err.getvalue())
+            self.assertEqual(blob.read_bytes(), payload)
+            self.assertFalse((store / "gguf" / "usb.gguf").exists())
+
+    def test_cli_copy_keeps_foreign_source(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            src_dir = home / "Downloads"
+            src_dir.mkdir()
+            blob = src_dir / "usb.gguf"
+            payload = b"g" * (128 * 1024)
+            blob.write_bytes(payload)
+            store = home / "Models"
+            store.mkdir()
+            target = self._target(home, store)
+            out = io.StringIO()
+            with (
+                patch("main.target_for", return_value=target),
+                patch("main.saved_scan_folders", return_value=()),
+                patch("weights.is_foreign_mount", return_value=True),
+                patch("sys.stdout", out),
+            ):
+                rc = installer_main(["--organize-weights", "copy"])
+            dest = store / "gguf" / "usb.gguf"
+            self.assertEqual(rc, 0)
+            self.assertTrue(dest.is_file())
+            self.assertFalse(dest.is_symlink())
+            self.assertEqual(dest.read_bytes(), payload)
+            self.assertEqual(blob.read_bytes(), payload)
+            self.assertIn("copied ", out.getvalue())
 
 
 if __name__ == "__main__":

@@ -459,6 +459,11 @@ class InstallerTwinOrganizeTests(unittest.TestCase):
             self.assertNotIn("then symlink into", src)
             self.assertNotIn('"Symlink"', src)
             self.assertNotIn('mode = "link"', src)
+            self.assertIn("foreign_source", src)
+            self.assertIn("apply_foreign_policy", src)
+            self.assertIn("Foreign mount. Copy only.", src)
+            self.assertIn("A foreign mount is copy only.", src)
+            self.assertNotIn("Windows", src)
 
 
 if __name__ == "__main__":

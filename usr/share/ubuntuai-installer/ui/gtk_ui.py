@@ -60,8 +60,10 @@ from runtime import (
 )
 from validate import collect, format_checks, format_health, worst
 from weights import (
+    ForeignMountError,
     catalog_dest,
     download,
+    foreign_source,
     human_bytes,
     load_catalog as load_weight_catalog,
     organize,
@@ -477,6 +479,7 @@ def _weights_page(win, user, status) -> Gtk.Widget:
         label=(
             f"Search known folders plus any you add, then copy into {t0.model_root}. "
             "Move removes the original after the checksum matches. "
+            "A foreign mount is copy only. "
             "Downloads are opt-in and go into the same store."
         ),
         xalign=0,
@@ -538,11 +541,14 @@ def _weights_page(win, user, status) -> Gtk.Widget:
             cb.set_sensitive(item.state == "new")
             found_checks[key] = cb
             found_items[key] = item
+            cb.connect("toggled", lambda *_a: apply_foreign_policy())
             title = f"{item.dest_name} ({human_bytes(item.size)})"
+            place = " · foreign mount" if foreign_source(item) else ""
             summary = (
-                f"{item.state} · {item.fmt} · {item.kind} · {item.subdir} · {item.path}"
+                f"{item.state} · {item.fmt} · {item.kind} · {item.subdir} · {item.path}{place}"
             )
             found_box.append(_check_row(title, summary, cb))
+        apply_foreign_policy()
 
     def refill_downloads() -> None:
         t = target_for(user)
@@ -662,6 +668,27 @@ def _weights_page(win, user, status) -> Gtk.Widget:
     move.connect("toggled", on_mode)
     on_mode()
 
+    def apply_foreign_policy(*_args) -> None:
+        picked = [
+            found_items[key]
+            for key, cb in found_checks.items()
+            if cb.get_active()
+        ]
+        blocked = any(foreign_source(item) for item in picked)
+        if blocked:
+            if move.get_active():
+                copy.set_active(True)
+            move.set_sensitive(False)
+            move.set_tooltip_text("Foreign mount. Copy only.")
+            remove_src.set_active(False)
+            remove_src.set_sensitive(False)
+            remove_src.set_tooltip_text("Foreign mount. Copy only.")
+            return
+        move.set_sensitive(True)
+        move.set_tooltip_text("")
+        remove_src.set_tooltip_text("")
+        on_mode()
+
     buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     exit_btn = Gtk.Button(label="Exit")
     scan_btn = Gtk.Button(label="Scan")
@@ -684,14 +711,18 @@ def _weights_page(win, user, status) -> Gtk.Widget:
             status.set_text("No new weights selected.")
             return
         mode = "move" if move.get_active() else "copy"
-        log = organize(
-            picked,
-            t.model_root,
-            mode=mode,
-            remove_source=remove_src.get_active(),
-            uid=t.uid,
-            gid=t.gid,
-        )
+        try:
+            log = organize(
+                picked,
+                t.model_root,
+                mode=mode,
+                remove_source=remove_src.get_active(),
+                uid=t.uid,
+                gid=t.gid,
+            )
+        except ForeignMountError as exc:
+            status.set_text(str(exc))
+            return
         status.set_text("\n".join(log))
         refill_found()
 

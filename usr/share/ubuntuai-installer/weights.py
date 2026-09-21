@@ -79,6 +79,8 @@ KNOWN_SUBDIRS = {
     "exl2",
 }
 UA = "ubuntuai-installer/0.1"
+FOREIGN_FSTYPES = frozenset({"ntfs", "fuseblk", "vfat", "exfat"})
+_FOREIGN_PREFIXES = (Path("/media"), Path("/mnt"))
 HEX_LEN = {
     "md5": 32,
     "sha1": 40,
@@ -672,6 +674,7 @@ def _append(
             state=state,
             fmt=fmt,
             kind=kind,
+            foreign=is_foreign_mount(src),
         )
     )
 
@@ -801,6 +804,130 @@ def integrity_algo_for(item: FoundWeight) -> str:
     return "sha256"
 
 
+class ForeignMountError(ValueError):
+    """Move and source removal are refused on a foreign mount."""
+
+
+def _unescape_mount(text: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 3 < n and text[i + 1 : i + 4].isdigit():
+            try:
+                out.append(chr(int(text[i + 1 : i + 4], 8)))
+            except ValueError:
+                out.append(text[i])
+                i += 1
+                continue
+            i += 4
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _parse_mountinfo(text: str) -> tuple[tuple[str, str], ...]:
+    rows: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        fields = line.split()
+        try:
+            sep = fields.index("-")
+        except ValueError:
+            continue
+        if sep < 5 or sep + 1 >= len(fields):
+            continue
+        mountpoint = _unescape_mount(fields[4])
+        if not mountpoint.startswith("/"):
+            continue
+        rows.append((mountpoint, fields[sep + 1].lower()))
+    return tuple(rows)
+
+
+def _mount_rows(mountinfo: str | None) -> tuple[tuple[str, str], ...]:
+    if mountinfo is None:
+        try:
+            mountinfo = Path("/proc/self/mountinfo").read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return ()
+    return _parse_mountinfo(mountinfo)
+
+
+def _path_forms(path: Path) -> tuple[Path, ...]:
+    forms: list[Path] = []
+    raw = path if path.is_absolute() else path.absolute()
+    forms.append(raw)
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = None
+    if resolved is not None and resolved not in forms:
+        forms.append(resolved)
+    return tuple(forms)
+
+
+def _on_foreign_prefix(path: Path) -> bool:
+    for cand in _path_forms(path):
+        for root in _FOREIGN_PREFIXES:
+            if cand == root or cand.is_relative_to(root):
+                return True
+    return False
+
+
+def _fstype(path: Path, rows: tuple[tuple[str, str], ...]) -> str:
+    best = ""
+    best_len = -1
+    for cand in _path_forms(path):
+        for mountpoint, fstype in rows:
+            mp = Path(mountpoint)
+            try:
+                inside = cand == mp or cand.is_relative_to(mp)
+            except (TypeError, ValueError):
+                inside = False
+            if not inside:
+                continue
+            score = len(mp.parts)
+            if score > best_len:
+                best = fstype
+                best_len = score
+    return best
+
+
+def is_foreign_mount(path: Path, mountinfo: str | None = None) -> bool:
+    """True for /media, /mnt, or fstype ntfs, fuseblk, vfat, or exfat."""
+    if _on_foreign_prefix(path):
+        return True
+    return _fstype(path, _mount_rows(mountinfo)) in FOREIGN_FSTYPES
+
+
+def foreign_source(item: FoundWeight) -> bool:
+    """True when this weight is copy only. Move stays off."""
+    return bool(item.foreign) or is_foreign_mount(item.path)
+
+
+def _refuse_foreign_mutate(
+    items: tuple[FoundWeight, ...],
+    mode: str,
+    remove_source: bool,
+) -> None:
+    if mode != "move" and not remove_source:
+        return
+    for item in items:
+        if item.state in {"already", "exists"}:
+            continue
+        if not foreign_source(item):
+            continue
+        if mode == "move":
+            raise ForeignMountError(
+                f"Move is refused for {item.path}. A foreign mount is copy only."
+            )
+        raise ForeignMountError(
+            f"Removing the original is refused for {item.path}. A foreign mount is copy only."
+        )
+
+
 def _remove_source(path: Path, kind: str) -> None:
     if kind == "dir" and path.is_dir() and not path.is_symlink():
         shutil.rmtree(path)
@@ -809,8 +936,9 @@ def _remove_source(path: Path, kind: str) -> None:
 
 
 def _copy_into_store(item: FoundWeight, dest: Path, uid: int | None, gid: int | None) -> None:
+    # A foreign tree must land as real files. Links back to that mount are refused.
     if item.kind == "dir":
-        shutil.copytree(item.path, dest, symlinks=True)
+        shutil.copytree(item.path, dest, symlinks=not foreign_source(item))
         if uid is not None and gid is not None:
             for dirpath, _dirnames, filenames in os.walk(dest):
                 os.chown(dirpath, uid, gid)
@@ -834,6 +962,7 @@ def organize(
 ) -> list[str]:
     if mode not in {"copy", "move"}:
         raise ValueError("mode must be copy or move")
+    _refuse_foreign_mutate(items, mode, remove_source)
     want_remove = mode == "move" or remove_source
     log: list[str] = []
     try:
@@ -993,10 +1122,21 @@ def ensure_weight(
         except OSError:
             pass
         if dry_run:
-            return f"link {item.path} -> {dest}"
+            verb = "copy" if foreign_source(item) else "link"
+            return f"{verb} {item.path} -> {dest}"
         dest.parent.mkdir(parents=True, exist_ok=True)
         if target.uid is not None:
             os.chown(dest.parent, target.uid, target.gid)
+        if foreign_source(item):
+            algo = integrity_algo_for(item)
+            src_hash = hash_path(item.path, algo)
+            _copy_into_store(item, dest, target.uid, target.gid)
+            if hash_path(dest, algo) != src_hash:
+                _remove_source(dest, item.kind)
+                raise RuntimeError(
+                    f"checksum mismatch copying {item.path}. The store file was not kept."
+                )
+            return f"copied {item.path} -> {dest}"
         dest.symlink_to(item.path)
         if target.uid is not None:
             os.lchown(dest, target.uid, target.gid)

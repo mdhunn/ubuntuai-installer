@@ -27,6 +27,7 @@ from repair import (
     load_saved_plan,
 )
 from weights import (
+    ForeignMountError,
     download,
     human_bytes,
     load_catalog as load_weight_catalog,
@@ -219,15 +220,19 @@ def cmd_organize_weights(
     if not found:
         print("nothing new to organize")
         return 0
-    log = organize(
-        found,
-        t.model_root,
-        mode=mode,
-        remove_source=remove_source,
-        uid=t.uid,
-        gid=t.gid,
-        dry_run=dry_run,
-    )
+    try:
+        log = organize(
+            found,
+            t.model_root,
+            mode=mode,
+            remove_source=remove_source,
+            uid=t.uid,
+            gid=t.gid,
+            dry_run=dry_run,
+        )
+    except ForeignMountError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     for line in log:
         print(line)
     return 0
@@ -382,12 +387,12 @@ def _parser() -> argparse.ArgumentParser:
         nargs="?",
         const="copy",
         choices=("copy", "move"),
-        help="copy (default) or move discovered weights into the model root",
+        help="copy (default) or move discovered weights into the model root. move is refused on a foreign mount",
     )
     p.add_argument(
         "--remove-source",
         action="store_true",
-        help="after copy, delete the original only if the checksum matches. move always does this",
+        help="after copy, delete the original only if the checksum matches. move always does this. refused on a foreign mount",
     )
     p.add_argument("--repair", action="store_true", help="diagnose and write a repair plan")
     p.add_argument(
