@@ -1,4 +1,4 @@
-"""Hardware probe. Reads lspci, sysfs, apt-cache policy, and a few binaries. Never installs."""
+"""Hardware probe. Reads lspci, sysfs, apt, os-release, and a few binaries. Never installs."""
 
 from __future__ import annotations
 
@@ -475,6 +475,96 @@ def apt_sources_text(text: str | None = None) -> str:
             if path.suffix in {".list", ".sources"} and path.is_file():
                 parts.append(path.read_text(encoding="utf-8", errors="replace"))
     return "\n".join(parts)
+
+
+# Ubuntu 26.04 is the first release where the Lemonade web UI expects fonts-katex.
+UBUNTU_FONTS_KATEX_MIN = (26, 4)
+KATEX_FONT_QUERY = "KaTeX_Main"
+_OS_RELEASE = Path("/etc/os-release")
+_FC_QUERY = re.compile(r"^[A-Za-z0-9_.+-]+$")
+_QUOTED_KATEX = re.compile(r'"KaTeX(?:_[A-Za-z0-9]+)?"')
+_BARE_KATEX = re.compile(r"^KaTeX(?:_[A-Za-z0-9]+)?$")
+DpkgStatusSource = Callable[[str], str] | dict[str, str]
+
+
+def os_release_text(text: str | None = None) -> str:
+    if text is not None:
+        return text
+    try:
+        return _OS_RELEASE.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _os_release_fields(text: str | None = None) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in os_release_text(text).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        fields[key.strip()] = value
+    return fields
+
+
+def ubuntu_version(text: str | None = None) -> tuple[int, int] | None:
+    """Ubuntu (major, minor). None when the release cannot be read."""
+    fields = _os_release_fields(text)
+    if fields.get("ID", "").lower() != "ubuntu":
+        return None
+    match = re.match(r"^(\d+)\.(\d+)", fields.get("VERSION_ID", "").strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def ubuntu_needs_katex_fonts(version: tuple[int, int] | None) -> bool:
+    return version is not None and version >= UBUNTU_FONTS_KATEX_MIN
+
+
+def dpkg_query_status(name: str, status: DpkgStatusSource | None = None) -> str:
+    """Read-only dpkg status. Never installs or removes packages."""
+    if not APT_NAME.match(name):
+        return ""
+    if isinstance(status, dict):
+        return str(status.get(name, "") or "").strip()
+    if status is not None:
+        return str(status(name) or "").strip()
+    try:
+        proc = subprocess.run(
+            ["dpkg-query", "-W", "-f=${Status}", name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def dpkg_status_installed(status_text: str) -> bool:
+    return "install ok installed" in status_text
+
+
+def fc_match_text(query: str = KATEX_FONT_QUERY, text: str | None = None) -> str:
+    """Read-only fc-match. text skips the binary. Never writes font files."""
+    if text is not None:
+        return text
+    if not _FC_QUERY.match(query):
+        return ""
+    return _run(["fc-match", query]).strip()
+
+
+def katex_family_resolves(text: str) -> bool:
+    """True when fc-match names a KaTeX family. A filename alone does not count."""
+    if _QUOTED_KATEX.search(text):
+        return True
+    return any(_BARE_KATEX.match(line.strip()) for line in text.splitlines())
 
 
 def universe_in_sources(text: str) -> bool:
