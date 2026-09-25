@@ -173,10 +173,12 @@ def quote_unit_path(path: Path) -> str:
 
 
 def mount_unit_text(what: Path, where: Path) -> str:
+    # DefaultDependencies orders a /var mount Before=local-fs.target.
+    # After=local-fs.target cycles with that. RequiresMountsFor waits for the source path.
     return (
         "[Unit]\n"
         f"Description={OWNED_UNIT_DESC}\n"
-        "After=local-fs.target\n"
+        f"RequiresMountsFor={quote_unit_path(what)}\n"
         "Before=snap.lemonade-server.daemon.service\n"
         "\n"
         "[Mount]\n"
