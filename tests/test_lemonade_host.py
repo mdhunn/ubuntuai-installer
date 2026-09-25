@@ -102,8 +102,10 @@ class UbuntuReleaseTests(unittest.TestCase):
         self.assertIsNone(ubuntu_version(OS_MINT))
 
     def test_injector_does_not_read_os_release(self) -> None:
-        with patch("probe._OS_RELEASE.read_text", side_effect=AssertionError):
+        with patch("probe._OS_RELEASE") as release:
+            release.read_text.side_effect = AssertionError("os-release")
             self.assertEqual(ubuntu_version(OS_2604), (26, 4))
+        release.read_text.assert_not_called()
 
 
 class KatexMatchTests(unittest.TestCase):
