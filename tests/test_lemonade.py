@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -271,6 +273,51 @@ class LemonadePublishTests(unittest.TestCase):
         self.assertIn('What="/tmp/AI models"', text)
         self.assertIn("Type=none", text)
         self.assertIn("Options=bind", text)
+
+    def test_mount_unit_has_no_local_fs_ordering_cycle(self) -> None:
+        what = Path("/tmp/AI models")
+        where = SNAP_LEMONADE_MODELS / "chat" / "src0"
+        text = mount_unit_text(what, where)
+        # Default dependencies add Before=local-fs.target for a /var mount.
+        self.assertNotIn("DefaultDependencies=no", text)
+        self.assertNotIn("After=local-fs.target", text)
+        self.assertIn(f"RequiresMountsFor={quote_unit_path(what)}", text)
+        self.assertIn('RequiresMountsFor="/tmp/AI models"', text)
+        self.assertIn("Before=snap.lemonade-server.daemon.service", text)
+        self.assertIn(f"Description={OWNED_UNIT_DESC}", text)
+        self.assertIn(f"What={quote_unit_path(what)}", text)
+        self.assertIn(f"Where={quote_unit_path(where)}", text)
+        self.assertIn("WantedBy=multi-user.target", text)
+
+    def test_mount_unit_systemd_analyze_verify_offline(self) -> None:
+        analyze = shutil.which("systemd-analyze")
+        escape = shutil.which("systemd-escape")
+        if not analyze or not escape:
+            self.skipTest("systemd-analyze verify is not available offline")
+        what = Path("/tmp/AI models")
+        where = SNAP_LEMONADE_MODELS / "chat" / "src0"
+        text = mount_unit_text(what, where)
+        escaped = subprocess.run(
+            [escape, "-p", "--suffix=mount", str(where)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        name = (escaped.stdout or "").strip()
+        if escaped.returncode != 0 or not name:
+            self.skipTest("systemd-escape failed")
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / name
+            path.write_text(text, encoding="utf-8")
+            result = subprocess.run(
+                [analyze, "verify", str(path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        output = (result.stdout or "") + (result.stderr or "")
+        self.assertNotIn("ordering cycle", output)
+        self.assertEqual(result.returncode, 0, output)
 
     def test_publish_snap_sets_snap_common_not_home(self) -> None:
         with TemporaryDirectory() as tmp:
