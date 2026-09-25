@@ -6,10 +6,13 @@ POLICY_IN = usr/share/polkit-1/actions/org.ubuntuai.pkexec.policy.in
 POLICY_OUT = usr/share/polkit-1/actions/org.ubuntuai.pkexec.policy
 POLKIT_DIR = /usr/share/polkit-1/actions
 
-.PHONY: test install uninstall policy
+.PHONY: test install uninstall policy catalog-drift
 
 test:
 	$(PYTHON) -m unittest discover -s tests -v
+
+catalog-drift:
+	$(PYTHON) usr/share/ubuntuai-installer/catalog_drift.py
 
 policy:
 	sed 's|@HELPER@|$(HELPER)|g' $(POLICY_IN) > $(POLICY_OUT)

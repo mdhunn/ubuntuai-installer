@@ -7,7 +7,7 @@
       "subdir": "gguf",
       "filename": "Qwen3-4B-Q4_K_M.gguf",
       "url": "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
-      "bytes": 2684354560,
+      "bytes": 2497280256,
       "workflows": ["ubuntuai-chat", "ubuntuai-coding"],
       "checksum": "",
       "default": false,
@@ -20,7 +20,7 @@
       "subdir": "gguf",
       "filename": "Qwen3-0.6B-Q8_0.gguf",
       "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
-      "bytes": 858993459,
+      "bytes": 639446688,
       "workflows": ["ubuntuai-chat"],
       "checksum": "",
       "default": true
@@ -56,7 +56,7 @@
       "subdir": "whisper",
       "filename": "ggml-base.en.bin",
       "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-      "bytes": 147951465,
+      "bytes": 147964211,
       "workflows": ["ubuntuai-stt-whisper"],
       "checksum": "",
       "default": false
@@ -68,7 +68,7 @@
       "subdir": "embeddings",
       "filename": "Qwen3-Embedding-0.6B-Q8_0.gguf",
       "url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf",
-      "bytes": 858993459,
+      "bytes": 639150592,
       "workflows": ["ubuntuai-rag"],
       "checksum": "",
       "default": false
