@@ -148,7 +148,15 @@ class NpuFirmwareValidateTests(unittest.TestCase):
                     meminfo=MEMINFO,
                     npu_firmware_link=link,
                 )
-            checks = collect(_target(), hw)
+            with patch("validate.dpkg_installed", return_value=False):
+                checks = collect(
+                    _target(),
+                    hw,
+                    os_release='ID=ubuntu\nVERSION_ID="24.04"\n',
+                    dpkg_status={},
+                    fc_match="",
+                    desktop={},
+                )
         fw = next(c for c in checks if c.name == "npu-firmware")
         self.assertEqual(fw.status, "warn")
         self.assertIn("mismatched pair", fw.detail)

@@ -1,4 +1,4 @@
-"""Hardware probe. Reads lspci, sysfs, apt-cache policy, and a few binaries. Never installs."""
+"""Hardware probe. Reads lspci, sysfs, apt, os-release, and a few binaries. Never installs."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -475,6 +475,106 @@ def apt_sources_text(text: str | None = None) -> str:
             if path.suffix in {".list", ".sources"} and path.is_file():
                 parts.append(path.read_text(encoding="utf-8", errors="replace"))
     return "\n".join(parts)
+
+
+# 26.04 fontconfig caches fonts-katex .woff files with an empty family. Qt 6.10 can crash.
+UBUNTU_FONTS_KATEX_MIN = (26, 4)
+KATEX_FONT_QUERY = "sans"
+_OS_RELEASE = Path("/etc/os-release")
+_FC_QUERY = re.compile(r"^[A-Za-z0-9_.+-]+$")
+_KATEX_WOFF = re.compile(r"katex[^:\s\"']*\.woff2?", re.IGNORECASE)
+_INSTALLED_STATES = frozenset({"install ok installed", "hold ok installed"})
+DpkgStatusSource = Callable[[str], str] | dict[str, str]
+
+
+def os_release_text(text: str | None = None) -> str:
+    if text is not None:
+        return text
+    try:
+        return _OS_RELEASE.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _os_release_fields(text: str | None = None) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in os_release_text(text).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        fields[key.strip()] = value
+    return fields
+
+
+def ubuntu_version(text: str | None = None) -> tuple[int, int] | None:
+    """Ubuntu (major, minor). None when the release cannot be read."""
+    fields = _os_release_fields(text)
+    if fields.get("ID", "").lower() != "ubuntu":
+        return None
+    match = re.match(r"^(\d+)\.(\d+)", fields.get("VERSION_ID", "").strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def ubuntu_katex_hazard(version: tuple[int, int] | None) -> bool:
+    """Ubuntu 26.04 and newer. fonts-katex .woff files can crash Qt 6.10."""
+    return version is not None and version >= UBUNTU_FONTS_KATEX_MIN
+
+
+def dpkg_query_status(name: str, status: DpkgStatusSource | None = None) -> str:
+    """Read-only dpkg status. Never installs or removes packages."""
+    if not APT_NAME.match(name):
+        return ""
+    if isinstance(status, dict):
+        return str(status.get(name, "") or "").strip()
+    if status is not None:
+        return str(status(name) or "").strip()
+    try:
+        proc = subprocess.run(
+            ["dpkg-query", "-W", "-f=${Status}", name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def dpkg_status_installed(status_text: str) -> bool:
+    """True for install ok installed and hold ok installed. Config-files do not count."""
+    return " ".join(status_text.split()) in _INSTALLED_STATES
+
+
+def fc_match_text(query: str = KATEX_FONT_QUERY, text: str | None = None) -> str:
+    """Read-only fc-match. text skips the binary. Never writes font files."""
+    if text is not None:
+        return text
+    if not _FC_QUERY.match(query):
+        return ""
+    return _run(["fc-match", query]).strip()
+
+
+def katex_woff_selected(text: str) -> bool:
+    """True when fc-match points at a KaTeX .woff file."""
+    return _KATEX_WOFF.search(text) is not None
+
+
+def plasma_session(env: Mapping[str, str] | None = None) -> bool:
+    """True when the session is KDE or Plasma. env skips the process environment."""
+    fields = os.environ if env is None else env
+    blob = " ".join(
+        str(fields.get(key, ""))
+        for key in ("XDG_CURRENT_DESKTOP", "DESKTOP_SESSION", "XDG_SESSION_DESKTOP")
+    ).lower()
+    return "kde" in blob or "plasma" in blob
 
 
 def universe_in_sources(text: str) -> bool:

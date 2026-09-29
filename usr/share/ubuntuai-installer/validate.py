@@ -22,13 +22,22 @@ from lemonade import (
 from paths import ENV_FILE, LIMITS_FILE
 from probe import (
     APT_NAME,
+    DpkgStatusSource,
     HYBRID_FLM_MISSING,
+    KATEX_FONT_QUERY,
     apt_cache_policy,
     apt_candidate,
     apt_sources_text,
     bind_which,
+    dpkg_query_status,
+    dpkg_status_installed,
+    fc_match_text,
+    katex_woff_selected,
+    plasma_session,
     probe,
     split_apt_policies,
+    ubuntu_katex_hazard,
+    ubuntu_version,
     universe_in_sources,
 )
 from users import target_for
@@ -52,6 +61,15 @@ def _fail(name: str, detail: str) -> Check:
 FIRMWARE_VALIDATE_ONLY = (
     "Validate-only. The installer will not rewrite firmware. "
     "Human approval is required if a rewrite is ever offered."
+)
+
+FONTS_KATEX_PKG = "fonts-katex"
+LEMONADE_APT_PKG = "lemonade-server"
+LP_KATEX = "https://bugs.launchpad.net/ubuntu/+source/node-katex/+bug/2168311"
+LEMONADE_APT_PRESENT = (
+    "lemonade-server from apt is installed. "
+    "Apt lemonade-server is unsupported here because this installer is snap-only. "
+    "Remove the apt package and use the snap if you decide to."
 )
 
 
@@ -175,6 +193,72 @@ def archive_gate_checks(
     return tuple(checks)
 
 
+def _katex_match_text(
+    dpkg_status: DpkgStatusSource | None,
+    fc_match: str | None,
+) -> str | None:
+    # Injected package status does not call fc-match unless the text is injected too.
+    if fc_match is not None:
+        return fc_match
+    if dpkg_status is not None:
+        return None
+    return fc_match_text(KATEX_FONT_QUERY)
+
+
+def fonts_katex_detail(*, woff: bool, plasma: bool) -> str:
+    parts = [
+        "fonts-katex is installed.",
+        "This package can crash the Plasma desktop on Qt 6.10.",
+        "The Lemonade snap does not need it.",
+    ]
+    if woff:
+        parts.append("fc-match sans resolves to a KaTeX .woff file.")
+    if plasma:
+        parts.append("This session is KDE Plasma.")
+    parts.append("Only remove it or change fontconfig if you decide to.")
+    parts.append("See the linked bug.")
+    parts.append(LP_KATEX)
+    return " ".join(parts)
+
+
+def fonts_katex_check(
+    *,
+    os_release: str | None = None,
+    dpkg_status: DpkgStatusSource | None = None,
+    fc_match: str | None = None,
+    desktop: dict[str, str] | None = None,
+) -> Check | None:
+    """Warn when Ubuntu 26.04 or newer has fonts-katex installed. Older releases are skipped.
+
+    Read-only. See LP #2168311.
+    """
+    if not ubuntu_katex_hazard(ubuntu_version(os_release)):
+        return None
+    installed = dpkg_status_installed(dpkg_query_status(FONTS_KATEX_PKG, dpkg_status))
+    if not installed:
+        return None
+    match = _katex_match_text(dpkg_status, fc_match)
+    woff = bool(match) and katex_woff_selected(match)
+    return _warn(
+        "fonts-katex",
+        fonts_katex_detail(woff=woff, plasma=plasma_session(desktop)),
+    )
+
+
+def lemonade_apt_check(
+    *,
+    dpkg_status: DpkgStatusSource | None = None,
+) -> Check | None:
+    """Warn when the lemonade-server deb is installed. Snap-only stays quiet.
+
+    Read-only. The package stays installed. See lemonade#3655.
+    """
+    status = dpkg_query_status(LEMONADE_APT_PKG, dpkg_status)
+    if not dpkg_status_installed(status):
+        return None
+    return _warn("lemonade-apt", LEMONADE_APT_PRESENT)
+
+
 # Missing flm is the Hybrid lane, not Chat. Chat stays on llama.cpp.
 def hybrid_engine_check(
     hw: Hardware,
@@ -199,6 +283,10 @@ def collect(
     apt_sources: str | None = None,
     which: Callable[[str], str | None] | None = None,
     path: str | None = None,
+    os_release: str | None = None,
+    dpkg_status: DpkgStatusSource | None = None,
+    fc_match: str | None = None,
+    desktop: dict[str, str] | None = None,
 ) -> tuple[Check, ...]:
     find = bind_which(which, path)
     hw = hw or probe(which=find)
@@ -327,6 +415,17 @@ def collect(
         if n == HYBRID_FLM_MISSING:
             continue
         checks.append(_warn("note", n))
+    katex = fonts_katex_check(
+        os_release=os_release,
+        dpkg_status=dpkg_status,
+        fc_match=fc_match,
+        desktop=desktop,
+    )
+    if katex is not None:
+        checks.append(katex)
+    apt_lemon = lemonade_apt_check(dpkg_status=dpkg_status)
+    if apt_lemon is not None:
+        checks.append(apt_lemon)
     if lemonade_detect():
         largest = largest_gguf_bytes(target)
         settings = load_tuning(hw, largest)

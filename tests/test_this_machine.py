@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import support  # noqa: F401
 
@@ -26,5 +27,15 @@ class ThisMachineTests(unittest.TestCase):
         text = explain_setup(user, target_for(user), hw)
         self.assertIn(hw.cpu_name.split()[0], text)
         self.assertIn("Listen:", text)
-        health = format_health(collect(target_for(user), hw))
+        with patch("validate.dpkg_installed", return_value=False):
+            health = format_health(
+                collect(
+                    target_for(user),
+                    hw,
+                    os_release='ID=ubuntu\nVERSION_ID="24.04"\n',
+                    dpkg_status={},
+                    fc_match="",
+                    desktop={},
+                )
+            )
         self.assertTrue(health)
