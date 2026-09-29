@@ -52,6 +52,15 @@ def _named(checks, name: str):
     return [c for c in checks if c.name == name]
 
 
+# collect() tests must not read the host os-release or run dpkg-query or fc-match.
+_HOST_OFF = {
+    "os_release": 'ID=ubuntu\nVERSION_ID="24.04"\n',
+    "dpkg_status": {},
+    "fc_match": "",
+    "desktop": {},
+}
+
+
 class HybridEngineCheckTests(unittest.TestCase):
     def test_xdna_without_flm_warns(self) -> None:
         check = hybrid_engine_check(_strix(), which=lambda name: None)
@@ -97,7 +106,8 @@ class HybridEngineCheckTests(unittest.TestCase):
 
 class ValidateCollectHybridTests(unittest.TestCase):
     def test_collect_warns_once_when_xdna_lacks_flm(self) -> None:
-        checks = collect(_target(), _strix(), which=lambda name: None)
+        with patch("validate.dpkg_installed", return_value=False):
+            checks = collect(_target(), _strix(), which=lambda name: None, **_HOST_OFF)
         flm = _named(checks, "fastflowlm")
         self.assertEqual(len(flm), 1)
         self.assertEqual(flm[0].status, "warn")
@@ -106,25 +116,29 @@ class ValidateCollectHybridTests(unittest.TestCase):
         self.assertEqual(notes, [])
 
     def test_collect_ok_when_flm_injected(self) -> None:
-        checks = collect(
-            _target(),
-            _strix(),
-            which=lambda name: "/opt/flm" if name == "flm" else None,
-        )
+        with patch("validate.dpkg_installed", return_value=False):
+            checks = collect(
+                _target(),
+                _strix(),
+                which=lambda name: "/opt/flm" if name == "flm" else None,
+                **_HOST_OFF,
+            )
         flm = _named(checks, "fastflowlm")
         self.assertEqual(len(flm), 1)
         self.assertEqual(flm[0].status, "ok")
 
     def test_collect_skips_hybrid_warning_without_xdna(self) -> None:
-        checks = collect(_target(), _cpu(), which=lambda name: None)
+        with patch("validate.dpkg_installed", return_value=False):
+            checks = collect(_target(), _cpu(), which=lambda name: None, **_HOST_OFF)
         self.assertEqual(_named(checks, "fastflowlm"), [])
 
     def test_collect_warns_on_huge_lemonade_load(self) -> None:
         with (
             patch("validate.lemonade_detect", return_value="snap"),
             patch("validate.largest_gguf_bytes", return_value=105 * 1024**3),
+            patch("validate.dpkg_installed", return_value=False),
         ):
-            checks = collect(_target(), _strix(), which=lambda name: None)
+            checks = collect(_target(), _strix(), which=lambda name: None, **_HOST_OFF)
         load = _named(checks, "lemonade-load")
         self.assertEqual(len(load), 1)
         self.assertEqual(load[0].status, "warn")

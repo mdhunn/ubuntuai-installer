@@ -216,12 +216,17 @@ class ArchiveGateTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_collect_wires_archive_gate(self) -> None:
-        checks = collect(
-            _target(),
-            _cpu(),
-            apt_policy=_known_map(self.names),
-            apt_sources=UNIVERSE_ON,
-        )
+        with patch("validate.dpkg_installed", return_value=False):
+            checks = collect(
+                _target(),
+                _cpu(),
+                apt_policy=_known_map(self.names),
+                apt_sources=UNIVERSE_ON,
+                os_release='ID=ubuntu\nVERSION_ID="24.04"\n',
+                dpkg_status={},
+                fc_match="",
+                desktop={},
+            )
         names = [c.name for c in checks]
         self.assertIn("cpu", names)
         self.assertIn("apt-known:llama.cpp-tools", names)

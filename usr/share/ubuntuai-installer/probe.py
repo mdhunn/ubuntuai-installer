@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -477,13 +477,13 @@ def apt_sources_text(text: str | None = None) -> str:
     return "\n".join(parts)
 
 
-# Ubuntu 26.04 is the first release where the Lemonade web UI expects fonts-katex.
+# 26.04 fontconfig caches fonts-katex .woff files with an empty family. Qt 6.10 can crash.
 UBUNTU_FONTS_KATEX_MIN = (26, 4)
-KATEX_FONT_QUERY = "KaTeX_Main"
+KATEX_FONT_QUERY = "sans"
 _OS_RELEASE = Path("/etc/os-release")
 _FC_QUERY = re.compile(r"^[A-Za-z0-9_.+-]+$")
-_QUOTED_KATEX = re.compile(r'"KaTeX(?:_[A-Za-z0-9]+)?"')
-_BARE_KATEX = re.compile(r"^KaTeX(?:_[A-Za-z0-9]+)?$")
+_KATEX_WOFF = re.compile(r"katex[^:\s\"']*\.woff2?", re.IGNORECASE)
+_INSTALLED_STATES = frozenset({"install ok installed", "hold ok installed"})
 DpkgStatusSource = Callable[[str], str] | dict[str, str]
 
 
@@ -521,7 +521,8 @@ def ubuntu_version(text: str | None = None) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
-def ubuntu_needs_katex_fonts(version: tuple[int, int] | None) -> bool:
+def ubuntu_katex_hazard(version: tuple[int, int] | None) -> bool:
+    """Ubuntu 26.04 and newer. fonts-katex .woff files can crash Qt 6.10."""
     return version is not None and version >= UBUNTU_FONTS_KATEX_MIN
 
 
@@ -548,7 +549,8 @@ def dpkg_query_status(name: str, status: DpkgStatusSource | None = None) -> str:
 
 
 def dpkg_status_installed(status_text: str) -> bool:
-    return "install ok installed" in status_text
+    """True for install ok installed and hold ok installed. Config-files do not count."""
+    return " ".join(status_text.split()) in _INSTALLED_STATES
 
 
 def fc_match_text(query: str = KATEX_FONT_QUERY, text: str | None = None) -> str:
@@ -560,11 +562,19 @@ def fc_match_text(query: str = KATEX_FONT_QUERY, text: str | None = None) -> str
     return _run(["fc-match", query]).strip()
 
 
-def katex_family_resolves(text: str) -> bool:
-    """True when fc-match names a KaTeX family. A filename alone does not count."""
-    if _QUOTED_KATEX.search(text):
-        return True
-    return any(_BARE_KATEX.match(line.strip()) for line in text.splitlines())
+def katex_woff_selected(text: str) -> bool:
+    """True when fc-match points at a KaTeX .woff file."""
+    return _KATEX_WOFF.search(text) is not None
+
+
+def plasma_session(env: Mapping[str, str] | None = None) -> bool:
+    """True when the session is KDE or Plasma. env skips the process environment."""
+    fields = os.environ if env is None else env
+    blob = " ".join(
+        str(fields.get(key, ""))
+        for key in ("XDG_CURRENT_DESKTOP", "DESKTOP_SESSION", "XDG_SESSION_DESKTOP")
+    ).lower()
+    return "kde" in blob or "plasma" in blob
 
 
 def universe_in_sources(text: str) -> bool:

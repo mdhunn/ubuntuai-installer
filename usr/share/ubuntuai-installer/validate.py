@@ -32,10 +32,11 @@ from probe import (
     dpkg_query_status,
     dpkg_status_installed,
     fc_match_text,
-    katex_family_resolves,
+    katex_woff_selected,
+    plasma_session,
     probe,
     split_apt_policies,
-    ubuntu_needs_katex_fonts,
+    ubuntu_katex_hazard,
     ubuntu_version,
     universe_in_sources,
 )
@@ -64,13 +65,12 @@ FIRMWARE_VALIDATE_ONLY = (
 
 FONTS_KATEX_PKG = "fonts-katex"
 LEMONADE_APT_PKG = "lemonade-server"
-FONTS_KATEX_MISSING = (
-    "Math rendering in the Lemonade web UI may break. "
-    "The Ubuntu package fonts-katex can be installed."
-)
+LP_KATEX = "https://bugs.launchpad.net/ubuntu/+source/node-katex/+bug/2168311"
 LEMONADE_APT_PRESENT = (
-    "Lemonade was installed from the apt package lemonade-server. "
-    "The supported build is the lemonade-server snap."
+    "lemonade-server from apt is installed. "
+    "Apt lemonade-server is unsupported here because this installer is snap-only. "
+    "The recommended action is to remove the apt package and use the snap. "
+    "Ask Mark before removing anything."
 )
 
 
@@ -206,26 +206,43 @@ def _katex_match_text(
     return fc_match_text(KATEX_FONT_QUERY)
 
 
+def fonts_katex_detail(*, woff: bool, plasma: bool) -> str:
+    parts = [
+        "fonts-katex is installed.",
+        "This package can crash the Plasma desktop on Qt 6.10.",
+        "The Lemonade snap does not need it.",
+    ]
+    if woff:
+        parts.append("fc-match sans resolves to a KaTeX .woff file.")
+    if plasma:
+        parts.append("This session is KDE Plasma.")
+    parts.append("Any purge or fontconfig change needs Mark's approval.")
+    parts.append(LP_KATEX)
+    return " ".join(parts)
+
+
 def fonts_katex_check(
     *,
     os_release: str | None = None,
     dpkg_status: DpkgStatusSource | None = None,
     fc_match: str | None = None,
+    desktop: dict[str, str] | None = None,
 ) -> Check | None:
-    """Warn when Ubuntu 26.04 or newer has no fonts-katex. Older releases are skipped.
+    """Warn when Ubuntu 26.04 or newer has fonts-katex installed. Older releases are skipped.
 
-    This check does not install the package.
+    Read-only. See LP #2168311.
     """
-    if not ubuntu_needs_katex_fonts(ubuntu_version(os_release)):
+    if not ubuntu_katex_hazard(ubuntu_version(os_release)):
         return None
     installed = dpkg_status_installed(dpkg_query_status(FONTS_KATEX_PKG, dpkg_status))
-    if installed:
-        return _ok("fonts-katex", "fonts-katex is installed.")
-    # A resolvable KaTeX family means math fonts are already on the machine.
+    if not installed:
+        return None
     match = _katex_match_text(dpkg_status, fc_match)
-    if match is not None and katex_family_resolves(match):
-        return _ok("fonts-katex", "A KaTeX font family resolves.")
-    return _warn("fonts-katex", FONTS_KATEX_MISSING)
+    woff = bool(match) and katex_woff_selected(match)
+    return _warn(
+        "fonts-katex",
+        fonts_katex_detail(woff=woff, plasma=plasma_session(desktop)),
+    )
 
 
 def lemonade_apt_check(
@@ -269,6 +286,7 @@ def collect(
     os_release: str | None = None,
     dpkg_status: DpkgStatusSource | None = None,
     fc_match: str | None = None,
+    desktop: dict[str, str] | None = None,
 ) -> tuple[Check, ...]:
     find = bind_which(which, path)
     hw = hw or probe(which=find)
@@ -401,6 +419,7 @@ def collect(
         os_release=os_release,
         dpkg_status=dpkg_status,
         fc_match=fc_match,
+        desktop=desktop,
     )
     if katex is not None:
         checks.append(katex)
