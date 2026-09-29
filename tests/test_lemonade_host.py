@@ -143,7 +143,9 @@ class FontsKatexCheckTests(unittest.TestCase):
         self.assertNotEqual(check.status, "fail")
         self.assertIn("Qt 6.10", check.detail)
         self.assertIn("snap", check.detail)
-        self.assertIn("Mark", check.detail)
+        self.assertIn("Only remove it or change fontconfig if you decide to.", check.detail)
+        self.assertIn("See the linked bug.", check.detail)
+        self.assertNotIn("Mark", check.detail)
         self.assertIn(LP_KATEX, check.detail)
         self.assertNotIn(".woff", check.detail)
         self.assertNotIn("This session is KDE Plasma.", check.detail)
@@ -242,8 +244,8 @@ class LemonadeAptCheckTests(unittest.TestCase):
         self.assertEqual(check.status, "warn")
         self.assertEqual(check.detail, LEMONADE_APT_PRESENT)
         self.assertIn("snap-only", check.detail)
-        self.assertIn("remove the apt package", check.detail)
-        self.assertIn("Ask Mark", check.detail)
+        self.assertIn("Remove the apt package and use the snap if you decide to.", check.detail)
+        self.assertNotIn("Mark", check.detail)
         self.assertNotEqual(check.status, "fail")
 
     def test_hold_counts_as_installed(self) -> None:
@@ -430,10 +432,12 @@ class NoInstallPathTests(unittest.TestCase):
         for token in ('["purge"', "apt purge", "dpkg --purge", "dpkg -P"):
             self.assertNotIn(token, validate_text, token)
         detail = fonts_katex_detail(woff=True, plasma=True)
-        self.assertIn("purge", detail)
         self.assertIn("fontconfig", detail)
-        self.assertIn("Mark's approval", detail)
+        self.assertIn("if you decide to", detail)
         self.assertIn("2168311", detail)
+        self.assertNotIn("Mark", detail)
+        self.assertNotIn("Mark", LEMONADE_APT_PRESENT)
+        self.assertNotIn("Mark", validate_text)
         quiet = (
             PKG / "apply.py",
             PKG / "vendor.py",

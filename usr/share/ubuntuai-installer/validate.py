@@ -69,8 +69,7 @@ LP_KATEX = "https://bugs.launchpad.net/ubuntu/+source/node-katex/+bug/2168311"
 LEMONADE_APT_PRESENT = (
     "lemonade-server from apt is installed. "
     "Apt lemonade-server is unsupported here because this installer is snap-only. "
-    "The recommended action is to remove the apt package and use the snap. "
-    "Ask Mark before removing anything."
+    "Remove the apt package and use the snap if you decide to."
 )
 
 
@@ -216,7 +215,8 @@ def fonts_katex_detail(*, woff: bool, plasma: bool) -> str:
         parts.append("fc-match sans resolves to a KaTeX .woff file.")
     if plasma:
         parts.append("This session is KDE Plasma.")
-    parts.append("Any purge or fontconfig change needs Mark's approval.")
+    parts.append("Only remove it or change fontconfig if you decide to.")
+    parts.append("See the linked bug.")
     parts.append(LP_KATEX)
     return " ".join(parts)
 
