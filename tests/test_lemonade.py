@@ -19,6 +19,8 @@ from lemonade import (
     LOAD_RISK_POLICY,
     OWNED_UNIT_DESC,
     _drop_bind_unit,
+    _unit_is_ours,
+    _where_from_unit,
     bind_mounts,
     cli_tuning_parts,
     detect,
@@ -30,6 +32,7 @@ from lemonade import (
     model_gguf_bytes,
     load_risk,
     load_tuning,
+    mount_unit_path,
     mount_unit_text,
     owned_bind_wheres,
     publish,
@@ -80,6 +83,35 @@ def _seed_unit(
     path = unit_dir / name
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def _systemd_analyze_verify(
+    analyze: str,
+    escape: str,
+    text: str,
+    where: Path,
+) -> tuple[int, str]:
+    """Verify a mount unit in one transaction with local-fs.target."""
+    escaped = subprocess.run(
+        [escape, "-p", "--suffix=mount", str(where)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    name = (escaped.stdout or "").strip()
+    if escaped.returncode != 0 or not name:
+        raise RuntimeError(escaped.stderr or "systemd-escape failed")
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / name
+        path.write_text(text, encoding="utf-8")
+        result = subprocess.run(
+            [analyze, "verify", str(path), "local-fs.target"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    output = (result.stdout or "") + (result.stderr or "")
+    return result.returncode, output
 
 
 class LemonadePublishTests(unittest.TestCase):
@@ -264,15 +296,22 @@ class LemonadePublishTests(unittest.TestCase):
                 ),
             )
 
-    def test_mount_unit_quotes_spaces(self) -> None:
-        what = Path("/tmp/AI models")
-        where = SNAP_LEMONADE_MODELS
+    def test_mount_unit_writes_unquoted_paths(self) -> None:
+        what = Path("/tmp/AI 100% models")
+        where = SNAP_LEMONADE_MODELS / "chat" / "src0"
         text = mount_unit_text(what, where)
-        self.assertIn(f"What={quote_unit_path(what)}", text)
-        self.assertIn(f"Where={quote_unit_path(where)}", text)
-        self.assertIn('What="/tmp/AI models"', text)
+        self.assertEqual(mount_unit_path(what), "/tmp/AI 100%% models")
+        self.assertIn("What=/tmp/AI 100%% models\n", text)
+        self.assertIn(f"Where={where}\n", text)
+        self.assertNotIn('What="', text)
+        self.assertNotIn('Where="', text)
         self.assertIn("Type=none", text)
-        self.assertIn("Options=bind", text)
+        self.assertIn("Options=bind,nofail", text)
+        self.assertEqual(_where_from_unit(text), where)
+        self.assertEqual(
+            _where_from_unit("Where=/tmp/100%% models\n"),
+            Path("/tmp/100% models"),
+        )
 
     def test_mount_unit_has_no_local_fs_ordering_cycle(self) -> None:
         what = Path("/tmp/AI models")
@@ -283,41 +322,71 @@ class LemonadePublishTests(unittest.TestCase):
         self.assertNotIn("After=local-fs.target", text)
         self.assertIn(f"RequiresMountsFor={quote_unit_path(what)}", text)
         self.assertIn('RequiresMountsFor="/tmp/AI models"', text)
+        self.assertIn("What=/tmp/AI models\n", text)
+        self.assertIn(f"Where={where}\n", text)
+        self.assertNotIn('What="', text)
+        self.assertNotIn('Where="', text)
+        self.assertIn("Options=bind,nofail", text)
         self.assertIn("Before=snap.lemonade-server.daemon.service", text)
         self.assertIn(f"Description={OWNED_UNIT_DESC}", text)
-        self.assertIn(f"What={quote_unit_path(what)}", text)
-        self.assertIn(f"Where={quote_unit_path(where)}", text)
         self.assertIn("WantedBy=multi-user.target", text)
 
     def test_mount_unit_systemd_analyze_verify_offline(self) -> None:
         analyze = shutil.which("systemd-analyze")
+        if not analyze:
+            self.skipTest("systemd-analyze is not installed")
         escape = shutil.which("systemd-escape")
-        if not analyze or not escape:
-            self.skipTest("systemd-analyze verify is not available offline")
+        if not escape:
+            self.skipTest("systemd-escape is not installed")
         what = Path("/tmp/AI models")
         where = SNAP_LEMONADE_MODELS / "chat" / "src0"
-        text = mount_unit_text(what, where)
-        escaped = subprocess.run(
-            [escape, "-p", "--suffix=mount", str(where)],
-            capture_output=True,
-            text=True,
-            check=False,
+        code, output = _systemd_analyze_verify(
+            analyze, escape, mount_unit_text(what, where), where
         )
-        name = (escaped.stdout or "").strip()
-        if escaped.returncode != 0 or not name:
-            self.skipTest("systemd-escape failed")
-        with TemporaryDirectory() as tmp:
-            path = Path(tmp) / name
-            path.write_text(text, encoding="utf-8")
-            result = subprocess.run(
-                [analyze, "verify", str(path)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        output = (result.stdout or "") + (result.stderr or "")
+        self.assertNotIn("not absolute", output)
         self.assertNotIn("ordering cycle", output)
-        self.assertEqual(result.returncode, 0, output)
+        self.assertEqual(code, 0, output)
+
+    def test_legacy_quoted_unit_is_still_owned(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "ubuntuai-models"
+            source = Path(tmp) / "AI models"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            legacy_where = dest / "chat" / "src0"
+            new_where = dest / "chat" / "src1"
+            legacy = (
+                "[Unit]\n"
+                f"Description={OWNED_UNIT_DESC}\n"
+                "After=local-fs.target\n"
+                "Before=snap.lemonade-server.daemon.service\n"
+                "\n"
+                "[Mount]\n"
+                f"What={quote_unit_path(source)}\n"
+                f"Where={quote_unit_path(legacy_where)}\n"
+                "Type=none\n"
+                "Options=bind\n"
+                "\n"
+                "[Install]\n"
+                "WantedBy=multi-user.target\n"
+            )
+            legacy_path = unit_dir / "legacy.mount"
+            legacy_path.write_text(legacy, encoding="utf-8")
+            new_path = unit_dir / "new.mount"
+            new_path.write_text(mount_unit_text(source, new_where), encoding="utf-8")
+            self.assertTrue(_unit_is_ours(legacy_path))
+            self.assertTrue(_unit_is_ours(new_path))
+            legacy_parsed = _where_from_unit(legacy)
+            new_parsed = _where_from_unit(new_path.read_text(encoding="utf-8"))
+            self.assertEqual(legacy_parsed, legacy_where)
+            self.assertEqual(new_parsed, new_where)
+            self.assertTrue(is_owned_lemonade_where(dest, legacy_parsed))
+            self.assertTrue(is_owned_lemonade_where(dest, new_parsed))
+            leftovers = leftover_owned_binds(dest, (), unit_dir=unit_dir)
+            self.assertEqual(
+                set(leftovers),
+                {legacy_where.resolve(), new_where.resolve()},
+            )
 
     def test_publish_snap_sets_snap_common_not_home(self) -> None:
         with TemporaryDirectory() as tmp:
