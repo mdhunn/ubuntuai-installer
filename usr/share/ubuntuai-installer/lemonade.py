@@ -167,23 +167,32 @@ def owned_bind_wheres(
 
 
 def quote_unit_path(path: Path) -> str:
-    # Spaces in ~/AI models must survive the systemd unit parser.
+    # RequiresMountsFor= splits on spaces. Quotes keep ~/AI models as one path.
     text = str(path).replace("\\", "\\\\").replace('"', '\\"')
     return f'"{text}"'
 
 
+def mount_unit_path(path: Path) -> str:
+    # systemd does not unquote What= or Where=. Quotes would be part of the path.
+    # % starts a specifier, so a literal percent is written %%.
+    return str(path).replace("%", "%%")
+
+
 def mount_unit_text(what: Path, where: Path) -> str:
+    # DefaultDependencies orders a /var mount Before=local-fs.target.
+    # After=local-fs.target cycles with that. RequiresMountsFor waits for the source path.
+    # nofail avoids a cycle on NFS or SMB and a long stall when a nofail disk is absent.
     return (
         "[Unit]\n"
         f"Description={OWNED_UNIT_DESC}\n"
-        "After=local-fs.target\n"
+        f"RequiresMountsFor={quote_unit_path(what)}\n"
         "Before=snap.lemonade-server.daemon.service\n"
         "\n"
         "[Mount]\n"
-        f"What={quote_unit_path(what)}\n"
-        f"Where={quote_unit_path(where)}\n"
+        f"What={mount_unit_path(what)}\n"
+        f"Where={mount_unit_path(where)}\n"
         "Type=none\n"
-        "Options=bind\n"
+        "Options=bind,nofail\n"
         "\n"
         "[Install]\n"
         "WantedBy=multi-user.target\n"
@@ -338,6 +347,9 @@ def _where_from_unit(text: str) -> Path | None:
         raw = line.split("=", 1)[1].strip()
         if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
             raw = raw[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        else:
+            # New units write a literal percent as %%. Legacy quoted units do not.
+            raw = raw.replace("%%", "%")
         return Path(raw) if raw else None
     return None
 
