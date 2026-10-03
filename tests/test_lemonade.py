@@ -111,16 +111,20 @@ def _refuse_lemonade_socket(address: object, *args: object, **kwargs: object) ->
 
 
 def setUpModule() -> None:
-    global _systemctl_guard, _http_guard, _socket_guard
+    global _systemctl_guard, _http_guard, _socket_guard, _state_guard
     _systemctl_guard = patch("lemonade.subprocess.run", side_effect=_refuse_host_systemctl)
     _http_guard = patch("lemonade.urllib.request.urlopen", side_effect=_refuse_lemonade_http)
     _socket_guard = patch("socket.create_connection", side_effect=_refuse_lemonade_socket)
+    # Publish creates /var/lib/ubuntuai before it unmounts. Unit tests are not root.
+    _state_guard = patch("lemonade._prepare_state_dirs")
     _systemctl_guard.start()
     _http_guard.start()
     _socket_guard.start()
+    _state_guard.start()
 
 
 def tearDownModule() -> None:
+    _state_guard.stop()
     _socket_guard.stop()
     _http_guard.stop()
     _systemctl_guard.stop()
@@ -1366,7 +1370,12 @@ class LemonadePublishTests(unittest.TestCase):
             _write_gguf(root / "chat.gguf")
             _write_gguf(emb / "embed.gguf")
             dest = Path(tmp) / "ubuntuai-models"
-            state = {"text": f"12 1 0:1 / {emb} rw - tmpfs tmpfs rw\n"}
+            state = {
+                "text": (
+                    f"12 1 0:46 / {emb} ro,nosuid,nodev,noexec - "
+                    "tmpfs tmpfs ro,size=64k,mode=555\n"
+                )
+            }
             cmds: list[list[str]] = []
 
             def read() -> str:
@@ -1405,7 +1414,10 @@ class LemonadePublishTests(unittest.TestCase):
             _write_gguf(root / "chat.gguf")
             _write_gguf(emb / "embed.gguf")
             dest = Path(tmp) / "ubuntuai-models"
-            text = f"12 1 0:1 / {emb} rw - tmpfs tmpfs rw\n"
+            text = (
+                f"12 1 0:46 / {emb} ro,nosuid,nodev,noexec - "
+                "tmpfs tmpfs ro,size=64k,mode=555\n"
+            )
 
             def run(cmd: list[str]) -> SimpleNamespace:
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -2078,6 +2090,591 @@ class LemonadePublishTests(unittest.TestCase):
         self.assertEqual(APPLY_PUBLISH_VERB, "lemonade-publish")
         action = Action("lemonade", "publish GGUF files to Lemonade", ("owner",))
         self.assertEqual(action.kind, "lemonade")
+
+    def test_systemd_path_escape_matches_known_names(self) -> None:
+        import lemonade
+
+        cases = {
+            Path("/var/lib/ubuntuai/stage"): "var-lib-ubuntuai-stage.mount",
+            Path("/tmp/AI models"): "tmp-AI\\x20models.mount",
+            Path("/tmp/100% models"): "tmp-100\\x25\\x20models.mount",
+            Path("/"): "-.mount",
+            Path("/tmp/foo-bar_baz.txt"): "tmp-foo\\x2dbar_baz.txt.mount",
+            Path("/tmp//foo/"): "tmp-foo.mount",
+            Path("/tmp/./foo"): "tmp-foo.mount",
+        }
+        for path, expected in cases.items():
+            self.assertEqual(lemonade._escape_mount(path), expected)
+        with self.assertRaises(RuntimeError) as ctx:
+            lemonade._escape_mount(Path("/tmp/foo/../bar"))
+        self.assertIn("systemd-escape failed", str(ctx.exception))
+
+    def test_second_publish_keeps_the_carried_cover(self) -> None:
+        import lemonade
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "AI models"
+            _write_gguf(root / "chat.gguf")
+            _write_gguf(root / "embeddings" / "embed.gguf")
+            dest = Path(tmp) / "ubuntuai-models"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            backup = Path(tmp) / "backups"
+            stage = STAGE_DIR.resolve()
+            dest_cover = dest / "chat" / "src0" / "embeddings"
+            stage_cover = stage / "src0" / "embeddings"
+            carried = "\n".join(
+                (
+                    f"10 1 0:1 / {stage} rw - ext4 /dev/sda1 rw",
+                    f"11 10 0:1 / {stage / 'src0'} rw - ext4 /dev/sda1 rw",
+                    (
+                        f"12 11 0:46 / {stage_cover} ro,nosuid,nodev,noexec shared:5 - "
+                        "tmpfs tmpfs ro,size=64k,mode=555"
+                    ),
+                    f"13 1 0:1 / {dest / 'chat' / 'src0'} rw - ext4 /dev/sda1 rw",
+                    (
+                        f"14 13 0:46 / {dest_cover} ro,nosuid,nodev,noexec master:5 - "
+                        "tmpfs tmpfs ro,size=64k,mode=555"
+                    ),
+                )
+            )
+            phase = {"second": False}
+            cmds: list[list[str]] = []
+            dropped: list[Path] = []
+
+            def read() -> str:
+                return carried if phase["second"] else ""
+
+            def run(cmd: list[str]) -> SimpleNamespace:
+                cmds.append(list(cmd))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def record_drop(where: Path, dest_arg: Path) -> None:
+                dropped.append(where)
+
+            target = _target(home, extra=(), model_root=root)
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                patch("lemonade.UNIT_BACKUP_DIR", backup),
+                patch("lemonade._ledger_dir_is_trusted", return_value=True),
+                patch("lemonade._read_mountinfo_text", side_effect=read),
+                patch("lemonade._run", side_effect=run),
+                patch("lemonade._drop_bind_unit", side_effect=record_drop),
+                patch("lemonade._write_bind_unit", return_value="unit.mount"),
+                patch("lemonade._write_cover_unit", return_value="cover.mount"),
+                patch("lemonade._set_extra_models_dir"),
+                _quiet_daemon(),
+                patch("lemonade.report_load_tuning", return_value=""),
+            ):
+                publish(target)
+                (unit_dir / "carried.mount").write_text(
+                    cover_unit_text(dest_cover, "parent.mount"),
+                    encoding="utf-8",
+                )
+                phase["second"] = True
+                cmds.clear()
+                dropped.clear()
+                publish(target)
+                self.assertTrue(
+                    lemonade._is_carried_rbind_mount(
+                        dest_cover,
+                        _snap_mount_plan(target, dest, gguf_sources(target)),
+                    )
+                )
+            self.assertEqual(dropped, [])
+            self.assertIn(["systemctl", "disable", "carried.mount"], cmds)
+            self.assertNotIn(["systemctl", "disable", "--now", "carried.mount"], cmds)
+            umounted = [
+                cmd for cmd in cmds if cmd and cmd[0] == "umount" and str(dest_cover) in cmd
+            ]
+            self.assertEqual(umounted, [])
+            self.assertFalse((unit_dir / "carried.mount").exists())
+
+    def test_publish_remounts_embeddings_captured_as_tmpfs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "AI models"
+            _write_gguf(root / "chat.gguf")
+            _write_gguf(root / "embeddings" / "embed.gguf")
+            dest = Path(tmp) / "ubuntuai-models"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            emb_where = dest / "embeddings"
+            _seed_unit(unit_dir, root / "embeddings", emb_where, "emb.mount")
+            state = {
+                "text": (
+                    f"20 1 0:46 / {emb_where} ro,nosuid,nodev,noexec - "
+                    "tmpfs tmpfs ro,size=64k,mode=555\n"
+                )
+            }
+            cmds: list[list[str]] = []
+            wrote: list[Path] = []
+
+            def read() -> str:
+                return state["text"]
+
+            def run(cmd: list[str]) -> SimpleNamespace:
+                cmds.append(list(cmd))
+                if cmd[:1] == ["umount"] and len(cmd) > 1 and cmd[1] == str(emb_where):
+                    state["text"] = ""
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def bind(what: Path, where: Path) -> str:
+                wrote.append(where)
+                return "unit.mount"
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                patch("lemonade._read_mountinfo_text", side_effect=read),
+                patch("lemonade._run", side_effect=run),
+                patch("lemonade._write_bind_unit", side_effect=bind),
+                patch("lemonade._write_cover_unit", return_value="cover.mount"),
+                patch("lemonade._set_extra_models_dir"),
+                _quiet_daemon(),
+                patch("lemonade.report_load_tuning", return_value=""),
+            ):
+                publish(_target(home, extra=(), model_root=root))
+            self.assertIn(["systemctl", "stop", "emb.mount"], cmds)
+            self.assertIn(["umount", str(emb_where)], cmds)
+            self.assertLess(
+                cmds.index(["umount", str(emb_where)]),
+                len(cmds),
+            )
+            self.assertIn(emb_where, wrote)
+            stop_at = cmds.index(["systemctl", "stop", "emb.mount"])
+            umount_at = cmds.index(["umount", str(emb_where)])
+            self.assertLess(stop_at, umount_at)
+
+    def test_publish_remounts_embeddings_when_the_directory_differs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "AI models"
+            _write_gguf(root / "chat.gguf")
+            _write_gguf(root / "embeddings" / "embed.gguf")
+            dest = Path(tmp) / "ubuntuai-models"
+            emb_where = dest / "embeddings"
+            emb_where.mkdir(parents=True)
+            state = {"text": f"20 1 8:1 /other {emb_where} rw - ext4 /dev/sdb1 rw\n"}
+            cmds: list[list[str]] = []
+
+            def read() -> str:
+                return state["text"]
+
+            def run(cmd: list[str]) -> SimpleNamespace:
+                cmds.append(list(cmd))
+                if cmd[:1] == ["umount"] and len(cmd) > 1 and cmd[1] == str(emb_where):
+                    state["text"] = ""
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade._read_mountinfo_text", side_effect=read),
+                patch("lemonade._run", side_effect=run),
+                patch("lemonade._write_bind_unit", return_value="unit.mount"),
+                patch("lemonade._write_cover_unit", return_value="cover.mount"),
+                patch("lemonade._set_extra_models_dir"),
+                _quiet_daemon(),
+                patch("lemonade.report_load_tuning", return_value=""),
+            ):
+                publish(_target(home, extra=(), model_root=root))
+            self.assertIn(["umount", str(emb_where)], cmds)
+
+    def test_publish_leaves_a_user_tmpfs_on_embeddings(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "models"
+            emb = root / "embeddings"
+            kept = _write_gguf(emb / "embed.gguf")
+            _write_gguf(root / "chat.gguf")
+            dest = Path(tmp) / "ubuntuai-models"
+            text = f"12 1 0:46 / {emb} rw,relatime - tmpfs tmpfs rw,size=1024k\n"
+            cmds: list[list[str]] = []
+
+            def run(cmd: list[str]) -> SimpleNamespace:
+                cmds.append(list(cmd))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade._read_mountinfo_text", return_value=text),
+                patch("lemonade._run", side_effect=run),
+                patch("lemonade._write_bind_unit", side_effect=AssertionError("write")),
+                patch("lemonade._set_extra_models_dir", side_effect=AssertionError("set")),
+                _quiet_daemon(),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    publish(_target(home, extra=(), model_root=root))
+            message = str(ctx.exception)
+            self.assertIn("not the empty cover", message)
+            self.assertIn("stays as it is", message)
+            self.assertNotIn("Traceback", message)
+            self.assertFalse(any(cmd and cmd[0] == "umount" for cmd in cmds))
+            self.assertEqual(kept.read_bytes(), b"G" * 2048)
+
+    def test_publish_refuses_a_cover_shared_only_with_a_foreign_mount(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "models"
+            emb = root / "embeddings"
+            _write_gguf(root / "chat.gguf")
+            _write_gguf(emb / "embed.gguf")
+            dest = Path(tmp) / "ubuntuai-models"
+            foreign = Path(tmp) / "foreign"
+            text = "\n".join(
+                (
+                    (
+                        f"12 1 0:46 / {emb} ro,nosuid,nodev,noexec shared:9 - "
+                        "tmpfs tmpfs ro,size=64k,mode=555"
+                    ),
+                    f"13 1 0:46 / {foreign} rw shared:9 - ext4 /dev/sdb1 rw",
+                )
+            )
+            cmds: list[list[str]] = []
+
+            def run(cmd: list[str]) -> SimpleNamespace:
+                cmds.append(list(cmd))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade._read_mountinfo_text", return_value=text),
+                patch("lemonade._run", side_effect=run),
+                patch("lemonade._write_bind_unit", side_effect=AssertionError("write")),
+                _quiet_daemon(),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    publish(_target(home, extra=(), model_root=root))
+            self.assertIn("not the empty cover", str(ctx.exception))
+            self.assertFalse(any(cmd and cmd[0] == "umount" for cmd in cmds))
+
+            owned = "\n".join(
+                (
+                    (
+                        f"12 1 0:46 / {emb} ro,nosuid,nodev,noexec shared:9 - "
+                        "tmpfs tmpfs ro,size=64k,mode=555"
+                    ),
+                    (
+                        f"13 1 0:46 / {dest / 'chat' / 'src0' / 'embeddings'} "
+                        "ro,nosuid,nodev,noexec shared:9 - tmpfs tmpfs ro,size=64k,mode=555"
+                    ),
+                )
+            )
+            cleared = {"text": owned}
+
+            def read() -> str:
+                return cleared["text"]
+
+            def clear(cmd: list[str]) -> SimpleNamespace:
+                cmds.append(list(cmd))
+                if cmd and cmd[0] == "umount":
+                    cleared["text"] = ""
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            cmds.clear()
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade._read_mountinfo_text", side_effect=read),
+                patch("lemonade._run", side_effect=clear),
+                patch("lemonade._write_bind_unit", return_value="unit.mount"),
+                patch("lemonade._write_cover_unit", return_value="cover.mount"),
+                patch("lemonade._set_extra_models_dir"),
+                _quiet_daemon(),
+                patch("lemonade.report_load_tuning", return_value=""),
+            ):
+                msg = publish(_target(home, extra=(), model_root=root))
+            self.assertIn("Removed a temporary filesystem", msg)
+            self.assertIn(["umount", str(emb)], cmds)
+
+    def test_publish_creates_the_state_folder_before_unmount(self) -> None:
+        _state_guard.stop()
+        try:
+            with TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                real = home / "AI models"
+                _write_gguf(real / "tiny.gguf")
+                dest = Path(tmp) / "ubuntuai-models"
+                unit_dir = Path(tmp) / "units"
+                unit_dir.mkdir()
+                _seed_unit(unit_dir, real, dest, "dest.mount")
+                state = Path(tmp) / "state"
+                stage = state / "stage"
+                backup = state / "backups"
+                seen = {"umount": False}
+
+                def run(cmd: list[str]) -> SimpleNamespace:
+                    if cmd and cmd[0] == "umount":
+                        self.assertTrue(stage.is_dir())
+                        self.assertTrue(backup.is_dir())
+                        seen["umount"] = True
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                def wheres() -> tuple[Path, ...]:
+                    if seen["umount"]:
+                        return ()
+                    return (dest,)
+
+                with (
+                    patch("lemonade.detect", return_value="snap"),
+                    patch("lemonade.extra_dir", return_value=dest),
+                    patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                    patch("lemonade.STAGE_DIR", stage),
+                    patch("lemonade.UNIT_BACKUP_DIR", backup),
+                    patch("lemonade._ledger_dir_is_trusted", return_value=True),
+                    patch("lemonade._mounted_wheres", side_effect=wheres),
+                    patch("lemonade._run", side_effect=run),
+                    patch("lemonade._write_bind_unit", return_value="unit.mount"),
+                    patch("lemonade._set_extra_models_dir"),
+                    _quiet_daemon(),
+                    patch("lemonade.report_load_tuning", return_value=""),
+                ):
+                    publish(_target(home))
+                self.assertTrue(seen["umount"])
+                self.assertTrue(stage.is_dir())
+        finally:
+            _state_guard.start()
+
+    def test_publish_stops_before_unmount_when_the_state_folder_is_unsafe(self) -> None:
+        _state_guard.stop()
+        try:
+            with TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                root = home / "models"
+                emb = root / "embeddings"
+                _write_gguf(root / "chat.gguf")
+                _write_gguf(emb / "embed.gguf")
+                dest = Path(tmp) / "ubuntuai-models"
+                unit_dir = Path(tmp) / "units"
+                unit_dir.mkdir()
+                unit = _seed_unit(unit_dir, root, dest, "dest.mount")
+                state = Path(tmp) / "state"
+                text = (
+                    f"12 1 0:46 / {emb} ro,nosuid,nodev,noexec - "
+                    "tmpfs tmpfs ro,size=64k,mode=555\n"
+                )
+                cmds: list[list[str]] = []
+
+                def run(cmd: list[str]) -> SimpleNamespace:
+                    cmds.append(list(cmd))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                with (
+                    patch("lemonade.detect", return_value="snap"),
+                    patch("lemonade.extra_dir", return_value=dest),
+                    patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                    patch("lemonade.STAGE_DIR", state / "stage"),
+                    patch("lemonade.UNIT_BACKUP_DIR", state / "backups"),
+                    patch("lemonade._ledger_dir_is_trusted", return_value=False),
+                    patch("lemonade._read_mountinfo_text", return_value=text),
+                    patch("lemonade._run", side_effect=run),
+                    patch("lemonade._write_bind_unit", side_effect=AssertionError("write")),
+                    _quiet_daemon(),
+                ):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        publish(_target(home, extra=(), model_root=root))
+                self.assertIn("not safe", str(ctx.exception))
+                self.assertTrue(unit.is_file())
+                self.assertFalse(any(cmd and cmd[0] == "umount" for cmd in cmds))
+        finally:
+            _state_guard.start()
+
+    def test_publish_plan_mentions_the_embeddings_cover_leak(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "models"
+            emb = root / "embeddings"
+            _write_gguf(root / "chat.gguf")
+            _write_gguf(emb / "embed.gguf")
+            dest = Path(tmp) / "ubuntuai-models"
+            cover = (
+                f"12 1 0:46 / {emb} ro,nosuid,nodev,noexec - "
+                "tmpfs tmpfs ro,size=64k,mode=555\n"
+            )
+            foreign = f"12 1 0:46 / {emb} rw,relatime - tmpfs tmpfs rw,size=1024k\n"
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade._read_mountinfo_text", return_value=cover),
+                patch("lemonade.load_tuning", return_value={}),
+            ):
+                text = publish_plan(_target(home, extra=(), model_root=root))
+            self.assertIn(f"Remove the empty cover that is hiding {emb}.", text)
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade._read_mountinfo_text", return_value=foreign),
+                patch("lemonade.load_tuning", return_value={}),
+            ):
+                text = publish_plan(_target(home, extra=(), model_root=root))
+            self.assertIn("not the empty cover", text)
+            self.assertIn("stays as it is", text)
+            self.assertNotIn("Remove the empty cover", text)
+
+    def test_unit_backups_keep_the_latest_ten(self) -> None:
+        import lemonade
+
+        with TemporaryDirectory() as tmp:
+            backup = Path(tmp) / "backups"
+            backup.mkdir()
+            unit = Path(tmp) / "src0.mount"
+            unit.write_text(mount_unit_text(Path(tmp) / "models", Path(tmp) / "dest"), encoding="utf-8")
+            for index in range(12):
+                (backup / f"src0.mount.20200101T000000{index:06d}Z").write_text(
+                    "old", encoding="utf-8"
+                )
+            (backup / "src0.mount.keep-link").symlink_to(unit.name)
+            with (
+                patch("lemonade.UNIT_BACKUP_DIR", backup),
+                patch("lemonade._ledger_dir_is_trusted", return_value=True),
+            ):
+                lemonade._backup_unit_file(unit)
+            kept = sorted(
+                path.name
+                for path in backup.iterdir()
+                if path.is_file() and path.name.startswith("src0.mount.")
+            )
+            self.assertEqual(len(kept), 10)
+            self.assertTrue(kept[-1].startswith("src0.mount.20"))
+            self.assertGreater(kept[-1], "src0.mount.20200101T000000000011Z")
+            self.assertTrue((backup / "src0.mount.keep-link").is_symlink())
+            self.assertFalse((backup / "src0.mount.20200101T000000000000Z").exists())
+
+    def test_prepare_stage_dir_closes_directory_fds(self) -> None:
+        import lemonade
+
+        def fd_count() -> int:
+            return len(os.listdir("/proc/self/fd"))
+
+        _state_guard.stop()
+        try:
+            before = fd_count()
+            with TemporaryDirectory() as tmp:
+                state = Path(tmp) / "state"
+                with (
+                    patch("lemonade.STAGE_DIR", state / "stage"),
+                    patch("lemonade.UNIT_BACKUP_DIR", state / "backups"),
+                    patch("lemonade._ledger_dir_is_trusted", return_value=True),
+                ):
+                    lemonade._prepare_stage_dir()
+                    lemonade._prepare_stage_dir()
+                    self.assertEqual(fd_count(), before)
+        finally:
+            _state_guard.start()
+
+    def test_mount_fallback_replaces_a_wrong_mount_and_skips_a_current_one(self) -> None:
+        import lemonade
+
+        calls: list[list[str]] = []
+
+        def run(cmd: list[str]) -> SimpleNamespace:
+            calls.append(list(cmd))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("lemonade._run", side_effect=run),
+            patch("lemonade._mount_is_current", return_value=True),
+        ):
+            self.assertIsNone(
+                lemonade._mount_with_command(Path("/src"), Path("/dst"), "bind,nofail")
+            )
+        self.assertEqual(calls, [])
+        mounted = {"on": True}
+
+        def current(what: Path, where: Path, options: str) -> bool:
+            return False
+
+        def is_mount(where: Path) -> bool:
+            return mounted["on"] and where == Path("/dst")
+
+        def replace(cmd: list[str]) -> SimpleNamespace:
+            calls.append(list(cmd))
+            if cmd and cmd[0] == "umount":
+                mounted["on"] = False
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        calls.clear()
+        with (
+            patch("lemonade._run", side_effect=replace),
+            patch("lemonade._mount_is_current", side_effect=current),
+            patch("lemonade._is_mountpoint", side_effect=is_mount),
+        ):
+            lemonade._mount_with_command(Path("/src"), Path("/dst"), "bind,nofail")
+        self.assertEqual(calls[0][:1], ["umount"])
+        self.assertEqual(calls[1][:1], ["mount"])
+
+    def test_busy_unmount_puts_the_embeddings_cover_back(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "ubuntuai-models"
+            where = dest / "chat" / "src0"
+            child = where / "embeddings"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            unit = _seed_unit(unit_dir, Path(tmp) / "AI models", where, "src0.mount")
+            state = {"child": True}
+
+            def read() -> str:
+                lines = [f"30 1 0:1 / {where} rw - ext4 /dev/sda1 rw"]
+                if state["child"]:
+                    lines.append(
+                        f"31 30 0:46 / {child} ro,nosuid,nodev,noexec - "
+                        "tmpfs tmpfs ro,size=64k,mode=555"
+                    )
+                return "\n".join(lines) + "\n"
+
+            cmds: list[list[str]] = []
+
+            def run(cmd: list[str]) -> SimpleNamespace:
+                cmds.append(list(cmd))
+                if cmd[:1] == ["umount"] and len(cmd) > 1 and cmd[1] == str(child):
+                    state["child"] = False
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd[:1] == ["mount"]:
+                    state["child"] = True
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                patch("lemonade._read_mountinfo_text", side_effect=read),
+                patch("lemonade._run", side_effect=run),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _drop_bind_unit(where, dest)
+            self.assertIn("still mounted", str(ctx.exception))
+            self.assertNotIn("was removed", str(ctx.exception))
+            self.assertTrue(unit.is_file())
+            self.assertTrue(any(cmd[:1] == ["mount"] for cmd in cmds))
+            self.assertTrue(state["child"])
+
+            state["child"] = True
+            cmds.clear()
+
+            def fail_restore(cmd: list[str]) -> SimpleNamespace:
+                cmds.append(list(cmd))
+                if cmd[:1] == ["umount"] and len(cmd) > 1 and cmd[1] == str(child):
+                    state["child"] = False
+                if cmd[:1] == ["mount"]:
+                    return SimpleNamespace(returncode=32, stdout="", stderr="busy")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                patch("lemonade._read_mountinfo_text", side_effect=read),
+                patch("lemonade._run", side_effect=fail_restore),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _drop_bind_unit(where, dest)
+            message = str(ctx.exception)
+            self.assertIn("was removed", message)
+            self.assertIn("Run publish again", message)
+            self.assertIn(str(child), message)
 
 
 def _vulkan_igpu(ram_gib: int = 122) -> Hardware:
