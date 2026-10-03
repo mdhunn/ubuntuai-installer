@@ -747,8 +747,11 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 def _escape_mount(where: Path) -> str:
     """systemd-escape --path --suffix=mount, without calling the binary.
 
-    Slash-replacement dashes stay literal. Every other byte outside ASCII
-    letters, digits, and :_. is \\xHH of its UTF-8 encoding. ".." is rejected.
+    Repeated slashes, a trailing slash, and "." segments collapse. A path
+    with no leading slash is taken from the root. A leading dot on the first
+    component is \\x2e. Later dots stay. Slash-replacement dashes stay
+    literal. Every other byte outside ASCII letters, digits, and :_. is
+    \\xHH of its UTF-8 encoding. ".." is rejected.
     """
     raw = str(where)
     if not raw.startswith("/"):
@@ -766,7 +769,11 @@ def _escape_mount(where: Path) -> str:
     for index, part in enumerate(parts):
         if index:
             chunks.append("-")
-        for ch in part:
+        body = part
+        if index == 0 and body.startswith("."):
+            chunks.append("\\x2e")
+            body = body[1:]
+        for ch in body:
             if ch.isascii() and (ch.isalnum() or ch in ":_."):
                 chunks.append(ch)
                 continue
@@ -1214,26 +1221,39 @@ def _peer_ids(row: _MountRow) -> set[str]:
     return found
 
 
-def _cover_peer_is_ours(row: _MountRow, dest: Path, rows: tuple[_MountRow, ...]) -> bool:
-    """A shared cover must have an installer mount in the same peer group.
+def _is_installer_cover_where(dest: Path, where: Path) -> bool:
+    """True for dest/chat/srcN/embeddings or the stage cover stage/srcN/embeddings.
 
-    No peer tag, or a peer group with only this mount, is the last remnant
-    of our cover. A peer group shared only with someone else's mounts is not.
+    dest/embeddings is the real embeddings bind. A peer there is not a cover.
+    """
+    where = _resolve(where)
+    if where.name != "embeddings":
+        return False
+    if _is_stage_src(where.parent):
+        return True
+    dest = _resolve(dest)
+    try:
+        rel = where.relative_to(dest)
+    except ValueError:
+        return False
+    return len(rel.parts) == 3 and rel.parts[0] == "chat" and _is_srcn(rel.parts[1])
+
+
+def _cover_peer_is_ours(row: _MountRow, dest: Path, rows: tuple[_MountRow, ...]) -> bool:
+    """True when this tmpfs shares a peer group with an installer cover.
+
+    The peer has to sit on a cover location and carry the cover options.
+    An exact cover signature with no such peer is the user's own tmpfs.
     """
     ids = _peer_ids(row)
     if not ids:
-        return True
-    others = [
-        other
-        for other in rows
-        if other.mount_id != row.mount_id and _peer_ids(other) & ids
-    ]
-    if not others:
-        return True
-    for other in others:
-        if _is_owned_stage_where(other.mountpoint) or is_owned_lemonade_where(
-            dest, other.mountpoint
-        ):
+        return False
+    for other in rows:
+        if other.mount_id == row.mount_id or not (_peer_ids(other) & ids):
+            continue
+        if not _is_cover_signature(other):
+            continue
+        if _is_installer_cover_where(dest, other.mountpoint):
             return True
     return False
 
@@ -1374,6 +1394,49 @@ def _mount_with_command(
     return _run(list(propagation_command(BindMount(what, where, options))))
 
 
+def _covering_mount(path: Path) -> _MountRow | None:
+    resolved = _resolve(path)
+    best: _MountRow | None = None
+    best_len = -1
+    for row in _mount_rows():
+        point = _resolve(row.mountpoint)
+        if resolved != point and point not in resolved.parents:
+            continue
+        length = len(point.parts)
+        if length > best_len:
+            best = row
+            best_len = length
+    return best
+
+
+def _path_on_mount(row: _MountRow, path: Path) -> str:
+    """mountinfo root of path, using the mount that contains it."""
+    point = _resolve(row.mountpoint)
+    resolved = _resolve(path)
+    rel = "" if resolved == point else resolved.relative_to(point).as_posix()
+    base = row.root.rstrip("/")
+    if not rel:
+        return base or "/"
+    if base in ("", "/"):
+        return "/" + rel
+    return f"{base}/{rel}"
+
+
+def _mountinfo_is_real_source(where: Path, what: Path) -> bool:
+    """True when where's mount is the filesystem object at what.
+
+    A tmpfs model folder and the installer cover both show up as tmpfs.
+    The device id plus the root inside that filesystem tell them apart.
+    """
+    here = _row_at(where)
+    there = _covering_mount(what)
+    if here is None or there is None:
+        return False
+    if here.dev != there.dev or here.source != there.source:
+        return False
+    return here.root == _path_on_mount(there, what)
+
+
 def _embeddings_bind_is_stale(mount: BindMount) -> bool:
     if _is_cover(mount) or mount.where.name != "embeddings":
         return False
@@ -1382,9 +1445,16 @@ def _embeddings_bind_is_stale(mount: BindMount) -> bool:
     if not _is_mountpoint(mount.where):
         return False
     row = _row_at(mount.where)
-    if row is not None and row.fstype == "tmpfs":
-        return True
+    # A bind of a tmpfs model folder keeps that folder's st_dev and st_ino.
+    # The installer cover is a different tmpfs. When the directories cannot
+    # be stated, the mountinfo device, source, and root are the same check.
     same = _same_directory(mount.where, mount.what)
+    if same is True:
+        return False
+    if row is not None and row.fstype == "tmpfs":
+        if same is None and _mountinfo_is_real_source(mount.where, mount.what):
+            return False
+        return True
     if same is not None:
         return not same
     if row is None:
