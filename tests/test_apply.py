@@ -5,6 +5,7 @@ import pwd
 import shlex
 import subprocess
 import unittest
+import urllib.error
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -395,6 +396,48 @@ class ApplyTests(unittest.TestCase):
                 self.target.home, uid=self.target.uid, gid=self.target.gid
             )
             self.assertIn("Finished.", log_file.read_text(encoding="utf-8"))
+
+    def test_failed_weight_download_keeps_the_existing_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = home / "AI models"
+            dest = store / "gguf" / "Qwen3-0.6B-Q8_0.gguf"
+            dest.parent.mkdir(parents=True)
+            payload = b"user-file" * 10000
+            dest.write_bytes(payload)
+            target = UserTarget(
+                name="tester",
+                uid=os.getuid(),
+                gid=os.getgid(),
+                home=home,
+                model_root=store,
+            )
+            actions = (
+                Action(
+                    "weights",
+                    "copy or download required weights",
+                    ("qwen3-0.6b-q8_0",),
+                ),
+            )
+
+            class PW:
+                pw_name = "tester"
+                pw_uid = os.getuid()
+                pw_gid = os.getgid()
+                pw_dir = str(home)
+
+            with (
+                patch("apply.pwd.getpwnam", return_value=PW()),
+                patch("apply.saved_scan_folders", return_value=()),
+                patch(
+                    "weights.urllib.request.urlopen",
+                    side_effect=urllib.error.URLError("offline"),
+                ),
+            ):
+                with self.assertRaises(ApplyError):
+                    execute_plan(actions, target, hw=_hw_strix(), dry_run=False)
+            self.assertEqual(dest.read_bytes(), payload)
+            self.assertFalse(dest.with_name(dest.name + ".part").exists())
 
     def test_execute_plan_relays_weight_download_strings(self) -> None:
         ticks = (

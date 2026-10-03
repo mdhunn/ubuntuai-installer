@@ -28,38 +28,13 @@ ENV_FILE="${{UBUNTUAI_ENV_FILE:-/etc/ubuntuai/ubuntuai.env}}"
 CONFIG="${{XDG_CONFIG_HOME:-$HOME/.config}}/ubuntuai/config.json"
 LEGACY="$HOME/{legacy_name}"
 
-expand_tilde() {{
-  case "$1" in
-    "~")
-      printf %s "$HOME"
-      ;;
-    "~/"*)
-      rest=${{1#"~/"}}
-      printf %s "$HOME/$rest"
-      ;;
-    *)
-      printf %s "$1"
-      ;;
-  esac
-}}
-
-root=""
-if [ -f "$CONFIG" ]; then
-  raw=$(python3 -c 'import json,sys,os
-p=sys.argv[1]
+accept_under_home() {{
+  python3 -c 'import sys,os
+raw=sys.argv[1]
 home=sys.argv[2]
-try:
-    fh=open(p,encoding="utf-8")
-    data=json.load(fh)
-    fh.close()
-except Exception:
+root=raw.strip()
+if not root:
     raise SystemExit(1)
-if not isinstance(data,dict):
-    raise SystemExit(1)
-root=data.get("model_root")
-if not isinstance(root,str) or not root.strip():
-    raise SystemExit(1)
-root=root.strip()
 if root=="~":
     root=home
 elif root.startswith("~/"):
@@ -76,18 +51,46 @@ except OSError:
 if os.path.commonpath((home_real,root_real))!=home_real:
     raise SystemExit(1)
 sys.stdout.write(root)
-' "$CONFIG" "$HOME" 2>/dev/null) || raw=""
+' "$1" "$HOME" 2>/dev/null
+}}
+
+root=""
+if [ -f "$CONFIG" ]; then
+  raw=$(python3 -c 'import json,sys
+p=sys.argv[1]
+try:
+    fh=open(p,encoding="utf-8")
+    data=json.load(fh)
+    fh.close()
+except Exception:
+    raise SystemExit(1)
+if not isinstance(data,dict):
+    raise SystemExit(1)
+root=data.get("model_root")
+if not isinstance(root,str) or not root.strip():
+    raise SystemExit(1)
+sys.stdout.write(root.strip())
+' "$CONFIG" 2>/dev/null) || raw=""
   if [ -n "$raw" ]; then
-    root=$raw
+    accepted=$(accept_under_home "$raw") || accepted=""
+    if [ -n "$accepted" ]; then
+      root=$accepted
+    fi
   fi
 fi
 if [ -z "$root" ] && [ -n "${{UBUNTUAI_MODELS:-}}" ]; then
-  root=$(expand_tilde "$UBUNTUAI_MODELS")
+  accepted=$(accept_under_home "$UBUNTUAI_MODELS") || accepted=""
+  if [ -n "$accepted" ]; then
+    root=$accepted
+  fi
 fi
 if [ -z "$root" ] && [ -r "$ENV_FILE" ]; then
   raw=$(. "$ENV_FILE"; printf %s "${{UBUNTUAI_MODELS:-}}")
   if [ -n "$raw" ]; then
-    root=$(expand_tilde "$raw")
+    accepted=$(accept_under_home "$raw") || accepted=""
+    if [ -n "$accepted" ]; then
+      root=$accepted
+    fi
   fi
 fi
 if [ -z "$root" ]; then

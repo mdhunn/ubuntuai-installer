@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tarfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -98,15 +99,16 @@ def os_getgid() -> int:
 
 class EnsureWeightTests(unittest.TestCase):
     def test_copies_existing_filename(self) -> None:
-        model = next(
-            w for w in load_catalog(PKG / "weights.json") if w.id == "whisper-base-en"
+        model = replace(
+            next(w for w in load_catalog(PKG / "weights.json") if w.id == "whisper-base-en"),
+            bytes=128 * 1024,
         )
         with TemporaryDirectory() as tmp:
             home = Path(tmp)
             extra = home / "stash"
             extra.mkdir()
             blob = extra / model.filename
-            blob.write_bytes(b"g" * (128 * 1024))
+            blob.write_bytes(b"g" * model.bytes)
             os.chmod(blob, 0o777)
             store = home / "Models"
             store.mkdir()

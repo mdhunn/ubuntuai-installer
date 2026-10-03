@@ -526,7 +526,51 @@ class SpaceSafeOutputTests(unittest.TestCase):
             finally:
                 shutil.rmtree(decoy_root, ignore_errors=True)
 
-    def test_systemd_escape_round_trip_for_a_spaced_path(self) -> None:
+    def test_launcher_env_outside_home_falls_through(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            outside = Path(tmp + "-out")
+            outside.mkdir()
+            lib = home / "lib"
+            self._fake_openmoss(lib)
+            decoy = self._gguf(outside / "openmoss", "decoy.gguf")
+            wanted = self._gguf(home / "From env" / "openmoss", "env.gguf")
+            legacy = self._gguf(home / "Models" / "openmoss", "legacy.gguf")
+            env_path = home / "ubuntuai.env"
+            env_path.write_text(
+                f"UBUNTUAI_MODELS={shlex.quote(str(home / 'From env'))}\n",
+                encoding="utf-8",
+            )
+            script = launcher_script(lib, 8081, home / "AI models")
+            env = self._launcher_env(home)
+            env["UBUNTUAI_ENV_FILE"] = str(env_path)
+            env["UBUNTUAI_MODELS"] = str(outside)
+            from_file = self._run_launcher(script, env)
+            self.assertEqual(from_file.returncode, 0, from_file.stderr)
+            self.assertEqual(from_file.stdout, str(wanted))
+            self.assertNotEqual(from_file.stdout, str(decoy))
+
+            env_path.write_text(
+                f"UBUNTUAI_MODELS={shlex.quote(str(outside))}\n",
+                encoding="utf-8",
+            )
+            env.pop("UBUNTUAI_MODELS")
+            from_legacy = self._run_launcher(script, env)
+            self.assertEqual(from_legacy.returncode, 0, from_legacy.stderr)
+            self.assertEqual(from_legacy.stdout, str(legacy))
+            self.assertNotEqual(from_legacy.stdout, str(decoy))
+
+            rel = self._gguf(home / "Rel models" / "openmoss", "rel.gguf")
+            env["UBUNTUAI_MODELS"] = "Rel models"
+            from_rel = self._run_launcher(script, env)
+            self.assertEqual(from_rel.returncode, 0, from_rel.stderr)
+            self.assertEqual(from_rel.stdout, str(rel))
+
+            env["UBUNTUAI_MODELS"] = f"../{outside.name}"
+            escaped = self._run_launcher(script, env)
+            self.assertEqual(escaped.returncode, 0, escaped.stderr)
+            self.assertEqual(escaped.stdout, str(legacy))
+            self.assertNotEqual(escaped.stdout, str(decoy))
         escape = shutil.which("systemd-escape")
         if not escape:
             self.skipTest("systemd-escape is not installed")
@@ -560,8 +604,8 @@ class LegacyWeightTests(unittest.TestCase):
             legacy_dir = home / "Models" / "whisper"
             legacy_dir.mkdir(parents=True)
             blob = legacy_dir / model.filename
-            payload = b"g" * (128 * 1024)
-            blob.write_bytes(payload)
+            blob.write_bytes(b"")
+            os.truncate(blob, model.bytes)
             root = home / "AI models"
             target = UserTarget(
                 name="tester",
@@ -586,7 +630,7 @@ class LegacyWeightTests(unittest.TestCase):
             self.assertTrue(any(line.startswith("copy ") for line in log))
             self.assertIn(str(blob), joined)
             self.assertIn(str(root / "whisper" / model.filename), joined)
-            self.assertEqual(blob.read_bytes(), payload)
+            self.assertEqual(blob.stat().st_size, model.bytes)
             self.assertFalse(blob.is_symlink())
             self.assertFalse((root / "whisper" / model.filename).exists())
             self.assertFalse(any(path.is_symlink() for path in home.rglob("*")))

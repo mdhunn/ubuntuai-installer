@@ -969,13 +969,6 @@ def _clear_copy_temp(dest: Path) -> None:
         pass
 
 
-def _discard_store_entry(path: Path) -> None:
-    if not path.exists() and not path.is_symlink():
-        return
-    kind = "dir" if path.is_dir() and not path.is_symlink() else "file"
-    _remove_source(path, kind)
-
-
 def _copy_bytes_needed(size: int) -> int:
     margin = max(COPY_FREE_MARGIN_MIN, size // 100)
     return size + margin
@@ -1012,8 +1005,23 @@ def _finish_store_file(path: Path, uid: int | None, gid: int | None) -> None:
         os.chown(path, uid, gid)
 
 
+def _open_part(part: Path):
+    """Create the temp file without following a symlink or truncating a name that exists."""
+    fd = os.open(
+        part,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o644,
+    )
+    try:
+        os.fchmod(fd, 0o644)
+    except OSError:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "wb")
+
+
 def _transfer_file(src: Path, part: Path) -> None:
-    with open(src, "rb") as rf, open(part, "wb") as wf:
+    with open(src, "rb") as rf, _open_part(part) as wf:
         while True:
             chunk = rf.read(1024 * 1024)
             if not chunk:
@@ -1178,75 +1186,70 @@ def catalog_dest(model: CatalogWeight, model_root: Path) -> Path:
     return model_root / model.subdir / model.filename
 
 
-def _catalog_file_complete(path: Path, model: CatalogWeight) -> bool:
-    """True when the store file matches the catalog size and published checksum.
+def _catalog_skip_reason(path: Path, model: CatalogWeight) -> str | None:
+    """Why this file cannot fill the catalog entry. None when it matches.
 
-    A short file left by a killed copy is not complete.
+    Size is checked first. A published checksum is checked when the catalog has one.
+    A short file left by a killed copy does not match.
     """
-    if not path.is_file() or path.is_symlink():
-        return False
+    if path.is_symlink() or not path.is_file():
+        return f"Skipped {path}. It is not a regular file."
     try:
         size = path.stat().st_size
     except OSError:
-        return False
+        return f"Skipped {path}. It could not be read."
     if size <= 0:
-        return False
+        return f"Skipped {path}. It is empty."
+    if model.bytes > 0 and size != model.bytes:
+        return (
+            f"Skipped {path}. It is {human_bytes(size)} and the catalog "
+            f"wants {human_bytes(model.bytes)}."
+        )
     published = model.published_hash()
     if published:
         try:
-            if hash_file(path, published.algo) != published.hexdigest.lower():
-                return False
+            digest = hash_file(path, published.algo)
         except (OSError, ValueError):
-            return False
-    if model.bytes > 0 and size != model.bytes:
-        return False
+            return f"Skipped {path}. Its checksum could not be read."
+        if digest != published.hexdigest.lower():
+            return f"Skipped {path}. Its checksum does not match the catalog."
     if model.bytes <= 0 and published is None:
-        return False
-    return True
+        return f"Skipped {path}. The catalog has no size or checksum to trust."
+    return None
 
 
-def _store_file_complete(
-    dest: Path, source: FoundWeight | None, model: CatalogWeight
-) -> bool:
-    if source is None:
-        return _catalog_file_complete(dest, model)
-    if not dest.is_file() or dest.is_symlink():
-        return False
-    try:
-        size = dest.stat().st_size
-        src_size = source.path.stat().st_size
-    except OSError:
-        return False
-    if size <= 0 or size != src_size:
-        return False
-    algo = integrity_algo_for(source)
-    try:
-        return hash_file(dest, algo) == hash_file(source.path, algo)
-    except (OSError, ValueError):
-        return False
+def _catalog_file_complete(path: Path, model: CatalogWeight) -> bool:
+    """True when the file matches the catalog size and published checksum."""
+    return _catalog_skip_reason(path, model) is None
 
 
-def _matching_source(
+def _acceptable_source(
     model: CatalogWeight,
     target: UserTarget,
     extra: tuple[Path, ...],
     dest: Path,
-) -> FoundWeight | None:
+) -> tuple[FoundWeight | None, str]:
+    """A found file that matches the catalog, plus why the first miss was skipped."""
     roots = scan_roots(target.home, target.model_root, extra)
     try:
         dest_real = dest.resolve() if dest.exists() or dest.is_symlink() else None
     except OSError:
         dest_real = None
+    skipped = ""
     for item in scan(roots, target.model_root):
-        if item.path.name != model.filename:
+        if item.kind != "file" or item.path.name != model.filename:
             continue
         try:
             if dest_real is not None and item.path.resolve() == dest_real:
                 continue
         except OSError:
             continue
-        return item
-    return None
+        reason = _catalog_skip_reason(item.path, model)
+        if reason is None:
+            return item, ""
+        if not skipped:
+            skipped = reason
+    return None, skipped
 
 
 def verify_download(
@@ -1297,12 +1300,11 @@ def download(
             return f"already {dest}"
     if dry_run:
         return f"download {model.id} -> {dest} ({human_bytes(model.bytes)})"
-    if dest.exists() or dest.is_symlink():
-        _discard_store_entry(dest)
+    # The final name stays until the temp file has been verified.
     dest.parent.mkdir(parents=True, exist_ok=True)
     if uid is not None and gid is not None:
         os.chown(dest.parent, uid, gid)
-    part = dest.with_name(dest.name + ".part")
+    part = _copy_part(dest)
     req = urllib.request.Request(model.url, headers={"User-Agent": UA})
     written = 0
     content_length = 0
@@ -1310,7 +1312,7 @@ def download(
         with urllib.request.urlopen(req, timeout=60) as resp:
             content_length = int(resp.headers.get("Content-Length") or 0)
             total = content_length or model.bytes
-            with open(part, "wb") as fh:
+            with _open_part(part) as fh:
                 while True:
                     chunk = resp.read(256 * 1024)
                     if not chunk:
@@ -1319,6 +1321,8 @@ def download(
                     written += len(chunk)
                     if on_progress:
                         on_progress(written, total)
+                fh.flush()
+                os.fsync(fh.fileno())
         want = expected or model.published_hash()
         published_size = 0
         if want is None:
@@ -1327,11 +1331,12 @@ def download(
         # Content-Length last. A truncated Xet body can advertise its own short length.
         want_size = published_size or model.bytes or content_length
         verify_download(part, model, expected=want, expected_size=want_size)
+        os.replace(part, dest)
+        _fsync_dir(dest.parent)
     except Exception:
-        part.unlink(missing_ok=True)
+        _clear_copy_temp(dest)
         raise
-    part.replace(dest)
-    if uid is not None and gid is not None:
+    if uid is not None and gid is not None and not dest.is_symlink():
         os.chown(dest, uid, gid)
     return f"downloaded {dest} ({human_bytes(written)})"
 
@@ -1346,42 +1351,51 @@ def ensure_weight(
 ) -> str:
     dest = catalog_dest(model, target.model_root)
     _clear_copy_temp(dest)
-    source = _matching_source(model, target, extra, dest)
-    # A short file at the final name is a killed copy. It is not the model.
-    if _store_file_complete(dest, source, model):
+    # The catalog is the check. A shorter file found on disk must not replace it.
+    if _catalog_file_complete(dest, model):
         return f"already {dest}"
+    source, skipped = _acceptable_source(model, target, extra, dest)
     # Copy or move places a real file in the store. A symlink is not offered.
     # Move removes the original and always asks, so Apply copies.
     if dry_run:
         if source is None:
-            return download(
+            planned = download(
                 model,
                 target.model_root,
                 uid=target.uid,
                 gid=target.gid,
                 dry_run=True,
             )
+            if skipped:
+                return f"{skipped} {planned}"
+            return planned
         return f"copy {source.path} -> {dest}"
-    if dest.exists() or dest.is_symlink():
-        _discard_store_entry(dest)
-    if source is None:
+    if source is not None:
+        algo = integrity_algo_for(source)
+        src_hash = hash_path(source.path, algo)
+        _copy_into_store(
+            source, dest, target.uid, target.gid, algo=algo, src_hash=src_hash
+        )
+        return f"copied {source.path} -> {dest}"
 
-        def prog(done: int, total: int) -> None:
-            if on_progress:
-                on_progress(
-                    f"Downloading {model.filename}: {human_bytes(done)} / {human_bytes(total)}"
-                )
+    def prog(done: int, total: int) -> None:
+        if on_progress:
+            on_progress(
+                f"Downloading {model.filename}: {human_bytes(done)} / {human_bytes(total)}"
+            )
 
-        return download(
+    try:
+        got = download(
             model,
             target.model_root,
             on_progress=prog,
             uid=target.uid,
             gid=target.gid,
         )
-    algo = integrity_algo_for(source)
-    src_hash = hash_path(source.path, algo)
-    _copy_into_store(
-        source, dest, target.uid, target.gid, algo=algo, src_hash=src_hash
-    )
-    return f"copied {source.path} -> {dest}"
+    except Exception as exc:
+        if skipped:
+            raise RuntimeError(f"{skipped} {exc}") from exc
+        raise
+    if skipped:
+        return f"{skipped} {got}"
+    return got
