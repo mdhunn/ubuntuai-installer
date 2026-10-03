@@ -10,12 +10,12 @@ import urllib.request
 from pathlib import Path
 
 from lemonade import (
+    APPLY_TUNE_VERB,
     check_model_updates,
     detect as lemonade_detect,
     largest_gguf_bytes,
     load_risk,
     load_tuning,
-    report_load_tuning,
     risk_english,
 )
 from probe import probe
@@ -288,8 +288,10 @@ def step_english(step: dict) -> str:
         )
     if kind == "lemonade_optimize":
         return (
-            "Tune Lemonade for large GGUF files: one model in memory, a bounded context, "
-            "a longer first-load timeout, and the GPU backend this machine already has."
+            "Tune Lemonade for large GGUF files. "
+            "A value you already set is kept, including how many models stay loaded. "
+            "Other settings get a bounded context, a longer first-load timeout, "
+            "and the GPU backend this machine already has."
         )
     if kind == "lemonade_update_models":
         return "Ask Lemonade to download newer copies of the models it already tracks."
@@ -363,6 +365,31 @@ def load_saved_plan(user: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _optimize_skipped_message() -> str:
+    return (
+        "Lemonade load settings were not changed. "
+        "Run Publish to apply the tuning."
+    )
+
+
+def _optimize_lemonade(user: str) -> str:
+    # The ledger is root-owned. A POST without that write later freezes as a user value.
+    from apply import run_privileged
+    from paths import helper_path
+
+    if os.geteuid() != 0 and (
+        shutil.which("pkexec") is None or not helper_path().is_file()
+    ):
+        return _optimize_skipped_message()
+    try:
+        rc, out = run_privileged(APPLY_TUNE_VERB, [user])
+    except OSError:
+        return _optimize_skipped_message()
+    if rc != 0:
+        return _optimize_skipped_message()
+    return out.strip()
+
+
 def execute_plan_steps(user: str, plan: dict | None, *, dry_run: bool = False) -> list[str]:
     t = target_for(user)
     hw = probe()
@@ -417,7 +444,7 @@ def execute_plan_steps(user: str, plan: dict | None, *, dry_run: bool = False) -
             )
             continue
         if kind == "lemonade_optimize":
-            text = report_load_tuning(t, hw)
+            text = _optimize_lemonade(user)
             log.extend(line for line in text.splitlines() if line)
             continue
         if kind == "lemonade_update_models":

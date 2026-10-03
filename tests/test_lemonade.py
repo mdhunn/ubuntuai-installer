@@ -1456,6 +1456,38 @@ class LemonadePublishTests(unittest.TestCase):
             self.assertEqual(events, ["start", "stop"])
             self.assertFalse(up["value"])
 
+    def test_unreadable_ledger_does_not_stop_publish(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            real = home / "AI models"
+            _write_gguf(real / "tiny.gguf")
+            dest = Path(tmp) / "snap-common" / "ubuntuai-models"
+
+            def urlopen(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError("tuning ran after an unreadable ledger")
+
+            with (
+                _quiet_daemon(),
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade._write_bind_unit", return_value="unit.mount"),
+                patch("lemonade._set_extra_models_dir"),
+                patch(
+                    "lemonade._load_ledger",
+                    side_effect=RuntimeError("The Lemonade settings folder is not safe to use."),
+                ),
+                patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
+                patch("lemonade.read_config", return_value=_merged_factory()),
+                patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
+                patch("lemonade.largest_gguf_bytes", return_value=105 * 1024**3),
+            ):
+                msg = publish(_target(home))
+            self.assertIn(str(dest), msg)
+            self.assertIn("could not be read", msg)
+            self.assertIn("still published", msg)
+            self.assertNotIn("Traceback", msg)
+            self.assertNotIn("did not accept", msg)
+
     def test_symlink_embeddings_skips_tmpfs_cover(self) -> None:
         with TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -2304,6 +2336,50 @@ class LemonadeLoadTuningTests(unittest.TestCase):
 
     def test_non_dict_ledger_is_no_ledger(self) -> None:
         self._corrupt_migrates(b"[1, 2]")
+
+    def test_ledger_write_failure_is_plain_english(self) -> None:
+        factory = _merged_factory()
+        state = json.loads(json.dumps(factory))
+        posts: list[dict] = []
+
+        class _Resp:
+            def __enter__(self) -> _Resp:
+                return self
+
+            def __exit__(self, *_args: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def read() -> dict:
+            return json.loads(json.dumps(state))
+
+        def urlopen(req: object, timeout: int = 3) -> _Resp:
+            body = json.loads(req.data.decode())  # type: ignore[attr-defined]
+            posts.append(body)
+            state.update(body)
+            return _Resp()
+
+        def boom(*_args: object, **_kwargs: object) -> None:
+            raise PermissionError(13, "Permission denied", "/var/lib/ubuntuai/lemonade-tuning.json")
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with (
+                patch("lemonade.read_config", side_effect=read),
+                patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
+                patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
+                patch("lemonade.largest_gguf_bytes", return_value=105 * 1024**3),
+                patch("lemonade.write_tuning_ledger", side_effect=boom),
+            ):
+                msg = report_load_tuning(_target(home), _vulkan_igpu(122), ledger_dir=home)
+        self.assertTrue(posts)
+        self.assertIn("could not be saved", msg)
+        self.assertIn("still published", msg)
+        self.assertNotIn("did not accept", msg)
+        self.assertNotIn("Errno", msg)
+        self.assertNotIn("Traceback", msg)
 
 
 class LemonadeLoadRiskTests(unittest.TestCase):

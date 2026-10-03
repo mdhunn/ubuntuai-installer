@@ -44,6 +44,7 @@ SNAP_COMMON = SNAP_LEMONADE_COMMON
 SNAP_EXTRA = SNAP_LEMONADE_MODELS
 LEMONADE_API = "http://127.0.0.1:13305"
 APPLY_PUBLISH_VERB = "lemonade-publish"
+APPLY_TUNE_VERB = "lemonade-tune"
 OWNED_UNIT_DESC = "Ubuntu AI models for Lemonade"
 SYSTEM_UNIT_DIR = Path("/etc/systemd/system")
 DAEMON_UNIT = "snap.lemonade-server.daemon"
@@ -1257,6 +1258,20 @@ def tuning_ledger_path(directory: Path | None = None) -> Path:
     return (directory if directory is not None else TUNING_LEDGER_DIR) / TUNING_LEDGER_NAME
 
 
+def _ledger_unreadable_message() -> str:
+    return (
+        "The saved Lemonade load settings could not be read. "
+        "Models are still published."
+    )
+
+
+def _ledger_write_failed_message() -> str:
+    return (
+        "The Lemonade settings record could not be saved. "
+        "Models are still published."
+    )
+
+
 def _ledger_dir_unsafe() -> str:
     return (
         "The Lemonade settings folder is not safe to use. "
@@ -1642,7 +1657,10 @@ def apply_tuning(
                 (p.stderr or p.stdout or "lemonade config set failed").strip()
             )
         cli = True
-    _remember_tuning(chosen, directory=ledger_dir, cli=cli)
+    try:
+        _remember_tuning(chosen, directory=ledger_dir, cli=cli)
+    except (OSError, RuntimeError):
+        return _with_ledger_warning(ledger_warning, _ledger_write_failed_message())
     ok, miss = verify_tuning(chosen, read_config())
     if not ok:
         return _with_ledger_warning(ledger_warning, miss)
@@ -1661,14 +1679,19 @@ def report_load_tuning(
     lines: list[str] = []
     current = read_config()
     factory = read_factory_defaults()
-    ledger, _ledger_warning = _load_ledger(ledger_dir)
+    ledger = None
     try:
-        lines.append(apply_tuning(settings, current, factory, ledger_dir))
+        ledger, _ledger_warning = _load_ledger(ledger_dir)
     except RuntimeError:
-        lines.append(
-            "Lemonade did not accept the load settings. "
-            "Models are still published."
-        )
+        lines.append(_ledger_unreadable_message())
+    else:
+        try:
+            lines.append(apply_tuning(settings, current, factory, ledger_dir))
+        except RuntimeError:
+            lines.append(
+                "Lemonade did not accept the load settings. "
+                "Models are still published."
+            )
     warn = risk_english(
         risk,
         ram_bytes=ram,

@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
+import io
+import json
+import shutil
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 from support import PKG  # noqa: F401
 
@@ -10,6 +17,7 @@ from unittest.mock import patch
 
 from domain import Device, Hardware, UserTarget
 from lemonade import load_tuning
+from main import cmd_upgrade
 from upgrade import (
     _sanitize,
     classical_plan,
@@ -187,24 +195,205 @@ class UpgradePlanTests(unittest.TestCase):
         why = next(s["why"] for s in plan["steps"] if s["kind"] == "lemonade_optimize")
         self.assertIn("--load-mode mmap", why)
         self.assertNotIn("refuse", format_plan(plan).lower())
+        text = step_english({"kind": "lemonade_optimize"})
+        self.assertNotIn("one model", text)
+        self.assertIn("already set is kept", text)
+        self.assertIn("how many models", text)
 
-    def test_execute_optimize_uses_live_tuning(self) -> None:
+    def test_optimize_pkexec_success_root_writes_post_and_ledger(self) -> None:
         target = _target_stub()
+        calls: list[list[str]] = []
+
+        def which(name: str, *_args: object, **_kwargs: object) -> str | None:
+            if name == "pkexec":
+                return "/usr/bin/pkexec"
+            return shutil.which(name)
+
+        def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+            if cmd and Path(str(cmd[0])).name == "systemctl":
+                raise AssertionError("systemctl")
+            calls.append(list(cmd))
+            return SimpleNamespace(
+                returncode=0,
+                stdout="lemonade load settings updated\n",
+                stderr="",
+            )
+
+        log, bombs = self._unprivileged_optimize(target, which, _HELPER, run)
+        text = "\n".join(log)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "/usr/bin/pkexec")
+        self.assertIn("lemonade-tune", calls[0])
+        self.assertIn(target.name, calls[0])
+        self.assertTrue(any(str(part).endswith("ubuntuai-installer-helper") for part in calls[0]))
+        self.assertIn("lemonade load settings updated", text)
+        self.assertEqual(bombs, {"http": 0, "ledger": 0})
+        self._assert_plain(log)
+        self._assert_helper_posts_and_writes_ledger()
+
+    def test_optimize_declined_writes_nothing(self) -> None:
+        target = _target_stub()
+        calls: list[list[str]] = []
+
+        def which(name: str, *_args: object, **_kwargs: object) -> str | None:
+            if name == "pkexec":
+                return "/usr/bin/pkexec"
+            return shutil.which(name)
+
+        def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+            if cmd and Path(str(cmd[0])).name == "systemctl":
+                raise AssertionError("systemctl")
+            calls.append(list(cmd))
+            return SimpleNamespace(returncode=126, stdout="", stderr="dismissed\n")
+
+        log, bombs = self._unprivileged_optimize(target, which, _HELPER, run)
+        cli = self._cli_optimize(target, which, _HELPER, run)
+        self.assertTrue(calls)
+        self.assertIn("Run Publish to apply the tuning.", "\n".join(log))
+        self.assertEqual(bombs, {"http": 0, "ledger": 0})
+        self._assert_plain(log)
+        self.assertIn("Run Publish to apply the tuning.", cli)
+        self._assert_plain([cli])
+
+    def test_optimize_unavailable_writes_nothing(self) -> None:
+        target = _target_stub()
+
+        def refuse_run(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            raise AssertionError("pkexec was started")
+
+        cases = {
+            "pkexec": (lambda *_a, **_k: None, _HELPER),
+            "helper": (lambda *_a, **_k: "/usr/bin/pkexec", Path("/no/such/ubuntuai-installer-helper")),
+        }
+        for name, (which, helper) in cases.items():
+            with self.subTest(name=name):
+                log, bombs = self._unprivileged_optimize(target, which, helper, refuse_run)
+                cli = self._cli_optimize(target, which, helper, refuse_run)
+                self.assertIn("Run Publish to apply the tuning.", "\n".join(log))
+                self.assertEqual(bombs, {"http": 0, "ledger": 0})
+                self._assert_plain(log)
+                self.assertIn("Run Publish to apply the tuning.", cli)
+                self._assert_plain([cli])
+
+    def _assert_plain(self, lines: list[str]) -> None:
+        text = "\n".join(lines)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("Errno", text)
+        self.assertNotIn("Update failed", text)
+
+    def _unprivileged_optimize(self, target, which, helper, run):
+        bombs = {"http": 0, "ledger": 0}
+
+        def refuse_http(*_args: object, **_kwargs: object) -> None:
+            bombs["http"] += 1
+            raise AssertionError("unprivileged POST")
+
+        def refuse_ledger(*_args: object, **_kwargs: object) -> None:
+            bombs["ledger"] += 1
+            raise AssertionError("unprivileged ledger write")
+
+        plan = {"steps": [{"kind": "lemonade_optimize", "why": "tune"}]}
         with (
             patch("upgrade.target_for", return_value=target),
             patch("upgrade.probe", return_value=_strix()),
-            patch(
-                "upgrade.report_load_tuning",
-                return_value="lemonade load settings updated\nStrong warning. continue.",
-            ) as report,
+            patch("upgrade.os.geteuid", return_value=1000),
+            patch("apply.os.geteuid", return_value=1000),
+            patch("upgrade.shutil.which", side_effect=which),
+            patch("apply.shutil.which", side_effect=which),
+            patch("paths.helper_path", return_value=helper),
+            patch("apply.subprocess.run", side_effect=run),
+            patch("lemonade.urllib.request.urlopen", side_effect=refuse_http),
+            patch("lemonade.write_tuning_ledger", side_effect=refuse_ledger),
         ):
-            log = execute_plan_steps(
-                target.name,
-                {
-                    "steps": [{"kind": "lemonade_optimize", "why": "tune"}],
-                    "tuning": {"max_loaded_models": 1},
-                },
-            )
-        report.assert_called_once()
-        self.assertIn("lemonade load settings updated", log)
-        self.assertTrue(any("Strong warning" in line for line in log))
+            log = execute_plan_steps(target.name, plan)
+        return log, bombs
+
+    def _cli_optimize(self, target, which, helper, run) -> str:
+        saved = {"plan": {"steps": [{"kind": "lemonade_optimize", "why": "tune"}]}}
+        out = io.StringIO()
+        err = io.StringIO()
+        with (
+            patch("upgrade.target_for", return_value=target),
+            patch("upgrade.probe", return_value=_strix()),
+            patch("upgrade.os.geteuid", return_value=1000),
+            patch("apply.os.geteuid", return_value=1000),
+            patch("upgrade.shutil.which", side_effect=which),
+            patch("apply.shutil.which", side_effect=which),
+            patch("paths.helper_path", return_value=helper),
+            patch("apply.subprocess.run", side_effect=run),
+            patch("upgrade.load_saved_plan", return_value=saved),
+            patch("lemonade.urllib.request.urlopen", side_effect=AssertionError("unprivileged POST")),
+            patch("lemonade.write_tuning_ledger", side_effect=AssertionError("unprivileged ledger write")),
+            redirect_stdout(out),
+            redirect_stderr(err),
+        ):
+            rc = cmd_upgrade(target.name, approve=True, dry_run=False)
+        self.assertEqual(rc, 0)
+        return out.getvalue() + err.getvalue()
+
+    def _assert_helper_posts_and_writes_ledger(self) -> None:
+        loader = importlib.machinery.SourceFileLoader("ubuntuai_helper_tune", str(_HELPER))
+        spec = importlib.util.spec_from_loader("ubuntuai_helper_tune", loader)
+        assert spec is not None
+        helper = importlib.util.module_from_spec(spec)
+        loader.exec_module(helper)
+        factory = {
+            "ctx_size": -1,
+            "global_timeout": 600,
+            "max_loaded_models": 1,
+            "llamacpp": {"backend": "auto", "args": "", "vulkan_args": ""},
+        }
+        state = json.loads(json.dumps(factory))
+        posts: list[tuple[str, dict]] = []
+
+        class _Resp:
+            def __enter__(self) -> _Resp:
+                return self
+
+            def __exit__(self, *_args: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def read() -> dict:
+            return json.loads(json.dumps(state))
+
+        def read_factory() -> dict:
+            return json.loads(json.dumps(factory))
+
+        def urlopen(req: object, timeout: int = 3) -> _Resp:
+            method = req.get_method()  # type: ignore[attr-defined]
+            raw = req.data  # type: ignore[attr-defined]
+            self.assertEqual(method, "POST")
+            body = json.loads(raw.decode())
+            posts.append((method, body))
+            state.update(body)
+            return _Resp()
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            out = io.StringIO()
+            with (
+                patch.object(helper, "target_for", return_value=_target_stub()),
+                patch("lemonade.probe", return_value=_strix(122)),
+                patch("lemonade.largest_gguf_bytes", return_value=105 * 1024**3),
+                patch("lemonade.read_config", side_effect=read),
+                patch("lemonade.read_factory_defaults", side_effect=read_factory),
+                patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
+                patch("lemonade.TUNING_LEDGER_DIR", home),
+                patch("lemonade._ledger_dir_is_trusted", return_value=True),
+                redirect_stdout(out),
+            ):
+                rc = helper.main(["ubuntuai-installer-helper", "lemonade-tune", "owner"])
+            ledger = json.loads((home / "lemonade-tuning.json").read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        self.assertTrue(posts)
+        self.assertTrue(all(method == "POST" for method, _body in posts))
+        self.assertIn("ctx_size", ledger)
+        text = out.getvalue()
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("Errno", text)
+
+
+_HELPER = Path(__file__).resolve().parents[1] / "usr" / "sbin" / "ubuntuai-installer-helper"
