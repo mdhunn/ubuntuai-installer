@@ -8,10 +8,12 @@ import json
 import os
 import re
 import shutil
+import struct
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 from domain import CatalogWeight, FileHash, FoundWeight, UserTarget
@@ -480,6 +482,283 @@ def classify(path: Path) -> str | None:
     if suffix == ".bin":
         return "pytorch"
     return None
+
+
+# llama.cpp general.architecture strings for text generation. A name that is
+# not in this set is not published as chat. Speech, image, and reranker
+# strings are listed on their own so the publish report can name them.
+_LLAMA_CPP_ARCHITECTURES = frozenset({
+    "afmoe", "apertus", "arctic", "arcee", "arwkv7", "baichuan", "bailingmoe",
+    "bailingmoe2", "bailingmoe3", "bert", "bitnet", "bloom", "chameleon",
+    "chatglm", "clef", "clip", "codeshell", "cogvlm", "cohere2", "cohere2moe",
+    "command-r", "dbrx", "deci", "deepseek", "deepseek2", "deepseek2-ocr",
+    "deepseek32", "deepseek4", "dflash", "dots1", "dots3note", "dream",
+    "eagle3", "ernie4_5", "ernie4_5-moe", "eurobert", "exaone", "exaone-moe",
+    "exaone4", "falcon", "falcon-h1", "gemma", "gemma-embedding", "gemma2",
+    "gemma3", "gemma3n", "gemma4", "gemma4-assistant", "glm-dsa", "glm4",
+    "glm4moe", "glm5-next", "gpt-oss", "gpt2", "gptj", "gptneox", "granite",
+    "granite_swa", "granitehybrid", "granitemoe", "graniteswitch", "grok",
+    "grovemoe", "hrm_text", "hunyuan-dense", "hunyuan-moe", "hunyuan_vl",
+    "hy_v3", "hy_v4", "internlm2", "jais", "jais2", "jamba", "jina-bert-v2",
+    "jina-bert-v3", "kimi-k3", "kimi-linear", "laguna", "lfm2", "lfm2moe",
+    "llama", "llama-embed", "llama4", "llada", "llada-moe", "maincoder",
+    "mamba", "mamba2", "maple", "mellum", "mimo2", "minicpm", "minicpm3",
+    "minimax-01", "minimax-m2", "minimax-m3", "mistral3", "mistral4",
+    "modern-bert", "mpt", "muse-glimmer", "nanbeige", "nemotron", "nemotron_h",
+    "nemotron_h_moe", "neo-bert", "nomic-bert", "nomic-bert-moe", "olmo",
+    "olmo2", "olmoe", "openelm", "orion", "paddleocr", "pangu-embedded",
+    "phi2", "phi3", "phimoe", "plamo", "plamo2", "plamo3", "plm", "pockettts",
+    "qwen", "qwen2", "qwen2moe", "qwen2vl", "qwen3", "qwen35", "qwen35moe",
+    "qwen3moe", "qwen3next", "qwen3tts", "qwen3vl", "qwen3vlmoe", "qwen4exp",
+    "refact", "rnd1", "rwkv6", "rwkv6qwen2", "rwkv7", "seed_oss", "smallthinker",
+    "smollm3", "spark2_5", "stablelm", "starcoder", "starcoder2", "step35",
+    "t5", "t5encoder", "talkie", "wavtokenizer-dec", "xverse",
+})
+_COMPANION_ARCHITECTURES = frozenset({"clip", "eagle3", "dflash"})
+_NOT_CHAT_ARCHITECTURES = frozenset({
+    "bert", "deepseek2-ocr", "eurobert", "gemma-embedding", "jina-bert-v2",
+    "jina-bert-v3", "llama-embed", "modern-bert", "neo-bert", "nomic-bert",
+    "nomic-bert-moe", "paddleocr", "pangu-embedded", "pockettts", "qwen3tts",
+    "t5encoder", "talkie", "wavtokenizer-dec",
+})
+_TTS_ARCHITECTURES = frozenset({
+    "magpie", "magpie-tts", "moss-tts-delay", "nano-codec", "pockettts",
+    "qwen3tts", "talkie", "wavtokenizer-dec",
+})
+_DIFFUSION_ARCHITECTURES = frozenset({
+    "aura", "chroma", "cosmos", "flux", "flux2", "hidream", "hyvid", "ltxv",
+    "lumina2", "qwen_image", "sd1", "sd2", "sd3", "sdxl", "svd", "wan",
+})
+CHAT_GGUF_ARCHITECTURES = (
+    _LLAMA_CPP_ARCHITECTURES
+    - _COMPANION_ARCHITECTURES
+    - _NOT_CHAT_ARCHITECTURES
+    - _TTS_ARCHITECTURES
+)
+_RERANK_POOLING = 4
+_RERANK_TYPES = frozenset({"rerank", "reranking"})
+_GGUF_MAGIC = b"GGUF"
+_GGUF_HEADER_CAP = 2 * 1024 * 1024
+_GGUF_STRING = 8
+_GGUF_ARRAY = 9
+_GGUF_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+
+@dataclass(frozen=True)
+class GgufInfo:
+    architecture: str | None
+    model_type: str | None
+    pooling: int | None
+    split_no: int | None = None
+
+
+def gguf_architecture_header(
+    architecture: str,
+    *,
+    pooling: int | None = None,
+    model_type: str | None = None,
+) -> bytes:
+    """Minimal GGUF header. Tests use it. It is not a model file."""
+    fields: list[tuple[str, object]] = [("general.architecture", architecture)]
+    if model_type is not None:
+        fields.append(("general.type", model_type))
+    if pooling is not None:
+        fields.append((f"{architecture}.pooling_type", pooling))
+    parts = [b"GGUF", struct.pack("<I", 3), struct.pack("<Q", 0), struct.pack("<Q", len(fields))]
+    for key, value in fields:
+        key_b = key.encode("utf-8")
+        parts.append(struct.pack("<Q", len(key_b)))
+        parts.append(key_b)
+        if isinstance(value, int):
+            parts.append(struct.pack("<I", 4))
+            parts.append(struct.pack("<I", value))
+        else:
+            val_b = str(value).encode("utf-8")
+            parts.append(struct.pack("<I", _GGUF_STRING))
+            parts.append(struct.pack("<Q", len(val_b)))
+            parts.append(val_b)
+    return b"".join(parts)
+
+
+def gguf_split_header(split_no: int, split_count: int) -> bytes:
+    """Shard header with split.no and split.count and no architecture."""
+    parts = [b"GGUF", struct.pack("<I", 3), struct.pack("<Q", 0), struct.pack("<Q", 2)]
+    for key, value in (("split.no", split_no), ("split.count", split_count)):
+        key_b = key.encode("utf-8")
+        parts.append(struct.pack("<Q", len(key_b)))
+        parts.append(key_b)
+        parts.append(struct.pack("<I", 4))
+        parts.append(struct.pack("<I", value))
+    return b"".join(parts)
+
+
+def _clean_gguf_text(text: str) -> str | None:
+    """Drop escapes and control bytes before a header string is stored or logged."""
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        if ch == "\x1b":
+            index += 1
+            if index < len(text) and text[index] == "[":
+                index += 1
+                while index < len(text) and not (text[index].isalpha() or text[index] in "@`}"):
+                    index += 1
+                if index < len(text):
+                    index += 1
+            continue
+        if ord(ch) < 32 or ord(ch) == 127:
+            index += 1
+            continue
+        out.append(ch)
+        index += 1
+    cleaned = "".join(out).strip()
+    if len(cleaned) > 64:
+        cleaned = cleaned[:64]
+    return cleaned or None
+
+
+def _gguf_string(blob: bytes, off: int) -> tuple[str | None, int | None]:
+    if off + 8 > len(blob):
+        return None, None
+    n = struct.unpack_from("<Q", blob, off)[0]
+    off += 8
+    if n > len(blob) or off + n > len(blob):
+        return None, None
+    try:
+        text = blob[off : off + n].decode("utf-8")
+    except UnicodeDecodeError:
+        return None, None
+    return text, off + n
+
+
+_GGUF_MAX_DEPTH = 64
+
+
+def _gguf_skip(blob: bytes, off: int, vtype: int, depth: int = 0) -> int | None:
+    # A few thousand nested arrays is a valid header shape and blows the stack.
+    if depth > _GGUF_MAX_DEPTH:
+        return None
+    if vtype == _GGUF_STRING:
+        _, nxt = _gguf_string(blob, off)
+        return nxt
+    if vtype == _GGUF_ARRAY:
+        if off + 12 > len(blob):
+            return None
+        et = struct.unpack_from("<I", blob, off)[0]
+        count = struct.unpack_from("<Q", blob, off + 4)[0]
+        off += 12
+        if count > 1_000_000:
+            return None
+        for _ in range(count):
+            nxt = _gguf_skip(blob, off, et, depth + 1)
+            if nxt is None:
+                return None
+            off = nxt
+        return off
+    size = _GGUF_SIZES.get(vtype)
+    if size is None or off + size > len(blob):
+        return None
+    return off + size
+
+
+def read_gguf_info(path: Path) -> GgufInfo | None:
+    """Read general.architecture. None when the header is missing or cut off.
+
+    The scan stops at 2 MiB. A header that hides the architecture past that
+    cap is treated as unreadable. Unknown architectures are not chat.
+    """
+    try:
+        with path.open("rb") as handle:
+            blob = handle.read(_GGUF_HEADER_CAP)
+    except OSError:
+        return None
+    if len(blob) < 24 or blob[:4] != _GGUF_MAGIC:
+        return None
+    version = struct.unpack_from("<I", blob, 4)[0]
+    if version < 2 or version > 3:
+        return None
+    n_kv = struct.unpack_from("<Q", blob, 16)[0]
+    if n_kv > 1_000_000:
+        return None
+    off = 24
+    architecture: str | None = None
+    model_type: str | None = None
+    pooling: int | None = None
+    split_no: int | None = None
+    for _ in range(n_kv):
+        key, off = _gguf_string(blob, off)
+        if key is None or off is None or off + 4 > len(blob):
+            break
+        vtype = struct.unpack_from("<I", blob, off)[0]
+        off += 4
+        if key == "general.architecture" and vtype == _GGUF_STRING:
+            value, off = _gguf_string(blob, off)
+            if value is None or off is None:
+                break
+            architecture = _clean_gguf_text(value.lower())
+            continue
+        if key == "general.type" and vtype == _GGUF_STRING:
+            value, off = _gguf_string(blob, off)
+            if value is None or off is None:
+                break
+            model_type = _clean_gguf_text(value.lower())
+            continue
+        if key == "split.no" and vtype == 4 and off + 4 <= len(blob):
+            split_no = struct.unpack_from("<I", blob, off)[0]
+            off += 4
+            continue
+        if (
+            architecture
+            and key == f"{architecture}.pooling_type"
+            and vtype == 4
+            and off + 4 <= len(blob)
+        ):
+            pooling = struct.unpack_from("<I", blob, off)[0]
+            off += 4
+            continue
+        nxt = _gguf_skip(blob, off, vtype)
+        if nxt is None:
+            break
+        off = nxt
+    if architecture is None and split_no is None:
+        return None
+    return GgufInfo(architecture, model_type, pooling, split_no)
+
+
+def gguf_architecture(path: Path) -> str | None:
+    info = read_gguf_info(path)
+    if info is None:
+        return None
+    return info.architecture
+
+
+def gguf_publish_role(path: Path) -> str:
+    """chat, companion, tts, diffusion, rerank, unknown, or truncated.
+
+    mmproj files and clip, eagle3, and dflash architectures are companions.
+    They do not count as chat and they do not block a chat directory.
+    A reranker is pooling type rank or general.type rerank, even when the
+    architecture is also a text model. Anything else this table does not
+    know stays out of chat.
+    """
+    if "mmproj" in path.name.lower():
+        return "companion"
+    info = read_gguf_info(path)
+    if info is None or not info.architecture:
+        return "truncated"
+    arch = info.architecture
+    if info.model_type in _RERANK_TYPES or info.pooling == _RERANK_POOLING:
+        return "rerank"
+    if arch in _TTS_ARCHITECTURES or "tts" in arch:
+        return "tts"
+    if arch in _DIFFUSION_ARCHITECTURES:
+        return "diffusion"
+    if arch in _COMPANION_ARCHITECTURES:
+        return "companion"
+    if arch in CHAT_GGUF_ARCHITECTURES:
+        return "chat"
+    return "unknown"
 
 
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.I)
