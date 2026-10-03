@@ -18,10 +18,13 @@ and order.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -136,7 +139,14 @@ def embeddings_cover(
     """Empty tmpfs over embeddings inside the model_root chat bind.
 
     One cover follows that srcN. Extra per-directory binds would renumber srcN.
+    A symlink is skipped. tmpfs on that path would follow the link and hide
+    the real folder for the whole host.
     """
+    try:
+        if (model_root / "embeddings").is_symlink():
+            return None
+    except OSError:
+        return None
     root = _resolve(model_root)
     for mount in mounts:
         if _is_cover(mount) or _resolve(mount.what) != root:
@@ -566,8 +576,6 @@ def _drop_bind_unit(where: Path, dest: Path) -> None:
     path = _owned_unit_path(where)
     if path is not None:
         _run(["systemctl", "disable", "--now", path.name])
-        path.unlink(missing_ok=True)
-        _run(["systemctl", "daemon-reload"])
     else:
         try:
             unit = _escape_mount(where)
@@ -577,7 +585,11 @@ def _drop_bind_unit(where: Path, dest: Path) -> None:
             _run(["systemctl", "disable", "--now", unit])
     _run(["umount", str(where)])
     if _is_mountpoint(where):
+        # Keep the unit. A later publish has to be able to stop this mount.
         raise RuntimeError(_still_mounted_message(where))
+    if path is not None:
+        path.unlink(missing_ok=True)
+        _run(["systemctl", "daemon-reload"])
 
 
 def _drop_obsolete_owned_binds(
@@ -592,7 +604,15 @@ def _drop_obsolete_owned_binds(
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=False, capture_output=True, text=True)
+    try:
+        return subprocess.run(cmd, check=False, capture_output=True, text=True)
+    except FileNotFoundError:
+        if cmd and cmd[0] == "systemctl":
+            raise RuntimeError(
+                "systemctl is not installed. "
+                "Publish stopped so your model files stay where they are."
+            ) from None
+        raise
 
 
 def _escape_mount(where: Path) -> str:
@@ -673,6 +693,11 @@ def _refresh_changed_whats(plan: tuple[BindMount, ...]) -> None:
             raise RuntimeError(_still_mounted_message(mount.where))
 
 
+# /internal/config has to answer before extra_models_dir or tuning. Both need a live server.
+CONFIG_READY_TIMEOUT = 15.0
+CONFIG_READY_INTERVAL = 0.25
+
+
 def _daemon_was_running() -> bool:
     return _run(["systemctl", "is-active", "--quiet", DAEMON_UNIT]).returncode == 0
 
@@ -683,6 +708,40 @@ def _stop_daemon() -> None:
 
 def _start_daemon() -> None:
     _run(["systemctl", "start", DAEMON_UNIT])
+
+
+def _lemonade_not_ready_message() -> str:
+    return (
+        "Lemonade did not come back after the folder mounts. "
+        "Publish stopped before setting the model folder."
+    )
+
+
+def _config_answers() -> bool:
+    req = urllib.request.Request(
+        f"{LEMONADE_API}/internal/config",
+        headers={"User-Agent": UA},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return isinstance(data, dict)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return False
+
+
+def _wait_for_config() -> None:
+    deadline = time.monotonic() + CONFIG_READY_TIMEOUT
+    while True:
+        if _config_answers():
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(_lemonade_not_ready_message())
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(_lemonade_not_ready_message())
+        time.sleep(min(CONFIG_READY_INTERVAL, remaining))
 
 
 def _write_bind_unit(what: Path, where: Path) -> str:
@@ -709,6 +768,11 @@ def _write_bind_unit(what: Path, where: Path) -> str:
 
 def _write_cover_unit(where: Path, parent_unit: str) -> str:
     # The parent bind already exposes this directory. Never mkdir it.
+    try:
+        if where.is_symlink():
+            return ""
+    except OSError:
+        return ""
     if not where.is_dir():
         raise RuntimeError(
             f"The embeddings cover has no folder at {where}. "
@@ -758,9 +822,15 @@ def _snap_mount_plan(
     return tuple(ordered)
 
 
-def _apply_snap_mounts(dest: Path, mounts: tuple[BindMount, ...]) -> str:
+def _apply_snap_mounts(
+    dest: Path,
+    mounts: tuple[BindMount, ...],
+    *,
+    on_ready: Callable[[], None] | None = None,
+) -> str:
     was_running = _daemon_was_running()
     label = ""
+    started = False
     try:
         if was_running:
             _stop_daemon()
@@ -775,9 +845,17 @@ def _apply_snap_mounts(dest: Path, mounts: tuple[BindMount, ...]) -> str:
             else:
                 label = _write_bind_unit(mount.what, mount.where)
                 written[_resolve(mount.where)] = label
+        # Binds are in place. The server has to be up before config writes.
+        _start_daemon()
+        started = True
+        _wait_for_config()
         _set_extra_models_dir(dest)
+        if on_ready is not None:
+            on_ready()
     finally:
-        if was_running:
+        if started and not was_running:
+            _stop_daemon()
+        elif was_running and not started:
             _start_daemon()
     return label
 
@@ -1082,9 +1160,129 @@ def _user_overrode(current: dict, factory: dict, key: str) -> bool:
     return not _values_equal(current.get(key), factory.get(key))
 
 
-def _load_mode_overrode(current: dict, factory: dict) -> bool:
-    return _user_overrode(current, factory, "llamacpp_args") or _user_overrode(
-        current, factory, "llamacpp_vulkan_args"
+def _config_known(current: object) -> bool:
+    return isinstance(current, dict) and bool(current)
+
+
+# Keys the installer may write. The ledger holds these values and nothing else.
+TUNING_LEDGER_KEYS = frozenset(
+    {
+        "max_loaded_models",
+        "ctx_size",
+        "global_timeout",
+        "llamacpp_backend",
+        "llamacpp_args",
+        "llamacpp_vulkan_args",
+    }
+)
+
+
+def tuning_ledger_path(home: Path) -> Path:
+    return home / ".config" / "ubuntuai" / "lemonade-tuning.json"
+
+
+def read_tuning_ledger(home: Path) -> dict[str, object] | None:
+    """None when this install has never recorded a write. {} is an empty ledger."""
+    path = tuning_ledger_path(home)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in data.items()
+        if str(key) in TUNING_LEDGER_KEYS
+    }
+
+
+def write_tuning_ledger(
+    home: Path,
+    values: dict[str, object],
+    *,
+    uid: int | None = None,
+    gid: int | None = None,
+) -> None:
+    path = tuning_ledger_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    kept = {
+        str(key): value
+        for key, value in values.items()
+        if str(key) in TUNING_LEDGER_KEYS
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(kept, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    if uid is not None and gid is not None:
+        try:
+            os.chown(path, uid, gid)
+        except OSError:
+            pass
+
+
+def _remember_tuning(
+    home: Path,
+    chosen: dict[str, object],
+    *,
+    uid: int | None = None,
+    gid: int | None = None,
+    cli: bool = False,
+) -> None:
+    prior = read_tuning_ledger(home) or {}
+    merged = dict(prior)
+    merged.update(
+        {key: value for key, value in chosen.items() if key in TUNING_LEDGER_KEYS}
+    )
+    if cli:
+        names = {
+            "llamacpp.backend": "llamacpp_backend",
+            "llamacpp.args": "llamacpp_args",
+            "llamacpp.vulkan_args": "llamacpp_vulkan_args",
+        }
+        numeric = {"ctx_size", "global_timeout", "max_loaded_models"}
+        for part in cli_tuning_parts(chosen):
+            raw_key, sep, raw_value = part.partition("=")
+            if not sep:
+                continue
+            key = names.get(raw_key, raw_key)
+            if key not in TUNING_LEDGER_KEYS:
+                continue
+            parsed = _as_int(raw_value)
+            merged[key] = parsed if parsed is not None and key in numeric else raw_value
+    write_tuning_ledger(home, merged, uid=uid, gid=gid)
+
+
+def _user_owns_key(
+    current: dict,
+    factory: dict,
+    ledger: dict[str, object] | None,
+    key: str,
+) -> bool:
+    """True when the live value is the user's, not ours and not the factory value.
+
+    No ledger is the migration case. A non-factory max_loaded_models stays.
+    Every other key is still ours and can be retuned.
+    """
+    if not _is_set(current, key):
+        return False
+    differs = _user_overrode(current, factory, key)
+    if ledger is None:
+        return key == "max_loaded_models" and differs
+    if not differs:
+        return False
+    if key not in ledger:
+        return True
+    return not _values_equal(current.get(key), ledger.get(key))
+
+
+def _load_mode_user_owns(
+    current: dict, factory: dict, ledger: dict[str, object] | None
+) -> bool:
+    return _user_owns_key(current, factory, ledger, "llamacpp_args") or _user_owns_key(
+        current, factory, ledger, "llamacpp_vulkan_args"
     )
 
 
@@ -1108,29 +1306,38 @@ def tuning_to_apply(
     defaults: dict[str, object],
     current: dict,
     factory: dict | None = None,
+    ledger: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    """Write a default only when the server still has the factory value."""
+    """Write a default only when the live value is still ours or still factory."""
+    if not _config_known(current):
+        return {}
     if factory is None:
         factory = read_factory_defaults()
-    flat = _flatten_config(current) if current else {}
+    flat = _flatten_config(current)
     flat_factory = _flatten_config(factory) if factory else {}
     chosen: dict[str, object] = {}
     for key, value in defaults.items():
-        if key == "llamacpp_args":
-            if _load_mode_overrode(flat, flat_factory):
+        if key in {"llamacpp_args", "llamacpp_vulkan_args"}:
+            if _load_mode_user_owns(flat, flat_factory, ledger):
                 continue
-        elif _user_overrode(flat, flat_factory, key):
+        elif _user_owns_key(flat, flat_factory, ledger, key):
             continue
         chosen[key] = value
     return chosen
 
 
 def effective_max_loaded(
-    settings: dict[str, object], current: dict, factory: dict
+    settings: dict[str, object],
+    current: dict,
+    factory: dict,
+    ledger: dict[str, object] | None = None,
 ) -> int:
-    flat = _flatten_config(current) if current else {}
+    if not _config_known(current):
+        value = _as_int(settings.get("max_loaded_models"))
+        return 1 if value is None else value
+    flat = _flatten_config(current)
     flat_factory = _flatten_config(factory) if factory else {}
-    if _user_overrode(flat, flat_factory, "max_loaded_models"):
+    if _user_owns_key(flat, flat_factory, ledger, "max_loaded_models"):
         value = _as_int(flat.get("max_loaded_models"))
         if value is not None:
             return value
@@ -1180,13 +1387,23 @@ def apply_tuning(
     settings: dict[str, object],
     current: dict | None = None,
     factory: dict | None = None,
+    home: Path | None = None,
+    *,
+    uid: int | None = None,
+    gid: int | None = None,
 ) -> str:
-    # Compare with factory defaults. /internal/config already merges them in.
+    # Compare with factory defaults and the ledger. /internal/config merges both.
     if current is None:
         current = read_config()
+    if not _config_known(current):
+        return (
+            "Lemonade did not report its load settings. "
+            "The installer left them unchanged."
+        )
     if factory is None:
         factory = read_factory_defaults()
-    chosen = tuning_to_apply(settings, current, factory)
+    ledger = read_tuning_ledger(home) if home is not None else None
+    chosen = tuning_to_apply(settings, current, factory, ledger)
     if not chosen:
         return "lemonade load settings kept"
     body = json.dumps(chosen).encode("utf-8")
@@ -1203,6 +1420,7 @@ def apply_tuning(
         wrote = True
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         pass
+    cli = False
     if not wrote:
         exe = shutil.which("lemonade-server") or shutil.which("lemonade")
         if not exe:
@@ -1212,6 +1430,9 @@ def apply_tuning(
             raise RuntimeError(
                 (p.stderr or p.stdout or "lemonade config set failed").strip()
             )
+        cli = True
+    if home is not None:
+        _remember_tuning(home, chosen, uid=uid, gid=gid, cli=cli)
     ok, miss = verify_tuning(chosen, read_config())
     if not ok:
         return miss
@@ -1228,8 +1449,18 @@ def report_load_tuning(target: UserTarget, hw=None) -> str:
     lines: list[str] = []
     current = read_config()
     factory = read_factory_defaults()
+    ledger = read_tuning_ledger(target.home)
     try:
-        lines.append(apply_tuning(settings, current, factory))
+        lines.append(
+            apply_tuning(
+                settings,
+                current,
+                factory,
+                target.home,
+                uid=target.uid,
+                gid=target.gid,
+            )
+        )
     except RuntimeError:
         lines.append(
             "Lemonade did not accept the load settings. "
@@ -1238,7 +1469,7 @@ def report_load_tuning(target: UserTarget, hw=None) -> str:
     warn = risk_english(
         risk,
         ram_bytes=ram,
-        max_loaded_models=effective_max_loaded(settings, current, factory),
+        max_loaded_models=effective_max_loaded(settings, current, factory, ledger),
     )
     if warn:
         lines.append(warn)
@@ -1270,13 +1501,20 @@ def publish(target: UserTarget) -> str:
             )
         # Stop the daemon before replacing binds. A busy dest mount would
         # mkdir chat/ inside the user's model tree.
-        unit = _apply_snap_mounts(dest, mounts)
+        notes: list[str] = []
+
+        def _ready() -> None:
+            text = report_load_tuning(target)
+            if text:
+                notes.append(text)
+
+        unit = _apply_snap_mounts(dest, mounts, on_ready=_ready)
         visible = sum(1 for mount in mounts if not _is_cover(mount))
         if visible == 1:
             prefix = f"lemonade extra_models_dir={dest} via {unit}"
         else:
             prefix = f"lemonade extra_models_dir={dest} ({visible} trees)"
-        extra = report_load_tuning(target)
+        extra = notes[0] if notes else ""
         return f"{prefix}\n{extra}" if extra else prefix
     if not sources:
         return "no real GGUF files to publish (Lemonade cannot follow store symlinks)"

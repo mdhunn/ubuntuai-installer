@@ -529,6 +529,8 @@ class ApplyTests(unittest.TestCase):
                 self.assertEqual(completed.stdout, str(root.resolve()))
                 profile = (etc_path / "ubuntuai.sh").read_text(encoding="utf-8")
                 self.assertIn("export UBUNTUAI_MODELS\n", profile)
+                self.assertIn("export UBUNTUAI_BIND\n", profile)
+                self.assertIn(f"UBUNTUAI_BIND={shlex.quote('127.0.0.1')}", text)
                 self.assertIn(shlex.quote(str(env)), profile)
                 child = subprocess.run(
                     [
@@ -544,6 +546,20 @@ class ApplyTests(unittest.TestCase):
                 )
                 self.assertEqual(child.returncode, 0, child.stderr)
                 self.assertEqual(child.stdout, str(root.resolve()))
+                bind_child = subprocess.run(
+                    [
+                        "sh",
+                        "-c",
+                        ". \"$1\"; sh -c 'printf %s \"$UBUNTUAI_BIND\"'",
+                        "sh",
+                        str(etc_path / "ubuntuai.sh"),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(bind_child.returncode, 0, bind_child.stderr)
+                self.assertEqual(bind_child.stdout, "127.0.0.1")
 
 
 if __name__ == "__main__":
