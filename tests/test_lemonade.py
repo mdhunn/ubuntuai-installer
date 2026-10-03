@@ -26,6 +26,8 @@ from lemonade import (
     cli_tuning_parts,
     detect,
     apply_tuning,
+    cover_unit_text,
+    embeddings_cover,
     embeddings_mount,
     extra_dir,
     gguf_sources,
@@ -73,6 +75,19 @@ def _write_gguf(path: Path) -> Path:
     return path
 
 
+def _merged_factory() -> dict:
+    """Shape of GET /internal/config after defaults.json is merged in."""
+    return {
+        "ctx_size": -1,
+        "global_timeout": 600,
+        "max_loaded_models": 1,
+        "llamacpp": {"backend": "auto", "args": "", "vulkan_args": ""},
+        "port": 13305,
+        "extra_models_dir": "",
+        "vulkan_bin": "",
+    }
+
+
 def _seed_unit(
     unit_dir: Path,
     what: Path,
@@ -108,7 +123,7 @@ def _systemd_analyze_verify(
         path = Path(tmp) / name
         path.write_text(text, encoding="utf-8")
         result = subprocess.run(
-            [analyze, "verify", str(path), "local-fs.target"],
+            [analyze, "--man=no", "verify", str(path), "local-fs.target"],
             capture_output=True,
             text=True,
             check=False,
@@ -278,7 +293,7 @@ class LemonadePublishTests(unittest.TestCase):
             target = _target(home, extra=(extra,), model_root=other)
             first = gguf_sources(target)
             second = gguf_sources(target)
-            self.assertEqual(first, (extra.resolve(), other.resolve()))
+            self.assertEqual(first, (other.resolve(), extra.resolve()))
             self.assertEqual(first, second)
             self.assertNotIn((extra / "gguf").resolve(), first)
             self.assertNotIn((other / "gguf").resolve(), first)
@@ -287,8 +302,8 @@ class LemonadePublishTests(unittest.TestCase):
             self.assertEqual(
                 tuple((m.what, m.where.name) for m in mounts),
                 (
-                    (extra.resolve(), "src0"),
-                    (other.resolve(), "src1"),
+                    (other.resolve(), "src0"),
+                    (extra.resolve(), "src1"),
                 ),
             )
             self.assertEqual(bind_mounts(gguf_sources(target), dest), mounts)
@@ -421,6 +436,7 @@ class LemonadePublishTests(unittest.TestCase):
         text = mount_unit_text(what, where)
         self.assertEqual(mount_unit_path(what), "/tmp/AI 100%% models")
         self.assertIn("What=/tmp/AI 100%% models\n", text)
+        self.assertIn('RequiresMountsFor="/tmp/AI 100%% models"', text)
         self.assertIn(f"Where={where}\n", text)
         self.assertNotIn('What="', text)
         self.assertNotIn('Where="', text)
@@ -590,8 +606,8 @@ class LemonadePublishTests(unittest.TestCase):
             self.assertEqual(
                 binds,
                 [
-                    (extra.resolve(), dest / "chat" / "src0"),
-                    (store.resolve(), dest / "chat" / "src1"),
+                    (store.resolve(), dest / "chat" / "src0"),
+                    (extra.resolve(), dest / "chat" / "src1"),
                 ],
             )
             self.assertIn("2 trees", msg)
@@ -628,6 +644,15 @@ class LemonadePublishTests(unittest.TestCase):
         self.assertFalse(is_owned_lemonade_where(dest, dest / "chat" / "src"))
         self.assertFalse(is_owned_lemonade_where(dest, dest / "chat" / "custom"))
         self.assertFalse(is_owned_lemonade_where(dest, dest / "chat" / "src0" / "nested"))
+        self.assertTrue(
+            is_owned_lemonade_where(dest, dest / "chat" / "src0" / "embeddings")
+        )
+        self.assertFalse(
+            is_owned_lemonade_where(
+                dest, dest / "chat" / "src0" / "embeddings" / "nested"
+            )
+        )
+        self.assertFalse(is_owned_lemonade_where(dest, dest / "chat" / "src0" / "gguf"))
         self.assertFalse(is_owned_lemonade_where(dest, Path("/mnt/other")))
 
     def test_leftover_nested_src_under_collapsed_dest(self) -> None:
@@ -807,8 +832,8 @@ class LemonadePublishTests(unittest.TestCase):
             src0 = dest / "chat" / "src0"
             src1 = dest / "chat" / "src1"
             src2 = dest / "chat" / "src2"
-            _seed_unit(unit_dir, extra, src0, "src0.mount")
-            _seed_unit(unit_dir, store, src1, "src1.mount")
+            _seed_unit(unit_dir, store, src0, "src0.mount")
+            _seed_unit(unit_dir, extra, src1, "src1.mount")
             _seed_unit(unit_dir, home / "Downloads", src2, "src2.mount")
             dropped: list[Path] = []
 
@@ -868,8 +893,8 @@ class LemonadePublishTests(unittest.TestCase):
             self.assertEqual(
                 binds,
                 [
-                    (extra.resolve(), dest / "chat" / "src0"),
-                    (store.resolve(), dest / "chat" / "src1"),
+                    (store.resolve(), dest / "chat" / "src0"),
+                    (extra.resolve(), dest / "chat" / "src1"),
                 ],
             )
 
@@ -964,20 +989,29 @@ class LemonadePublishTests(unittest.TestCase):
             self.assertNotIn('What="', text)
             self.assertNotIn('Where="', text)
             binds: list[tuple[Path, Path]] = []
+            covers: list[tuple[Path, str]] = []
+            order: list[str] = []
 
             def record_bind(what: Path, where: Path) -> str:
                 binds.append((what, where))
+                order.append(f"bind:{where.name}")
                 return "unit.mount"
+
+            def record_cover(where: Path, parent_unit: str) -> str:
+                covers.append((where, parent_unit))
+                order.append("cover")
+                return "cover.mount"
 
             with (
                 patch("lemonade.detect", return_value="snap"),
                 patch("lemonade.extra_dir", return_value=dest),
                 patch("lemonade._write_bind_unit", side_effect=record_bind),
+                patch("lemonade._write_cover_unit", side_effect=record_cover),
                 patch("lemonade._set_extra_models_dir"),
                 patch("lemonade._restart_snap"),
                 patch("lemonade.report_load_tuning", return_value=""),
             ):
-                publish(target)
+                msg = publish(target)
             self.assertEqual(
                 binds,
                 [
@@ -985,7 +1019,268 @@ class LemonadePublishTests(unittest.TestCase):
                     ((root / "embeddings").resolve(), dest / "embeddings"),
                 ],
             )
+            self.assertIn("2 trees", msg)
+            self.assertEqual(
+                covers,
+                [(dest / "chat" / "src0" / "embeddings", "unit.mount")],
+            )
+            self.assertEqual(order, ["bind:src0", "cover", "bind:embeddings"])
             self.assertTrue(is_owned_lemonade_where(dest, dest / "embeddings"))
+            self.assertEqual(
+                embeddings_cover(root, bind_mounts(gguf_sources(target), dest)),
+                BindMount(Path("tmpfs"), dest / "chat" / "src0" / "embeddings"),
+            )
+
+    def test_embeddings_cover_unit_text_orders_after_parent(self) -> None:
+        dest = SNAP_LEMONADE_MODELS
+        where = dest / "chat" / "src0" / "embeddings"
+        parent = "var-snap-lemonade--server-common-ubuntuai\\x2dmodels-chat-src0.mount"
+        text = cover_unit_text(where, parent)
+        self.assertIn("What=tmpfs\n", text)
+        self.assertIn("Type=tmpfs", text)
+        self.assertIn(
+            "Options=ro,nosuid,nodev,noexec,size=64k,mode=0555,nofail", text
+        )
+        self.assertIn(f"After={parent}\n", text)
+        self.assertNotIn("After=local-fs.target", text)
+        self.assertNotIn("DefaultDependencies=no", text)
+        self.assertIn("Before=snap.lemonade-server.daemon.service", text)
+        self.assertIn(f"Description={OWNED_UNIT_DESC}", text)
+        self.assertIn("WantedBy=multi-user.target", text)
+        self.assertIn(f"RequiresMountsFor={quote_unit_path(where.parent)}", text)
+        self.assertIn(f"Where={mount_unit_path(where)}\n", text)
+        self.assertNotIn('What="', text)
+        self.assertNotIn('Where="', text)
+        self.assertTrue(is_owned_lemonade_where(dest, where))
+        with TemporaryDirectory() as tmp:
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            local_dest = Path(tmp) / "ubuntuai-models"
+            cover_where = local_dest / "chat" / "src0" / "embeddings"
+            (unit_dir / "cover.mount").write_text(
+                cover_unit_text(cover_where, parent), encoding="utf-8"
+            )
+            chat = BindMount(Path(tmp) / "AI models", local_dest / "chat" / "src0")
+            bare = leftover_owned_binds(local_dest, (chat,), unit_dir=unit_dir)
+            self.assertEqual(bare, (cover_where.resolve(),))
+            kept = leftover_owned_binds(
+                local_dest,
+                (chat, BindMount(Path("tmpfs"), cover_where)),
+                unit_dir=unit_dir,
+            )
+            self.assertEqual(kept, ())
+
+    def test_model_root_is_src0_then_lifted_trees_sorted(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "AI models"
+            _write_gguf(root / "local.gguf")
+            zeta = home / "zeta"
+            mu = home / "mu"
+            _write_gguf(zeta / "z.gguf")
+            _write_gguf(mu / "m.gguf")
+            (root / "to-zeta.gguf").symlink_to(zeta / "z.gguf")
+            (root / "to-mu.gguf").symlink_to(mu / "m.gguf")
+            extra = home / "extra"
+            _write_gguf(extra / "e.gguf")
+            target = _target(home, extra=(extra,), model_root=root)
+            first = gguf_sources(target)
+            second = gguf_sources(target)
+            self.assertEqual(first, second)
+            self.assertEqual(first[0], root.resolve())
+            rest = (
+                extra.resolve(),
+                mu.resolve(),
+                zeta.resolve(),
+            )
+            self.assertEqual(first[1:], tuple(sorted(rest, key=str)))
+
+    def test_rewrites_unit_when_what_changes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "AI models"
+            _write_gguf(root / "tiny.gguf")
+            dest = Path(tmp) / "snap-common" / "ubuntuai-models"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            src0 = dest / "chat" / "src0"
+            old = home / "Models" / "lemonade" / "chat"
+            _seed_unit(unit_dir, old, src0, "src0.mount")
+            mounted = {src0.resolve()}
+            events: list[str] = []
+            binds: list[tuple[Path, Path]] = []
+
+            def wheres() -> tuple[Path, ...]:
+                return tuple(mounted)
+
+            def record_run(cmd: list[str]) -> SimpleNamespace:
+                if cmd[:3] == ["systemctl", "is-active", "--quiet"]:
+                    events.append("active")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd[:3] == ["systemctl", "stop", "snap.lemonade-server.daemon"]:
+                    events.append("stop-daemon")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd[:2] == ["systemctl", "stop"]:
+                    events.append("stop-unit")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd[:2] == ["systemctl", "start"]:
+                    events.append("start-daemon")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd and cmd[0] == "umount":
+                    events.append("umount")
+                    mounted.discard(Path(cmd[1]).resolve())
+                    return SimpleNamespace(returncode=1, stdout="", stderr="busy")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def record_bind(what: Path, where: Path) -> str:
+                events.append("rewrite")
+                binds.append((what, where))
+                _seed_unit(unit_dir, what, where, "src0.mount")
+                return "src0.mount"
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                patch("lemonade._mounted_wheres", side_effect=wheres),
+                patch("lemonade._run", side_effect=record_run),
+                patch("lemonade._write_bind_unit", side_effect=record_bind),
+                patch("lemonade._set_extra_models_dir"),
+                patch("lemonade.report_load_tuning", return_value=""),
+            ):
+                publish(_target(home, extra=(), model_root=root))
+            self.assertEqual(binds, [(root.resolve(), src0)])
+            self.assertLess(events.index("stop-daemon"), events.index("umount"))
+            self.assertLess(events.index("stop-unit"), events.index("umount"))
+            self.assertLess(events.index("umount"), events.index("rewrite"))
+            self.assertLess(events.index("rewrite"), events.index("start-daemon"))
+            text = (unit_dir / "src0.mount").read_text(encoding="utf-8")
+            self.assertIn(f"What={mount_unit_path(root.resolve())}\n", text)
+            self.assertNotIn("lemonade/chat", text)
+
+    def test_publish_aborts_when_unmount_stays_busy(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            real = home / "AI models"
+            _write_gguf(real / "tiny.gguf")
+            dest = Path(tmp) / "snap-common" / "ubuntuai-models"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            _seed_unit(unit_dir, real, dest, "dest.mount")
+            cmds: list[list[str]] = []
+
+            def record_run(cmd: list[str]) -> SimpleNamespace:
+                cmds.append(list(cmd))
+                if cmd[:3] == ["systemctl", "is-active", "--quiet"]:
+                    return SimpleNamespace(returncode=0, stdout="active", stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def fail_write(*args: object) -> str:
+                raise AssertionError(args)
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                patch("lemonade._mounted_wheres", return_value=(dest,)),
+                patch("lemonade._run", side_effect=record_run),
+                patch("lemonade._write_bind_unit", side_effect=fail_write),
+                patch("lemonade._write_cover_unit", side_effect=fail_write),
+                patch(
+                    "lemonade._set_extra_models_dir",
+                    side_effect=AssertionError("set"),
+                ),
+                patch("lemonade.report_load_tuning", return_value=""),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    publish(_target(home))
+            message = str(ctx.exception)
+            self.assertIn("still mounted", message)
+            self.assertIn(str(dest), message)
+            self.assertIn("model files stay where they are", message)
+            self.assertFalse((dest / "chat").exists())
+            self.assertFalse((dest / "embeddings").exists())
+            flat = [" ".join(cmd) for cmd in cmds]
+            stop_at = flat.index("systemctl stop snap.lemonade-server.daemon")
+            umount_at = flat.index(f"umount {dest}")
+            start_at = flat.index("systemctl start snap.lemonade-server.daemon")
+            self.assertLess(stop_at, umount_at)
+            self.assertLess(umount_at, start_at)
+
+    def test_publish_stops_daemon_before_binds_and_restarts_after(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            real = home / "AI models"
+            _write_gguf(real / "tiny.gguf")
+            dest = Path(tmp) / "snap-common" / "ubuntuai-models"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            events: list[str] = []
+
+            def record_run(cmd: list[str]) -> SimpleNamespace:
+                if cmd[:3] == ["systemctl", "is-active", "--quiet"]:
+                    events.append("active")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd[:3] == ["systemctl", "stop", "snap.lemonade-server.daemon"]:
+                    events.append("stop")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd[:3] == ["systemctl", "start", "snap.lemonade-server.daemon"]:
+                    events.append("start")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def record_bind(what: Path, where: Path) -> str:
+                events.append("bind")
+                return "unit.mount"
+
+            def record_set(path: Path) -> None:
+                events.append("set")
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                patch("lemonade._mounted_wheres", return_value=()),
+                patch("lemonade._run", side_effect=record_run),
+                patch("lemonade._write_bind_unit", side_effect=record_bind),
+                patch("lemonade._set_extra_models_dir", side_effect=record_set),
+                patch("lemonade.report_load_tuning", return_value=""),
+            ):
+                publish(_target(home))
+            self.assertEqual(events, ["active", "stop", "bind", "set", "start"])
+
+    def test_publish_leaves_stopped_daemon_stopped(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            real = home / "AI models"
+            _write_gguf(real / "tiny.gguf")
+            dest = Path(tmp) / "snap-common" / "ubuntuai-models"
+            unit_dir = Path(tmp) / "units"
+            unit_dir.mkdir()
+            events: list[str] = []
+
+            def record_run(cmd: list[str]) -> SimpleNamespace:
+                if cmd[:3] == ["systemctl", "is-active", "--quiet"]:
+                    events.append("active")
+                    return SimpleNamespace(returncode=3, stdout="inactive", stderr="")
+                if cmd[:3] == ["systemctl", "stop", "snap.lemonade-server.daemon"]:
+                    events.append("stop")
+                if cmd[:3] == ["systemctl", "start", "snap.lemonade-server.daemon"]:
+                    events.append("start")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
+                patch("lemonade._mounted_wheres", return_value=()),
+                patch("lemonade._run", side_effect=record_run),
+                patch("lemonade._write_bind_unit", return_value="unit.mount"),
+                patch("lemonade._set_extra_models_dir"),
+                patch("lemonade.report_load_tuning", return_value=""),
+            ):
+                publish(_target(home))
+            self.assertEqual(events, ["active"])
 
     def test_missing_embeddings_adds_no_bind(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1143,6 +1438,7 @@ class LemonadeLoadTuningTests(unittest.TestCase):
             home = Path(tmp)
             with (
                 patch("lemonade.read_config", side_effect=read),
+                patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
                 patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
                 patch("lemonade.largest_gguf_bytes", return_value=105 * 1024**3),
                 patch("lemonade.shutil.which", return_value=None),
@@ -1151,6 +1447,8 @@ class LemonadeLoadTuningTests(unittest.TestCase):
         self.assertEqual(reads, ["read"])
         self.assertIn("lemonade load settings kept", text)
         self.assertIn("Strong warning", text)
+        self.assertIn("2 models", text)
+        self.assertNotIn("keep one model", text)
         self.assertEqual(LOAD_RISK_POLICY, "warn_only")
         risk = load_risk(0.60, 105 * 1024**3, "vulkan")
         self.assertEqual(risk["action"], "warn")
@@ -1187,6 +1485,7 @@ class LemonadeLoadTuningTests(unittest.TestCase):
         defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
         with (
             patch("lemonade.read_config", side_effect=read),
+            patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
             patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
         ):
             msg = apply_tuning(defaults)
@@ -1235,6 +1534,7 @@ class LemonadeLoadTuningTests(unittest.TestCase):
         defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
         with (
             patch("lemonade.read_config", side_effect=read),
+            patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
             patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
         ):
             msg = apply_tuning(defaults)
@@ -1266,11 +1566,99 @@ class LemonadeLoadTuningTests(unittest.TestCase):
         defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
         with (
             patch("lemonade.read_config", side_effect=read),
+            patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
             patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
             patch("lemonade.shutil.which", return_value=None),
         ):
             msg = apply_tuning(defaults)
         self.assertEqual(msg, "lemonade load settings kept")
+
+    def test_fresh_merged_defaults_get_our_tuning(self) -> None:
+        factory = _merged_factory()
+        state = json.loads(json.dumps(factory))
+        bodies: list[dict] = []
+
+        class _Resp:
+            def __enter__(self) -> _Resp:
+                return self
+
+            def __exit__(self, *args: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def read() -> dict:
+            return json.loads(json.dumps(state))
+
+        def urlopen(req: object, timeout: int = 3) -> _Resp:
+            body = json.loads(req.data.decode())  # type: ignore[attr-defined]
+            bodies.append(body)
+            state.update(body)
+            return _Resp()
+
+        defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
+        with (
+            patch("lemonade.read_config", side_effect=read),
+            patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
+            patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
+        ):
+            msg = apply_tuning(defaults)
+        self.assertEqual(msg, "lemonade load settings updated")
+        self.assertEqual(len(bodies), 1)
+        body = bodies[0]
+        self.assertEqual(body["ctx_size"], defaults["ctx_size"])
+        self.assertEqual(body["global_timeout"], defaults["global_timeout"])
+        self.assertEqual(body["max_loaded_models"], 1)
+        self.assertEqual(body["llamacpp_backend"], "vulkan")
+        self.assertEqual(body["llamacpp_args"], LLAMACPP_MMAP_ARGS)
+
+    def test_user_max_loaded_models_survives_merged_defaults(self) -> None:
+        factory = _merged_factory()
+        state = json.loads(json.dumps(factory))
+        state["max_loaded_models"] = 2
+        state["ctx_size"] = 16384
+        bodies: list[dict] = []
+
+        class _Resp:
+            def __enter__(self) -> _Resp:
+                return self
+
+            def __exit__(self, *args: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def read() -> dict:
+            return json.loads(json.dumps(state))
+
+        def urlopen(req: object, timeout: int = 3) -> _Resp:
+            body = json.loads(req.data.decode())  # type: ignore[attr-defined]
+            bodies.append(body)
+            state.update(body)
+            return _Resp()
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with (
+                patch("lemonade.read_config", side_effect=read),
+                patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
+                patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
+                patch("lemonade.largest_gguf_bytes", return_value=105 * 1024**3),
+            ):
+                text = report_load_tuning(_target(home), _vulkan_igpu(122))
+        self.assertEqual(len(bodies), 1)
+        body = bodies[0]
+        self.assertNotIn("max_loaded_models", body)
+        self.assertNotIn("ctx_size", body)
+        self.assertEqual(body["global_timeout"], 2400)
+        self.assertEqual(body["llamacpp_backend"], "vulkan")
+        self.assertEqual(body["llamacpp_args"], LLAMACPP_MMAP_ARGS)
+        self.assertEqual(state["max_loaded_models"], 2)
+        self.assertEqual(state["ctx_size"], 16384)
+        self.assertIn("2 models", text)
+        self.assertNotIn("keep one model", text)
 
 
 class LemonadeLoadRiskTests(unittest.TestCase):
@@ -1379,7 +1767,7 @@ class LemonadePublishTuningTests(unittest.TestCase):
             hw = _vulkan_igpu(122)
             captured: list[dict] = []
 
-            def record_apply(settings: dict) -> str:
+            def record_apply(settings: dict, *_args: object) -> str:
                 captured.append(settings)
                 return "lemonade load settings updated"
 

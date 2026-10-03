@@ -604,9 +604,11 @@ def write_core_files(user: str, model_root: str, bind: str) -> None:
     )
     ENV_FILE.write_text(env, encoding="utf-8")
     os.chmod(ENV_FILE, 0o644)
+    env_ref = shlex.quote(str(ENV_FILE))
     PROFILE_FILE.write_text(
         "# Ubuntu AI Installer\n"
-        "[ -r /etc/ubuntuai/ubuntuai.env ] && . /etc/ubuntuai/ubuntuai.env\n"
+        f"[ -r {env_ref} ] && . {env_ref}\n"
+        "export UBUNTUAI_MODELS\n"
         "[ -d \"$HOME/.local/bin\" ] && case \":$PATH:\" in\n"
         "  *\":$HOME/.local/bin:\"*) ;;\n"
         "  *) PATH=\"$HOME/.local/bin:$PATH\" ;;\n"

@@ -5,8 +5,9 @@ extra_models_dir. Bind the real trees into SNAP_LEMONADE_MODELS and set
 extra_models_dir to that snap-common path.
 
 Chat trees always land at dest/chat/srcN. Embedding GGUFs also bind at
-dest/embeddings. Lemonade labels a GGUF as embeddings only when that
-file's first directory under extra_models_dir is embeddings.
+dest/embeddings. Lemonade labels a GGUF from the first directory under
+extra_models_dir. The model_root chat bind would still show embeddings
+as chat, so an empty read-only tmpfs covers that one srcN/embeddings.
 
 Apply runs helper verb lemonade-publish after weights. That verb calls
 publish(target_for(USER)). CLI --publish-lemonade is the same verb.
@@ -40,6 +41,7 @@ LEMONADE_API = "http://127.0.0.1:13305"
 APPLY_PUBLISH_VERB = "lemonade-publish"
 OWNED_UNIT_DESC = "Ubuntu AI models for Lemonade"
 SYSTEM_UNIT_DIR = Path("/etc/systemd/system")
+DAEMON_UNIT = "snap.lemonade-server.daemon"
 
 # Mark HITL. This PR warns only. Flip the string if a later change should refuse.
 LOAD_RISK_POLICY = "warn_only"
@@ -49,6 +51,18 @@ STRONG_FRAC = 0.50
 HUGE_GGUF_BYTES = 80 * 1024**3
 # Lemonade has no load-mode key. /internal/set uses llamacpp_args.
 LLAMACPP_MMAP_ARGS = "--load-mode mmap"
+# Shipped lemonade defaults.json. /internal/config merges these in, so a
+# fresh install looks fully set until it is compared with /internal/config/defaults.
+SHIPPED_DEFAULTS: dict[str, object] = {
+    "ctx_size": -1,
+    "global_timeout": 600,
+    "max_loaded_models": 1,
+    "llamacpp": {
+        "backend": "auto",
+        "args": "",
+        "vulkan_args": "",
+    },
+}
 CLI_TUNING_KEYS = {
     "llamacpp_backend": "llamacpp.backend",
     "llamacpp_args": "llamacpp.args",
@@ -77,7 +91,7 @@ def extra_dir(kind: str) -> Path:
 
 
 def gguf_sources(target: UserTarget) -> tuple[Path, ...]:
-    """Real GGUF trees. Store symlinks are followed. HF and Diffusers stay put."""
+    """Real GGUF trees. The model_root tree is src0. Other trees are sorted."""
     trees: list[Path] = []
     seen: set[Path] = set()
     for root in _search_roots(target):
@@ -86,7 +100,7 @@ def gguf_sources(target: UserTarget) -> tuple[Path, ...]:
                 continue
             seen.add(tree)
             trees.append(tree)
-    return _collapse(tuple(trees))
+    return _order_sources(_collapse(tuple(trees)), target)
 
 
 def bind_mounts(sources: tuple[Path, ...], dest: Path) -> tuple[BindMount, ...]:
@@ -106,8 +120,9 @@ def bind_mounts(sources: tuple[Path, ...], dest: Path) -> tuple[BindMount, ...]:
 def embeddings_mount(target: UserTarget, dest: Path) -> BindMount | None:
     """Bind model_root/embeddings at dest/embeddings when that folder has a GGUF.
 
-    The chat srcN mount hides that folder under chat/. Lemonade reads the
-    embeddings label from the first directory under extra_models_dir.
+    Lemonade reads the embeddings label from the first directory under
+    extra_models_dir. This bind is that directory. The chat srcN bind is a
+    second copy and is covered separately.
     """
     source = _embeddings_source(target)
     if source is None:
@@ -115,8 +130,25 @@ def embeddings_mount(target: UserTarget, dest: Path) -> BindMount | None:
     return BindMount(source, dest / "embeddings")
 
 
+def embeddings_cover(
+    model_root: Path, mounts: tuple[BindMount, ...]
+) -> BindMount | None:
+    """Empty tmpfs over embeddings inside the model_root chat bind.
+
+    One cover follows that srcN. Extra per-directory binds would renumber srcN.
+    """
+    root = _resolve(model_root)
+    for mount in mounts:
+        if _is_cover(mount) or _resolve(mount.what) != root:
+            continue
+        if not _is_srcn(mount.where.name):
+            continue
+        return BindMount(Path("tmpfs"), mount.where / "embeddings")
+    return None
+
+
 def is_owned_lemonade_where(dest: Path, where: Path) -> bool:
-    """True for dest, dest/embeddings, or dest/chat/srcN.
+    """True for dest, dest/embeddings, dest/chat/srcN, or that srcN embeddings cover.
 
     dest itself is a legacy single-source bind. Cleanup still recognizes it.
     """
@@ -129,6 +161,13 @@ def is_owned_lemonade_where(dest: Path, where: Path) -> bool:
     except ValueError:
         return False
     if rel.parts == ("embeddings",):
+        return True
+    if (
+        len(rel.parts) == 3
+        and rel.parts[0] == "chat"
+        and _is_srcn(rel.parts[1])
+        and rel.parts[2] == "embeddings"
+    ):
         return True
     return len(rel.parts) == 2 and rel.parts[0] == "chat" and _is_srcn(rel.parts[1])
 
@@ -191,7 +230,8 @@ def owned_bind_wheres(
 
 def quote_unit_path(path: Path) -> str:
     # RequiresMountsFor= splits on spaces. Quotes keep ~/AI models as one path.
-    text = str(path).replace("\\", "\\\\").replace('"', '\\"')
+    # % starts a specifier inside the quoted value too.
+    text = str(path).replace("\\", "\\\\").replace("%", "%%").replace('"', '\\"')
     return f'"{text}"'
 
 
@@ -216,6 +256,26 @@ def mount_unit_text(what: Path, where: Path) -> str:
         f"Where={mount_unit_path(where)}\n"
         "Type=none\n"
         "Options=bind,nofail\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
+def cover_unit_text(where: Path, parent_unit: str) -> str:
+    # Mounts after the model_root srcN bind. Hides embeddings that Lemonade would label chat.
+    return (
+        "[Unit]\n"
+        f"Description={OWNED_UNIT_DESC}\n"
+        f"RequiresMountsFor={quote_unit_path(where.parent)}\n"
+        f"After={parent_unit}\n"
+        "Before=snap.lemonade-server.daemon.service\n"
+        "\n"
+        "[Mount]\n"
+        "What=tmpfs\n"
+        f"Where={mount_unit_path(where)}\n"
+        "Type=tmpfs\n"
+        "Options=ro,nosuid,nodev,noexec,size=64k,mode=0555,nofail\n"
         "\n"
         "[Install]\n"
         "WantedBy=multi-user.target\n"
@@ -403,8 +463,40 @@ def _collapse(trees: tuple[Path, ...]) -> tuple[Path, ...]:
     return tuple(kept)
 
 
+def _order_sources(trees: tuple[Path, ...], target: UserTarget) -> tuple[Path, ...]:
+    """model_root first so vulkan_bin stays on src0. Remaining trees sort by path."""
+    if not trees:
+        return ()
+    primary = _primary_tree(trees, target)
+    rest = [tree for tree in trees if tree != primary]
+    rest.sort(key=str)
+    if primary is None:
+        return tuple(rest)
+    return (primary, *rest)
+
+
+def _primary_tree(trees: tuple[Path, ...], target: UserTarget) -> Path | None:
+    model_root = _resolve(target.model_root)
+    store = _resolve(target.model_root / "gguf")
+    for tree in trees:
+        if tree == model_root:
+            return tree
+    for tree in trees:
+        if tree == store:
+            return tree
+    parents = [tree for tree in trees if _nested_under(model_root, tree)]
+    if not parents:
+        return None
+    parents.sort(key=lambda path: len(path.parts))
+    return parents[-1]
+
+
 def _is_srcn(name: str) -> bool:
     return name.startswith("src") and name[3:].isdigit()
+
+
+def _is_cover(mount: BindMount) -> bool:
+    return mount.what == Path("tmpfs")
 
 
 def _unit_is_ours(path: Path) -> bool:
@@ -415,9 +507,10 @@ def _unit_is_ours(path: Path) -> bool:
     return f"Description={OWNED_UNIT_DESC}" in text
 
 
-def _where_from_unit(text: str) -> Path | None:
+def _field_from_unit(text: str, field: str) -> str | None:
+    prefix = f"{field}="
     for line in text.splitlines():
-        if not line.startswith("Where="):
+        if not line.startswith(prefix):
             continue
         raw = line.split("=", 1)[1].strip()
         if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
@@ -425,8 +518,17 @@ def _where_from_unit(text: str) -> Path | None:
         else:
             # New units write a literal percent as %%. Legacy quoted units do not.
             raw = raw.replace("%%", "%")
-        return Path(raw) if raw else None
+        return raw or None
     return None
+
+
+def _where_from_unit(text: str) -> Path | None:
+    raw = _field_from_unit(text, "Where")
+    return Path(raw) if raw else None
+
+
+def _what_from_unit(text: str) -> str | None:
+    return _field_from_unit(text, "What")
 
 
 def _owned_unit_path(where: Path) -> Path | None:
@@ -474,6 +576,8 @@ def _drop_bind_unit(where: Path, dest: Path) -> None:
         if unit:
             _run(["systemctl", "disable", "--now", unit])
     _run(["umount", str(where)])
+    if _is_mountpoint(where):
+        raise RuntimeError(_still_mounted_message(where))
 
 
 def _drop_obsolete_owned_binds(
@@ -499,7 +603,93 @@ def _escape_mount(where: Path) -> str:
     return name
 
 
+def _is_mountpoint(where: Path) -> bool:
+    where = _resolve(where)
+    return any(_resolve(item) == where for item in _mounted_wheres())
+
+
+def _bind_dest(where: Path) -> Path:
+    where = _resolve(where)
+    if (
+        where.name == "embeddings"
+        and _is_srcn(where.parent.name)
+        and where.parent.parent.name == "chat"
+    ):
+        return where.parent.parent.parent
+    if _is_srcn(where.name) and where.parent.name == "chat":
+        return where.parent.parent
+    if where.name == "embeddings":
+        return where.parent
+    return where
+
+
+def _owned_ancestor_mount(where: Path, dest: Path) -> Path | None:
+    where = _resolve(where)
+    mounted = {_resolve(item) for item in _mounted_wheres()}
+    for parent in where.parents:
+        if parent in mounted and is_owned_lemonade_where(dest, parent):
+            return parent
+    return None
+
+
+def _still_mounted_message(where: Path) -> str:
+    return (
+        f"The old Lemonade folder is still mounted at {where}. "
+        "Publish stopped so your model files stay where they are."
+    )
+
+
+def _planned_what(mount: BindMount) -> str:
+    if _is_cover(mount):
+        return "tmpfs"
+    return str(_resolve(mount.what))
+
+
+def _unit_what(text: str) -> str | None:
+    raw = _what_from_unit(text)
+    if raw is None:
+        return None
+    if raw == "tmpfs":
+        return raw
+    return str(_resolve(Path(raw)))
+
+
+def _refresh_changed_whats(plan: tuple[BindMount, ...]) -> None:
+    """Remount an owned unit whose source moved but whose Where stayed put."""
+    for mount in plan:
+        path = _owned_unit_path(mount.where)
+        if path is None:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        current = _unit_what(text)
+        if current is None or current == _planned_what(mount):
+            continue
+        _run(["systemctl", "stop", path.name])
+        _run(["umount", str(mount.where)])
+        if _is_mountpoint(mount.where):
+            raise RuntimeError(_still_mounted_message(mount.where))
+
+
+def _daemon_was_running() -> bool:
+    return _run(["systemctl", "is-active", "--quiet", DAEMON_UNIT]).returncode == 0
+
+
+def _stop_daemon() -> None:
+    _run(["systemctl", "stop", DAEMON_UNIT])
+
+
+def _start_daemon() -> None:
+    _run(["systemctl", "start", DAEMON_UNIT])
+
+
 def _write_bind_unit(what: Path, where: Path) -> str:
+    dest = _bind_dest(where)
+    ancestor = _owned_ancestor_mount(where, dest)
+    if ancestor is not None:
+        raise RuntimeError(_still_mounted_message(ancestor))
     where.mkdir(parents=True, exist_ok=True)
     unit = _escape_mount(where)
     text = mount_unit_text(what, where)
@@ -515,6 +705,81 @@ def _write_bind_unit(what: Path, where: Path) -> str:
                 + (mounted.stderr or mounted.stdout or "")
             )
     return unit
+
+
+def _write_cover_unit(where: Path, parent_unit: str) -> str:
+    # The parent bind already exposes this directory. Never mkdir it.
+    if not where.is_dir():
+        raise RuntimeError(
+            f"The embeddings cover has no folder at {where}. "
+            "Publish stopped so your model files stay where they are."
+        )
+    unit = _escape_mount(where)
+    text = cover_unit_text(where, parent_unit)
+    path = Path("/etc/systemd/system") / unit
+    path.write_text(text, encoding="utf-8")
+    _run(["systemctl", "daemon-reload"])
+    enabled = _run(["systemctl", "enable", "--now", unit])
+    if enabled.returncode != 0:
+        mounted = _run(
+            [
+                "mount",
+                "-t",
+                "tmpfs",
+                "-o",
+                "ro,nosuid,nodev,noexec,size=64k,mode=0555",
+                "tmpfs",
+                str(where),
+            ]
+        )
+        if mounted.returncode != 0:
+            raise RuntimeError(
+                (enabled.stderr or enabled.stdout or "")
+                + (mounted.stderr or mounted.stdout or "")
+            )
+    return unit
+
+
+def _snap_mount_plan(
+    target: UserTarget, dest: Path, sources: tuple[Path, ...]
+) -> tuple[BindMount, ...]:
+    mounts = list(bind_mounts(sources, dest))
+    cover = None
+    if _embeddings_source(target) is not None:
+        cover = embeddings_cover(target.model_root, tuple(mounts))
+    ordered: list[BindMount] = []
+    for mount in mounts:
+        ordered.append(mount)
+        if cover is not None and _resolve(mount.where) == _resolve(cover.where.parent):
+            ordered.append(cover)
+    emb = embeddings_mount(target, dest)
+    if emb is not None:
+        ordered.append(emb)
+    return tuple(ordered)
+
+
+def _apply_snap_mounts(dest: Path, mounts: tuple[BindMount, ...]) -> str:
+    was_running = _daemon_was_running()
+    label = ""
+    try:
+        if was_running:
+            _stop_daemon()
+        _refresh_changed_whats(mounts)
+        _drop_obsolete_owned_binds(dest, mounts)
+        written: dict[Path, str] = {}
+        for mount in mounts:
+            if _is_cover(mount):
+                parent = _resolve(mount.where.parent)
+                parent_unit = written.get(parent) or _escape_mount(mount.where.parent)
+                _write_cover_unit(mount.where, parent_unit)
+            else:
+                label = _write_bind_unit(mount.what, mount.where)
+                written[_resolve(mount.where)] = label
+        _set_extra_models_dir(dest)
+    finally:
+        if was_running:
+            _start_daemon()
+    return label
 
 
 def _set_extra_models_dir(path: Path) -> None:
@@ -633,23 +898,38 @@ def load_risk(
     }
 
 
-def risk_english(risk: dict[str, object], ram_bytes: int = 0) -> str:
+def _models_phrase(count: int) -> str:
+    if count == 1:
+        return "one model"
+    if count < 0:
+        return "as many models as memory allows"
+    return f"{count} models"
+
+
+def risk_english(
+    risk: dict[str, object], ram_bytes: int = 0, max_loaded_models: int = 1
+) -> str:
     level = str(risk.get("level") or "ok")
     if level == "ok":
         return ""
     size = human_bytes(int(risk.get("bytes") or 0))
     ram = human_bytes(ram_bytes) if ram_bytes else "this machine's RAM"
+    try:
+        count = int(max_loaded_models)
+    except (TypeError, ValueError):
+        count = 1
+    kept = _models_phrase(count)
     if level == "strong":
         return (
             f"Strong warning. Largest GGUF is {size} on {ram}. "
             "Vulkan can lose the GPU when a file this large is loaded. "
-            "Lemonade will keep one model, shrink context, and memory-map the file. "
+            f"Lemonade will keep {kept}, shrink context, and memory-map the file. "
             "Publish and updates continue."
         )
     return (
         f"Warning. Largest GGUF is {size} on {ram}. "
         "That is a large share of RAM. "
-        "Lemonade will keep one model and shrink context."
+        f"Lemonade will keep {kept} and shrink context."
     )
 
 
@@ -782,24 +1062,80 @@ def _is_set(flat: dict, key: str) -> bool:
     return True
 
 
-def _load_mode_set(flat: dict) -> bool:
-    return _is_set(flat, "llamacpp_args") or _is_set(flat, "llamacpp_vulkan_args")
+def _values_equal(left: object, right: object) -> bool:
+    left_int = _as_int(left)
+    right_int = _as_int(right)
+    if left_int is not None and right_int is not None:
+        if isinstance(left, bool) or isinstance(right, bool):
+            return left == right
+        return left_int == right_int
+    return str(left if left is not None else "").strip() == str(
+        right if right is not None else ""
+    ).strip()
+
+
+def _user_overrode(current: dict, factory: dict, key: str) -> bool:
+    if not _is_set(current, key):
+        return False
+    if key not in factory:
+        return True
+    return not _values_equal(current.get(key), factory.get(key))
+
+
+def _load_mode_overrode(current: dict, factory: dict) -> bool:
+    return _user_overrode(current, factory, "llamacpp_args") or _user_overrode(
+        current, factory, "llamacpp_vulkan_args"
+    )
+
+
+def read_factory_defaults() -> dict:
+    req = urllib.request.Request(
+        f"{LEMONADE_API}/internal/config/defaults",
+        headers={"User-Agent": UA},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if isinstance(data, dict) and data:
+            return data
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        pass
+    return json.loads(json.dumps(SHIPPED_DEFAULTS))
 
 
 def tuning_to_apply(
-    defaults: dict[str, object], current: dict
+    defaults: dict[str, object],
+    current: dict,
+    factory: dict | None = None,
 ) -> dict[str, object]:
-    """Defaults for keys the server has not set. Existing values stay put."""
+    """Write a default only when the server still has the factory value."""
+    if factory is None:
+        factory = read_factory_defaults()
     flat = _flatten_config(current) if current else {}
+    flat_factory = _flatten_config(factory) if factory else {}
     chosen: dict[str, object] = {}
     for key, value in defaults.items():
         if key == "llamacpp_args":
-            if _load_mode_set(flat):
+            if _load_mode_overrode(flat, flat_factory):
                 continue
-        elif _is_set(flat, key):
+        elif _user_overrode(flat, flat_factory, key):
             continue
         chosen[key] = value
     return chosen
+
+
+def effective_max_loaded(
+    settings: dict[str, object], current: dict, factory: dict
+) -> int:
+    flat = _flatten_config(current) if current else {}
+    flat_factory = _flatten_config(factory) if factory else {}
+    if _user_overrode(flat, flat_factory, "max_loaded_models"):
+        value = _as_int(flat.get("max_loaded_models"))
+        if value is not None:
+            return value
+    value = _as_int(settings.get("max_loaded_models"))
+    return 1 if value is None else value
 
 
 def verify_tuning(
@@ -840,9 +1176,17 @@ def verify_tuning(
     return True, ""
 
 
-def apply_tuning(settings: dict[str, object]) -> str:
-    # Read first so a value already on the server is not replaced by a default.
-    chosen = tuning_to_apply(settings, read_config())
+def apply_tuning(
+    settings: dict[str, object],
+    current: dict | None = None,
+    factory: dict | None = None,
+) -> str:
+    # Compare with factory defaults. /internal/config already merges them in.
+    if current is None:
+        current = read_config()
+    if factory is None:
+        factory = read_factory_defaults()
+    chosen = tuning_to_apply(settings, current, factory)
     if not chosen:
         return "lemonade load settings kept"
     body = json.dumps(chosen).encode("utf-8")
@@ -882,14 +1226,20 @@ def report_load_tuning(target: UserTarget, hw=None) -> str:
     frac = largest / max(ram, 1)
     risk = load_risk(frac, largest, str(settings.get("llamacpp_backend") or ""))
     lines: list[str] = []
+    current = read_config()
+    factory = read_factory_defaults()
     try:
-        lines.append(apply_tuning(settings))
+        lines.append(apply_tuning(settings, current, factory))
     except RuntimeError:
         lines.append(
             "Lemonade did not accept the load settings. "
             "Models are still published."
         )
-    warn = risk_english(risk, ram_bytes=ram)
+    warn = risk_english(
+        risk,
+        ram_bytes=ram,
+        max_loaded_models=effective_max_loaded(settings, current, factory),
+    )
     if warn:
         lines.append(warn)
     return "\n".join(line for line in lines if line)
@@ -911,28 +1261,21 @@ def publish(target: UserTarget) -> str:
     sources = gguf_sources(target)
     if kind == "snap":
         dest = extra_dir(kind)
-        mounts = bind_mounts(sources, dest)
-        emb = embeddings_mount(target, dest)
-        if emb is not None:
-            mounts = (*mounts, emb)
+        mounts = _snap_mount_plan(target, dest, sources)
         if not mounts:
             return "no real GGUF files to publish (Lemonade cannot follow store symlinks)"
         if dest == Path() or is_home_path(dest):
             raise RuntimeError(
                 "snap extra_models_dir must be under /var/snap/lemonade-server/common"
             )
-        # Drop a legacy dest bind before writing dest/chat/srcN.
-        # A leftover dest bind would write chat/ into the user's tree.
-        _drop_obsolete_owned_binds(dest, mounts)
-        unit = ""
-        for mount in mounts:
-            unit = _write_bind_unit(mount.what, mount.where)
-        _set_extra_models_dir(dest)
-        _restart_snap()
-        if len(mounts) == 1:
+        # Stop the daemon before replacing binds. A busy dest mount would
+        # mkdir chat/ inside the user's model tree.
+        unit = _apply_snap_mounts(dest, mounts)
+        visible = sum(1 for mount in mounts if not _is_cover(mount))
+        if visible == 1:
             prefix = f"lemonade extra_models_dir={dest} via {unit}"
         else:
-            prefix = f"lemonade extra_models_dir={dest} ({len(mounts)} trees)"
+            prefix = f"lemonade extra_models_dir={dest} ({visible} trees)"
         extra = report_load_tuning(target)
         return f"{prefix}\n{extra}" if extra else prefix
     if not sources:

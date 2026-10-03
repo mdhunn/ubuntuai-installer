@@ -527,6 +527,23 @@ class ApplyTests(unittest.TestCase):
                 )
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertEqual(completed.stdout, str(root.resolve()))
+                profile = (etc_path / "ubuntuai.sh").read_text(encoding="utf-8")
+                self.assertIn("export UBUNTUAI_MODELS\n", profile)
+                self.assertIn(shlex.quote(str(env)), profile)
+                child = subprocess.run(
+                    [
+                        "sh",
+                        "-c",
+                        ". \"$1\"; sh -c 'printf %s \"$UBUNTUAI_MODELS\"'",
+                        "sh",
+                        str(etc_path / "ubuntuai.sh"),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(child.returncode, 0, child.stderr)
+                self.assertEqual(child.stdout, str(root.resolve()))
 
 
 if __name__ == "__main__":
