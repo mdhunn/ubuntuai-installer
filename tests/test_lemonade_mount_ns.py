@@ -322,6 +322,72 @@ def namespace_child() -> None:
 
         real_run(["umount", str(emb)], check=False, capture_output=True, text=True)
         clear_plan(plan)
+
+        def cover_tmpfs(path: Path, data: bytes) -> None:
+            path.mkdir(parents=True, exist_ok=True)
+            mount_ok(
+                [
+                    "mount",
+                    "-t",
+                    "tmpfs",
+                    "-o",
+                    "rw,nosuid,nodev,noexec,size=64k,mode=0555",
+                    "tmpfs",
+                    str(path),
+                ]
+            )
+            (path / "keep.gguf").write_bytes(data)
+            mount_ok(
+                [
+                    "mount",
+                    "-o",
+                    "remount,ro,nosuid,nodev,noexec,size=64k,mode=0555",
+                    str(path),
+                ]
+            )
+
+        def refused(tag: str) -> None:
+            try:
+                lemonade.publish(target)
+            except RuntimeError as exc:
+                print(f"{tag}_ERR={exc}")
+            else:
+                print(f"{tag}_ERR=")
+                sys.stderr.write(f"{tag} exact cover was not refused\n")
+                raise SystemExit(8)
+
+        cover_tmpfs(emb, b"keep-exact")
+        refused("P6")
+        print(f"P6_STILL={int(mounted(emb))}")
+        print(f"P6_KEEP={keep_text(emb)}")
+        real_run(["umount", str(emb)], check=False, capture_output=True, text=True)
+
+        cover_tmpfs(emb, b"keep-destpeer")
+        mount_ok(["mount", "--make-shared", str(emb)])
+        mount_ok(["mount", "--bind", str(emb), str(dest / "embeddings")])
+        refused("P7")
+        print(f"P7_STILL={int(mounted(emb))}")
+        print(f"P7_KEEP={keep_text(emb)}")
+        real_run(["umount", str(dest / "embeddings")], check=False, capture_output=True, text=True)
+        real_run(["umount", str(emb)], check=False, capture_output=True, text=True)
+
+        mount_ok(["mount", "-t", "tmpfs", "-o", "rw,size=64m", "tmpfs", str(source)])
+        emb.mkdir(parents=True, exist_ok=True)
+        (emb / "file.gguf").write_bytes(b"G" * 32)
+        (source / "chat.gguf").write_bytes(b"C" * 32)
+        tmpfs_plan = lemonade._snap_mount_plan(target, dest, lemonade.gguf_sources(target))
+        msg = lemonade.publish(target)
+        if str(msg).startswith("ERROR"):
+            sys.stderr.write(str(msg) + "\n")
+            raise SystemExit(9)
+        before_ids = mount_ids(dest / "embeddings")
+        lemonade.publish(target)
+        after_ids = mount_ids(dest / "embeddings")
+        print("P8_BEFORE=" + ",".join(str(item) for item in before_ids))
+        print("P8_AFTER=" + ",".join(str(item) for item in after_ids))
+        print(f"P8_COUNT={len(after_ids)}")
+        clear_plan(tmpfs_plan)
+        real_run(["umount", str(source)], check=False, capture_output=True, text=True)
         left: list[str] = []
         for line in Path("/proc/self/mountinfo").read_text().splitlines():
             parts = line.split()
@@ -399,6 +465,17 @@ class LemonadeMountNamespaceTests(unittest.TestCase):
                 self.assertIn("keep.gguf", lines[f"{who}_p5_SOURCE"])
             self.assertEqual(lines["P5_STILL"], "1")
             self.assertEqual(lines["HOST_p5_EMB_MOUNT"], "1")
+            self.assertIn("not the empty cover", lines["P6_ERR"])
+            self.assertIn("stays as it is", lines["P6_ERR"])
+            self.assertEqual(lines["P6_STILL"], "1")
+            self.assertEqual(lines["P6_KEEP"], "keep-exact")
+            self.assertIn("not the empty cover", lines["P7_ERR"])
+            self.assertIn("stays as it is", lines["P7_ERR"])
+            self.assertEqual(lines["P7_STILL"], "1")
+            self.assertEqual(lines["P7_KEEP"], "keep-destpeer")
+            self.assertEqual(lines["P8_BEFORE"], lines["P8_AFTER"])
+            self.assertEqual(lines["P8_COUNT"], "1")
+            self.assertNotEqual(lines["P8_BEFORE"], "")
             self.assertEqual(lines["LEFT"], "none")
             self.assertEqual(lines["HOST_EMB_AFTER"], "file.gguf")
             self.assertEqual(lines["HOST_EMB_MOUNT_AFTER"], "0")
