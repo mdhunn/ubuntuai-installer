@@ -2371,6 +2371,7 @@ class LemonadePublishTests(unittest.TestCase):
             root = home / "models"
             emb = root / "embeddings"
             kept = _write_gguf(emb / "embed.gguf")
+            expected = kept.read_bytes()
             _write_gguf(root / "chat.gguf")
             dest = Path(tmp) / "ubuntuai-models"
             text = f"12 1 0:46 / {emb} rw,relatime - tmpfs tmpfs rw,size=1024k\n"
@@ -2396,7 +2397,7 @@ class LemonadePublishTests(unittest.TestCase):
             self.assertIn("stays as it is", message)
             self.assertNotIn("Traceback", message)
             self.assertFalse(any(cmd and cmd[0] == "umount" for cmd in cmds))
-            self.assertEqual(kept.read_bytes(), b"G" * 2048)
+            self.assertEqual(kept.read_bytes(), expected)
 
     def test_publish_refuses_a_cover_shared_only_with_a_foreign_mount(self) -> None:
         with TemporaryDirectory() as tmp:
