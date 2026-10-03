@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -621,6 +622,31 @@ def _already_in_store(path: Path, model_root: Path) -> bool:
     return bool(parts) and parts[0] in KNOWN_SUBDIRS
 
 
+def _partial_sibling(path: Path) -> str | None:
+    """A sibling aria2 or part file means the download is still writing."""
+    for suffix in (".aria2", COPY_PART_SUFFIX):
+        sibling = path.with_name(path.name + suffix)
+        try:
+            if sibling.exists() or sibling.is_symlink():
+                return sibling.name
+        except OSError:
+            continue
+    return None
+
+
+def _collision_dest_name(src: Path, base: str, n: int | None = None) -> str:
+    # A Hugging Face snapshot directory is named for the revision.
+    # Prefixing the parent "snapshots" produces a name that is not the model.
+    if src.parent.name == "snapshots":
+        label = src.name
+        if n is None:
+            return f"{base}-{label}"
+        return f"{base}-{label}-{n}"
+    if n is None:
+        return f"{src.parent.name}-{base}"
+    return f"{src.parent.name}-{n}-{base}"
+
+
 def _dest_for(
     src: Path,
     resolved: Path,
@@ -632,7 +658,7 @@ def _dest_for(
     base = preferred or src.name
     if _already_in_store(src, model_root):
         return base, "already"
-    names = [base, f"{src.parent.name}-{base}"]
+    names = [base, _collision_dest_name(src, base)]
     n = 2
     while True:
         for dest_name in names:
@@ -648,7 +674,7 @@ def _dest_for(
             if key in used:
                 continue
             return dest_name, "new"
-        names = [f"{src.parent.name}-{n}-{base}"]
+        names = [_collision_dest_name(src, base, n)]
         n += 1
 
 
@@ -672,6 +698,8 @@ def _append(
     dest_name, state = _dest_for(
         src, resolved, subdir, model_root, used, preferred=preferred
     )
+    if state == "new" and kind == "file" and _partial_sibling(src):
+        state = "busy"
     used[(subdir, dest_name)] = resolved
     found.append(
         FoundWeight(
@@ -946,11 +974,284 @@ def _refuse_foreign_mutate(
         )
 
 
-def _remove_source(path: Path, kind: str) -> None:
-    if kind == "dir" and path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
+class OrganizeLinkError(ValueError):
+    """Copy or move cannot place a real file for this link."""
+
+
+class _CopyPlan:
+    __slots__ = ("dirs", "files", "followed_dir_link", "has_symlink", "linked")
+
+    def __init__(self) -> None:
+        self.dirs: list[tuple[tuple[str, ...], Path]] = []
+        self.files: list[tuple[tuple[str, ...], Path]] = []
+        self.followed_dir_link = False
+        self.has_symlink = False
+        self.linked: set[tuple[str, ...]] = set()
+
+
+def _link_text(link: Path, root: Path) -> str:
+    if link == root:
+        return link.name
+    try:
+        return link.relative_to(root).as_posix()
+    except ValueError:
+        return link.name
+
+
+def _link_refusal(root: Path, link: Path, kind: str) -> OrganizeLinkError:
+    shown = _link_text(link, root)
+    if kind == "loop":
+        reason = f"The link {shown} loops."
+    elif kind == "dangling":
+        reason = f"The link {shown} points nowhere."
+    elif kind == "outside":
+        reason = f"The link {shown} points at a folder outside the bundle."
+    elif kind == "unreadable":
+        reason = f"The file linked from {shown} cannot be read."
+    elif kind == "unreadable-dir":
+        reason = f"The folder linked from {shown} cannot be read."
+    elif kind == "unreadable-folder":
+        reason = f"The folder {shown} cannot be read."
+    elif kind == "dir":
+        reason = f"The link {shown} points at a folder."
+    else:
+        reason = f"The link {shown} does not point at a file."
+    return OrganizeLinkError(
+        f"Organize is refused for {root}. {reason} The copy was not started."
+    )
+
+
+def _refusal_from_os(root: Path, link: Path, exc: OSError) -> OrganizeLinkError:
+    if exc.errno == errno.ELOOP:
+        return _link_refusal(root, link, "loop")
+    if exc.errno in {errno.ENOENT, errno.ENOTDIR}:
+        return _link_refusal(root, link, "dangling")
+    return _link_refusal(root, link, "unreadable")
+
+
+def _read_link_target(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    os.close(fd)
+
+
+def _final_target(link: Path, root: Path) -> Path:
+    """Follow link to a real path. Refuse a loop or a target that is not there."""
+    seen: set[tuple[int, int]] = set()
+    current = link
+    while True:
+        try:
+            st = current.lstat()
+        except OSError as exc:
+            raise _refusal_from_os(root, link, exc) from exc
+        if not stat.S_ISLNK(st.st_mode):
+            try:
+                return current.resolve()
+            except OSError as exc:
+                raise _refusal_from_os(root, link, exc) from exc
+        ident = (st.st_dev, st.st_ino)
+        if ident in seen:
+            raise _link_refusal(root, link, "loop")
+        seen.add(ident)
+        try:
+            raw = os.readlink(current)
+        except OSError as exc:
+            raise _refusal_from_os(root, link, exc) from exc
+        nxt = Path(raw)
+        if not nxt.is_absolute():
+            nxt = current.parent / nxt
+        current = nxt
+
+
+def _within_bundle(path: Path, root: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        base = root.resolve()
+    except OSError:
+        return False
+    return resolved == base or resolved.is_relative_to(base)
+
+
+def _ensure_link_readable(path: Path, root: Path, link: Path) -> None:
+    try:
+        _read_link_target(path)
+    except PermissionError as exc:
+        raise _link_refusal(root, link, "unreadable") from exc
+    except OSError as exc:
+        raise _refusal_from_os(root, link, exc) from exc
+
+
+def _require_file(path: Path) -> None:
+    if not path.is_symlink():
         return
-    path.unlink()
+    final = _final_target(path, path)
+    if final.is_dir():
+        raise _link_refusal(path, path, "dir")
+    if not final.is_file():
+        raise _link_refusal(path, path, "notfile")
+    _ensure_link_readable(final, path, path)
+
+
+def _walk_bundle(
+    directory: Path,
+    prefix: tuple[str, ...],
+    stack: set[Path],
+    root: Path,
+    via: Path | None,
+    plan: _CopyPlan,
+) -> None:
+    try:
+        real = directory.resolve()
+    except OSError as exc:
+        raise _refusal_from_os(root, via or directory, exc) from exc
+    if real in stack:
+        raise _link_refusal(root, via or directory, "loop")
+    stack.add(real)
+    plan.dirs.append((prefix, real))
+    try:
+        children = list(directory.iterdir())
+    except OSError as exc:
+        kind = "unreadable-dir" if via is not None else "unreadable-folder"
+        raise _link_refusal(root, via or directory, kind) from exc
+    for child in children:
+        rel = prefix + (child.name,)
+        if child.is_symlink():
+            plan.has_symlink = True
+            final = _final_target(child, root)
+            if final.is_dir():
+                if not _within_bundle(final, root):
+                    raise _link_refusal(root, child, "outside")
+                plan.followed_dir_link = True
+                _walk_bundle(final, rel, stack, root, child, plan)
+                continue
+            if not final.is_file():
+                raise _link_refusal(root, child, "notfile")
+            _ensure_link_readable(final, root, child)
+            plan.files.append((rel, final))
+            plan.linked.add(rel)
+            continue
+        if child.is_dir():
+            _walk_bundle(child, rel, stack, root, None, plan)
+            continue
+        if child.is_file():
+            plan.files.append((rel, child))
+    stack.remove(real)
+
+
+def _plan_tree(root: Path) -> _CopyPlan:
+    plan = _CopyPlan()
+    if root.is_symlink():
+        plan.has_symlink = True
+    _walk_bundle(root, (), set(), root, None, plan)
+    return plan
+
+
+def _tree_has_symlink(root: Path) -> bool:
+    if os.path.islink(root):
+        return True
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in [*dirnames, *filenames]:
+            if os.path.islink(os.path.join(dirpath, name)):
+                return True
+    return False
+
+
+def _plan_bytes(plan: _CopyPlan) -> int:
+    total = 0
+    for _rel, src in plan.files:
+        total += src.stat().st_size
+    return total
+
+
+def _hash_materialized(plan: _CopyPlan, algo: str) -> str:
+    """Hash the files the store tree will contain. Matches hash_path on that tree."""
+    name = normalize_algo(algo)
+    if name is None:
+        raise ValueError(f"unsupported hash algorithm {algo!r}")
+    digest = hashlib.new(name)
+    rows = sorted(
+        (("/".join(parts), src) for parts, src in plan.files),
+        key=lambda item: item[0],
+    )
+    for rel, src in rows:
+        digest.update(rel.encode())
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(hash_file(src, name)))
+    return digest.hexdigest()
+
+
+def _source_hash(path: Path, algo: str, plan: _CopyPlan | None) -> str:
+    # Folder links are stored as real files. Hash that layout, or the check fails.
+    if plan is not None and plan.followed_dir_link:
+        return _hash_materialized(plan, algo)
+    return hash_path(path, algo)
+
+
+def _space_anchor(path: Path) -> Path:
+    current = path
+    while not current.exists():
+        parent = current.parent
+        if parent == current:
+            return current
+        current = parent
+    return current
+
+
+def _remove_verified_source(path: Path, kind: str, plan: _CopyPlan | None) -> list[str]:
+    """Unlink copied entries only. Empty directories go. Anything else stays."""
+    if kind != "dir" or plan is None or path.is_symlink():
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+        except OSError:
+            return [path.name]
+        return [] if not path.exists() else [path.name]
+    file_rels = sorted({rel for rel, _src in plan.files}, key=len, reverse=True)
+    for rel in file_rels:
+        entry = path.joinpath(*rel)
+        try:
+            st = entry.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            try:
+                entry.unlink()
+            except OSError:
+                pass
+    dir_rels = sorted((rel for rel, _src in plan.dirs if rel), key=len, reverse=True)
+    for rel in dir_rels:
+        entry = path.joinpath(*rel)
+        try:
+            st = entry.lstat()
+        except OSError:
+            continue
+        try:
+            if stat.S_ISLNK(st.st_mode):
+                entry.unlink()
+            elif stat.S_ISDIR(st.st_mode):
+                entry.rmdir()
+        except OSError:
+            pass
+    if not path.exists():
+        return []
+    left: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+        base = Path(dirpath)
+        for name in list(dirnames):
+            child = base / name
+            if child.is_symlink():
+                left.append(child.relative_to(path).as_posix())
+                dirnames.remove(name)
+        for name in filenames:
+            left.append((base / name).relative_to(path).as_posix())
+        if base != path and not dirnames and not filenames:
+            left.append(base.relative_to(path).as_posix())
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+    if path.exists() and not left:
+        left.append(path.name)
+    return left
 
 
 def _copy_part(dest: Path) -> Path:
@@ -1020,15 +1321,43 @@ def _open_part(part: Path):
     return os.fdopen(fd, "wb")
 
 
-def _transfer_file(src: Path, part: Path) -> None:
-    with open(src, "rb") as rf, _open_part(part) as wf:
-        while True:
-            chunk = rf.read(1024 * 1024)
-            if not chunk:
-                break
-            wf.write(chunk)
-        wf.flush()
-        os.fsync(wf.fileno())
+def _read_failure(exc: OSError, *, linked: bool) -> RuntimeError:
+    if exc.errno in {errno.EACCES, errno.EPERM}:
+        return RuntimeError(
+            "Could not copy this model. The file cannot be read. "
+            "The partial file was removed."
+        )
+    if exc.errno in {errno.ENOENT, errno.ENOTDIR}:
+        if linked:
+            return RuntimeError(
+                "Could not copy this model. A link target was removed "
+                "before the copy finished. The partial file was removed."
+            )
+        return RuntimeError(
+            "Could not copy this model. The file was removed before the copy finished. "
+            "The partial file was removed."
+        )
+    return RuntimeError(
+        "Could not copy this model. The copy stopped with an error. "
+        "The partial file was removed."
+    )
+
+
+def _transfer_file(src: Path, part: Path, *, linked: bool = False) -> None:
+    try:
+        with open(src, "rb") as rf, _open_part(part) as wf:
+            while True:
+                chunk = rf.read(1024 * 1024)
+                if not chunk:
+                    break
+                wf.write(chunk)
+            wf.flush()
+            os.fsync(wf.fileno())
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            raise
+        linked_now = linked or src.is_symlink()
+        raise _read_failure(exc, linked=linked_now) from exc
 
 
 def _raise_copy_error(exc: Exception) -> None:
@@ -1037,6 +1366,8 @@ def _raise_copy_error(exc: Exception) -> None:
             "Could not copy this model. The disk filled up during the copy. "
             "The partial file was removed."
         ) from exc
+    if isinstance(exc, OSError):
+        raise _read_failure(exc, linked=False) from exc
     raise exc
 
 
@@ -1067,6 +1398,27 @@ def _copy_file_into_store(
         _raise_copy_error(exc)
 
 
+def _materialize_plan(
+    plan: _CopyPlan,
+    dest: Path,
+    uid: int | None,
+    gid: int | None,
+) -> None:
+    dest.mkdir()
+    for rel, _src in plan.dirs:
+        if not rel:
+            continue
+        dest.joinpath(*rel).mkdir(parents=True, exist_ok=True)
+    for rel, src in plan.files:
+        out = dest.joinpath(*rel)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        _transfer_file(src, out, linked=rel in plan.linked)
+        _finish_store_file(out, uid, gid)
+    if uid is not None and gid is not None:
+        for dirpath, _dirnames, _filenames in os.walk(dest):
+            os.chown(dirpath, uid, gid)
+
+
 def _copy_tree_into_store(
     item: FoundWeight,
     dest: Path,
@@ -1074,23 +1426,22 @@ def _copy_tree_into_store(
     gid: int | None,
     algo: str,
     src_hash: str,
+    plan: _CopyPlan | None = None,
 ) -> None:
-    _require_copy_space(dest.parent, _dir_size(item.path))
+    # The sibling staging directory is the only name written before the checksum.
+    # A killed copy leaves that directory, never a short file under the final name.
+    if plan is None:
+        plan = _plan_tree(item.path)
+    _require_copy_space(dest.parent, _plan_bytes(plan))
     part = _copy_part(dest)
     _clear_copy_temp(dest)
     try:
-        # A foreign tree must land as real files. Links back to that mount are refused.
-        shutil.copytree(item.path, part, symlinks=not foreign_source(item))
-        for dirpath, _dirnames, filenames in os.walk(part):
-            if uid is not None and gid is not None:
-                os.chown(dirpath, uid, gid)
-            for name in filenames:
-                fp = Path(dirpath) / name
-                if fp.is_symlink():
-                    continue
-                _finish_store_file(fp, uid, gid)
-                with open(fp, "rb") as fh:
-                    os.fsync(fh.fileno())
+        _materialize_plan(plan, part, uid, gid)
+        if _tree_has_symlink(part):
+            raise OrganizeLinkError(
+                f"Organize is refused for {item.path}. A link would remain in the store. "
+                "The copy was not kept."
+            )
         if hash_path(part, algo) != src_hash:
             raise RuntimeError(
                 f"checksum mismatch copying {item.path}. The store file was not kept."
@@ -1110,14 +1461,175 @@ def _copy_into_store(
     *,
     algo: str,
     src_hash: str,
+    plan: _CopyPlan | None = None,
 ) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if uid is not None and gid is not None:
         os.chown(dest.parent, uid, gid)
     if item.kind == "dir":
-        _copy_tree_into_store(item, dest, uid, gid, algo, src_hash)
+        _copy_tree_into_store(item, dest, uid, gid, algo, src_hash, plan)
         return
     _copy_file_into_store(item.path, dest, uid, gid, algo, src_hash)
+
+
+def _busy_line(item: FoundWeight) -> str:
+    sibling = _partial_sibling(item.path)
+    if sibling:
+        return (
+            f"Skipped {item.path}. {sibling} is still present, "
+            "so this download is not finished."
+        )
+    return f"Skipped {item.path}. A download is still writing this file."
+
+
+def _chown_tree(dest: Path, uid: int, gid: int) -> None:
+    for dirpath, dirnames, filenames in os.walk(dest, followlinks=False):
+        os.chown(dirpath, uid, gid, follow_symlinks=False)
+        for name in filenames:
+            os.chown(os.path.join(dirpath, name), uid, gid, follow_symlinks=False)
+        for name in dirnames:
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path):
+                os.chown(path, uid, gid, follow_symlinks=False)
+
+
+def _same_device(src: Path, dest_parent: Path) -> bool:
+    try:
+        return src.stat().st_dev == dest_parent.stat().st_dev
+    except OSError:
+        return False
+
+
+def _organize_one(
+    item: FoundWeight,
+    model_root: Path,
+    store: Path,
+    log: list[str],
+    *,
+    mode: str,
+    want_remove: bool,
+    uid: int | None,
+    gid: int | None,
+    dry_run: bool,
+) -> None:
+    dest = model_root / item.subdir / item.dest_name
+    if item.state == "already":
+        log.append(f"already {dest}")
+        return
+    if item.state == "exists":
+        log.append(f"skip {item.path} -> {dest} (name taken)")
+        return
+    if item.state == "busy" or (item.kind == "file" and _partial_sibling(item.path)):
+        log.append(_busy_line(item))
+        return
+    plan: _CopyPlan | None = None
+    if item.kind == "dir":
+        plan = _plan_tree(item.path)
+    else:
+        _require_file(item.path)
+    extra = " then remove source" if want_remove else ""
+    if dry_run:
+        log.append(f"{mode} {item.path} -> {dest}{extra}")
+        return
+    parent_writable = os.access(item.path.parent, os.W_OK)
+    same_disk = _same_device(item.path, _space_anchor(dest))
+    can_rename = (
+        mode == "move"
+        and item.kind == "dir"
+        and not item.path.is_symlink()
+        and plan is not None
+        and not plan.has_symlink
+        and parent_writable
+        and same_disk
+    )
+    # A byte copy needs room before the store directory is created.
+    if not can_rename and not (dest.exists() or dest.is_symlink()):
+        nbytes = _plan_bytes(plan) if plan is not None else item.path.stat().st_size
+        _require_copy_space(_space_anchor(dest), nbytes)
+    created_parent = not dest.parent.exists()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if uid is not None and gid is not None:
+        os.chown(dest.parent, uid, gid)
+    if dest.exists() or dest.is_symlink():
+        log.append(f"skip {dest} (appeared)")
+        return
+    keep_reason = ""
+    renamed = False
+    if (
+        mode == "move"
+        and item.kind == "dir"
+        and not item.path.is_symlink()
+        and plan is not None
+        and not plan.has_symlink
+        and parent_writable
+        and _same_device(item.path, dest.parent)
+    ):
+        # A link that appeared after the scan must not be renamed into the store.
+        if _tree_has_symlink(item.path):
+            plan = _plan_tree(item.path)
+        else:
+            try:
+                os.replace(item.path, dest)
+                renamed = True
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    if created_parent:
+                        try:
+                            dest.parent.rmdir()
+                        except OSError:
+                            pass
+                    raise OrganizeLinkError(
+                        f"Organize is refused for {item.path}. "
+                        "The move could not be completed. Nothing was written."
+                    ) from exc
+                keep_reason = "could not rename onto the store"
+                plan = _plan_tree(item.path)
+    if renamed:
+        if uid is not None and gid is not None:
+            try:
+                _chown_tree(dest, uid, gid)
+            except OSError as exc:
+                if exc.errno != errno.EPERM:
+                    raise
+                log.append(f"moved {item.path} -> {dest}")
+                log.append(
+                    f"Could not change the owner of {dest}. The files are in place."
+                )
+                return
+        log.append(f"moved {item.path} -> {dest}")
+        return
+    if not parent_writable:
+        keep_reason = "not writable"
+    algo = integrity_algo_for(item)
+    try:
+        src_hash = _source_hash(item.path, algo, plan)
+        _copy_into_store(
+            item, dest, uid, gid, algo=algo, src_hash=src_hash, plan=plan
+        )
+    except RuntimeError as exc:
+        if "checksum mismatch" in str(exc):
+            log.append(
+                f"checksum mismatch after {mode} {item.path} -> {dest} ({algo})"
+            )
+            return
+        raise
+    verb = "copied" if mode == "copy" else "moved"
+    log.append(f"{verb} {item.path} -> {dest} {algo}={src_hash[:12]}")
+    if not want_remove:
+        return
+    if keep_reason:
+        log.append(f"kept source {item.path} ({keep_reason})")
+        return
+    if _under(item.path, store):
+        log.append(f"kept source {item.path} (inside store)")
+        return
+    # The store name already holds the checked copy. Removal cannot undo that.
+    left = _remove_verified_source(item.path, item.kind, plan)
+    if left:
+        shown = ", ".join(left)
+        log.append(f"Kept source entries under {item.path}: {shown}")
+        return
+    log.append(f"removed source {item.path} after checksum match")
 
 
 def organize(
@@ -1140,45 +1652,24 @@ def organize(
     except OSError:
         store = model_root
     for item in items:
-        dest = model_root / item.subdir / item.dest_name
-        if item.state == "already":
-            log.append(f"already {dest}")
-            continue
-        if item.state == "exists":
-            log.append(f"skip {item.path} -> {dest} (name taken)")
-            continue
-        extra = " then remove source" if want_remove else ""
-        if dry_run:
-            log.append(f"{mode} {item.path} -> {dest}{extra}")
-            continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if uid is not None and gid is not None:
-            os.chown(dest.parent, uid, gid)
-        if dest.exists() or dest.is_symlink():
-            log.append(f"skip {dest} (appeared)")
-            continue
-        parent_writable = os.access(item.path.parent, os.W_OK)
-        algo = integrity_algo_for(item)
-        src_hash = hash_path(item.path, algo)
         try:
-            _copy_into_store(item, dest, uid, gid, algo=algo, src_hash=src_hash)
+            _organize_one(
+                item,
+                model_root,
+                store,
+                log,
+                mode=mode,
+                want_remove=want_remove,
+                uid=uid,
+                gid=gid,
+                dry_run=dry_run,
+            )
+        except OrganizeLinkError as exc:
+            log.append(str(exc))
         except RuntimeError as exc:
-            if "checksum mismatch" in str(exc):
-                log.append(
-                    f"checksum mismatch after {mode} {item.path} -> {dest} ({algo})"
-                )
-                continue
-            raise
-        verb = "copied" if mode == "copy" else "moved"
-        log.append(f"{verb} {item.path} -> {dest} {algo}={src_hash[:12]}")
-        if want_remove:
-            if not parent_writable:
-                log.append(f"kept source {item.path} (not writable)")
-            elif _under(item.path, store):
-                log.append(f"kept source {item.path} (inside store)")
-            else:
-                _remove_source(item.path, item.kind)
-                log.append(f"removed source {item.path} after checksum match")
+            log.append(str(exc))
+        except OSError as exc:
+            log.append(str(_read_failure(exc, linked=item.path.is_symlink())))
     return log
 
 
@@ -1243,6 +1734,17 @@ def _acceptable_source(
             if dest_real is not None and item.path.resolve() == dest_real:
                 continue
         except OSError:
+            continue
+        if item.state == "busy":
+            sibling = _partial_sibling(item.path)
+            reason = (
+                f"Skipped {item.path}. {sibling} is still present, "
+                "so this download is not finished."
+                if sibling
+                else f"Skipped {item.path}. A download is still writing this file."
+            )
+            if not skipped:
+                skipped = reason
             continue
         reason = _catalog_skip_reason(item.path, model)
         if reason is None:

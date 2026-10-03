@@ -6,6 +6,8 @@ import http.server
 import io
 import os
 import pwd
+import shutil
+import stat
 import threading
 import unittest
 import urllib.error
@@ -28,6 +30,7 @@ from weights import (
     classify,
     detect_bundle,
     disk_words,
+    _copy_bytes_needed,
     _open_part,
     download,
     ensure_weight,
@@ -1076,6 +1079,793 @@ class StoreCopySafetyTests(unittest.TestCase):
                     download(model, store, force=True)
             self.assertEqual(dest.stat().st_size, model.bytes)
             self.assertFalse(dest.with_name(dest.name + ".part").exists())
+
+
+class OrganizeSymlinkTests(unittest.TestCase):
+    """organize() is the function the Weights tab and --organize-weights call."""
+
+    def _assert_no_links(self, root: Path) -> None:
+        self.assertTrue(root.exists(), root)
+        self.assertFalse(os.path.islink(root), root)
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            for name in [*dirnames, *filenames]:
+                path = os.path.join(dirpath, name)
+                self.assertFalse(os.path.islink(path), path)
+
+    def _dirs(self, scan_root: Path, store: Path) -> tuple:
+        found = tuple(item for item in scan((scan_root,), store) if item.kind == "dir")
+        self.assertEqual(len(found), 1)
+        return found
+
+    def _payload(self) -> bytes:
+        return b"s" * (128 * 1024)
+
+    def _bundle(self, repo: Path, payload: bytes, *, link: Path | None = None) -> None:
+        repo.mkdir(parents=True)
+        (repo / "config.json").write_text("{}", encoding="utf-8")
+        blob = repo / "model.safetensors"
+        if link is None:
+            blob.write_bytes(payload)
+        else:
+            blob.symlink_to(link)
+
+    def test_absolute_link_bundle_lands_as_a_regular_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            blob = root / "blob.safetensors"
+            blob.write_bytes(payload)
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload, link=blob)
+            self.assertTrue(os.path.isabs(os.readlink(repo / "model.safetensors")))
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            log = organize(found, store)
+            dest = store / "hf" / "Qwen"
+            copied = dest / "model.safetensors"
+            self._assert_no_links(store)
+            self.assertTrue(stat.S_ISREG(os.lstat(copied).st_mode))
+            self.assertEqual(copied.read_bytes(), payload)
+            self.assertFalse(os.path.samefile(copied, blob))
+            self.assertTrue((repo / "model.safetensors").is_symlink())
+            self.assertTrue(any(line.startswith("copied ") and "sha256=" in line for line in log))
+            self.assertFalse(any("checksum mismatch" in line for line in log))
+            self.assertFalse(dest.with_name(dest.name + ".part").exists())
+
+    def test_move_dereferences_an_absolute_link(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            blob = root / "blob.safetensors"
+            blob.write_bytes(payload)
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload, link=blob)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            log = organize(found, store, mode="move")
+            copied = store / "hf" / "Qwen" / "model.safetensors"
+            self._assert_no_links(store)
+            self.assertTrue(stat.S_ISREG(os.lstat(copied).st_mode))
+            self.assertEqual(copied.read_bytes(), payload)
+            self.assertFalse(repo.exists())
+            self.assertEqual(blob.read_bytes(), payload)
+            self.assertFalse(os.path.samefile(copied, blob))
+            self.assertTrue(any(line.startswith("moved ") and "sha256=" in line for line in log))
+            self.assertTrue(any("removed source" in line for line in log))
+
+    def test_hf_snapshot_links_copy_and_verify(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            cache = root / "incoming" / "models--lab--demo"
+            blobs = cache / "blobs"
+            blobs.mkdir(parents=True)
+            (blobs / "cfg").write_text("{}", encoding="utf-8")
+            weights = blobs / "weights"
+            weights.write_bytes(payload)
+            snap = cache / "snapshots" / "main"
+            snap.mkdir(parents=True)
+            (snap / "config.json").symlink_to("../../blobs/cfg")
+            (snap / "model.safetensors").symlink_to("../../blobs/weights")
+            store = root / "store"
+            found = self._dirs(root / "incoming", store)
+            log = organize(found, store)
+            dest = store / "hf" / "lab--demo"
+            copied = dest / "model.safetensors"
+            self._assert_no_links(store)
+            self.assertTrue(stat.S_ISREG(os.lstat(copied).st_mode))
+            self.assertEqual(copied.read_bytes(), payload)
+            self.assertEqual((dest / "config.json").read_text(encoding="utf-8"), "{}")
+            self.assertFalse(os.path.samefile(copied, weights))
+            self.assertTrue((snap / "model.safetensors").is_symlink())
+            self.assertTrue(any(line.startswith("copied ") and "sha256=" in line for line in log))
+            self.assertFalse(any("checksum mismatch" in line for line in log))
+
+    def test_inside_folder_link_is_real_files(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            repo = root / "incoming" / "Qwen"
+            nested = repo / "nested"
+            nested.mkdir(parents=True)
+            (repo / "config.json").write_text("{}", encoding="utf-8")
+            (repo / "model.safetensors").write_bytes(payload)
+            (nested / "extra.bin").write_bytes(b"extra")
+            (repo / "alias").symlink_to("nested", target_is_directory=True)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            log = organize(found, store)
+            dest = store / "hf" / "Qwen"
+            self._assert_no_links(store)
+            self.assertEqual((dest / "alias" / "extra.bin").read_bytes(), b"extra")
+            self.assertEqual((dest / "nested" / "extra.bin").read_bytes(), b"extra")
+            self.assertTrue(any(line.startswith("copied ") and "sha256=" in line for line in log))
+            self.assertFalse(any("checksum mismatch" in line for line in log))
+
+    def test_dangling_link_is_refused_before_a_partial_copy(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "incoming" / "Qwen"
+            nested = repo / "nested"
+            nested.mkdir(parents=True)
+            (repo / "config.json").write_text("{}", encoding="utf-8")
+            (repo / "model.safetensors").write_bytes(self._payload())
+            (nested / "gone.safetensors").symlink_to("missing.safetensors")
+            store = root / "store"
+            store.mkdir()
+            found = self._dirs(repo.parent, store)
+            log = organize(found, store)
+            text = "\n".join(log)
+            self.assertIn("points nowhere", text)
+            self.assertIn("The copy was not started", text)
+            self.assertNotIn("checksum", text)
+            self.assertFalse((store / "hf").exists())
+            self.assertTrue((repo / "model.safetensors").is_file())
+            self.assertTrue((nested / "gone.safetensors").is_symlink())
+
+    def test_link_loop_is_refused_before_a_partial_copy(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "incoming" / "Qwen"
+            repo.mkdir(parents=True)
+            (repo / "config.json").write_text("{}", encoding="utf-8")
+            (repo / "model.safetensors").write_bytes(self._payload())
+            (repo / "a.safetensors").symlink_to("b.safetensors")
+            (repo / "b.safetensors").symlink_to("a.safetensors")
+            store = root / "store"
+            store.mkdir()
+            found = self._dirs(repo.parent, store)
+            log = organize(found, store, mode="move")
+            text = "\n".join(log)
+            self.assertIn("loops", text)
+            self.assertIn("The copy was not started", text)
+            self.assertFalse((store / "hf").exists())
+            self.assertTrue(repo.is_dir())
+            self.assertTrue((repo / "model.safetensors").is_file())
+
+    def test_folder_link_outside_the_bundle_is_refused(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "secret.bin").write_bytes(b"nope")
+            repo = root / "incoming" / "Qwen"
+            repo.mkdir(parents=True)
+            (repo / "config.json").write_text("{}", encoding="utf-8")
+            (repo / "model.safetensors").write_bytes(self._payload())
+            (repo / "escape").symlink_to(outside, target_is_directory=True)
+            store = root / "store"
+            store.mkdir()
+            found = self._dirs(repo.parent, store)
+            log = organize(found, store)
+            text = "\n".join(log)
+            self.assertIn("outside the bundle", text)
+            self.assertIn("The copy was not started", text)
+            self.assertFalse((store / "hf").exists())
+            self.assertEqual((outside / "secret.bin").read_bytes(), b"nope")
+
+    def test_unreadable_link_target_is_refused(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            blob = root / "blob.safetensors"
+            blob.write_bytes(payload)
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload, link=blob)
+            store = root / "store"
+            store.mkdir()
+            found = self._dirs(repo.parent, store)
+            with patch("weights._read_link_target", side_effect=PermissionError("denied")):
+                log = organize(found, store)
+            text = "\n".join(log)
+            self.assertIn("cannot be read", text)
+            self.assertIn("The copy was not started", text)
+            self.assertFalse((store / "hf").exists())
+            self.assertEqual(blob.read_bytes(), payload)
+
+    def test_cli_organize_weights_dereferences_hf_links(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            payload = self._payload()
+            incoming = home / "incoming"
+            cache = incoming / "models--lab--demo"
+            blobs = cache / "blobs"
+            blobs.mkdir(parents=True)
+            (blobs / "cfg").write_text("{}", encoding="utf-8")
+            (blobs / "weights").write_bytes(payload)
+            snap = cache / "snapshots" / "main"
+            snap.mkdir(parents=True)
+            (snap / "config.json").symlink_to("../../blobs/cfg")
+            (snap / "model.safetensors").symlink_to("../../blobs/weights")
+            store = home / "store"
+            store.mkdir()
+            target = UserTarget(
+                name=pwd.getpwuid(os.getuid()).pw_name,
+                uid=os.getuid(),
+                gid=os.getgid(),
+                home=home,
+                model_root=store,
+            )
+            out = io.StringIO()
+            err = io.StringIO()
+            with (
+                patch("main.target_for", return_value=target),
+                patch("main.saved_scan_folders", return_value=()),
+                patch("sys.stdout", out),
+                patch("sys.stderr", err),
+            ):
+                rc = installer_main(
+                    ["--organize-weights", "copy", "--scan-folder", str(incoming)]
+                )
+            dest = store / "hf" / "lab--demo"
+            self.assertEqual(rc, 0, err.getvalue())
+            self._assert_no_links(store)
+            self.assertEqual((dest / "model.safetensors").read_bytes(), payload)
+            self.assertIn("sha256=", out.getvalue())
+            self.assertIn("copied ", out.getvalue())
+            self.assertEqual(err.getvalue(), "")
+
+    def test_cli_organize_weights_refuses_a_dangling_link(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            incoming = home / "incoming"
+            repo = incoming / "Qwen"
+            repo.mkdir(parents=True)
+            (repo / "config.json").write_text("{}", encoding="utf-8")
+            (repo / "model.safetensors").write_bytes(self._payload())
+            (repo / "gone.safetensors").symlink_to("missing.safetensors")
+            store = home / "store"
+            store.mkdir()
+            target = UserTarget(
+                name=pwd.getpwuid(os.getuid()).pw_name,
+                uid=os.getuid(),
+                gid=os.getgid(),
+                home=home,
+                model_root=store,
+            )
+            err = io.StringIO()
+            with (
+                patch("main.target_for", return_value=target),
+                patch("main.saved_scan_folders", return_value=()),
+                patch("sys.stderr", err),
+            ):
+                rc = installer_main(
+                    ["--organize-weights", "copy", "--scan-folder", str(incoming)]
+                )
+            self.assertEqual(rc, 1)
+            self.assertIn("points nowhere", err.getvalue())
+            self.assertIn("The copy was not started", err.getvalue())
+            self.assertFalse((store / "hf").exists())
+            self.assertTrue((repo / "model.safetensors").is_file())
+
+    def test_weights_tab_calls_organize_and_shows_link_errors(self) -> None:
+        for name in ("gtk_ui.py", "qt_ui.py"):
+            text = (PKG / "ui" / name).read_text(encoding="utf-8")
+            self.assertIn("log = organize(", text)
+            self.assertIn("OrganizeLinkError", text)
+
+    def test_store_copy_follows_file_links(self) -> None:
+        text = (PKG / "weights.py").read_text(encoding="utf-8")
+        self.assertNotIn("copytree", text)
+        self.assertNotIn("rsync", text)
+        self.assertNotIn("shutil.copy2", text)
+        self.assertIn("def _transfer_file", text)
+        self.assertIn("def _materialize_plan", text)
+
+    def test_same_disk_move_without_links_renames(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload)
+            dir_ino = repo.stat().st_ino
+            file_ino = (repo / "model.safetensors").stat().st_ino
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            with (
+                patch("weights._transfer_file") as transfer,
+                patch("weights.os.replace", wraps=os.replace) as repl,
+            ):
+                log = organize(found, store, mode="move")
+            transfer.assert_not_called()
+            repl.assert_called_once()
+            dest = store / "hf" / "Qwen"
+            copied = dest / "model.safetensors"
+            self._assert_no_links(store)
+            self.assertEqual(dest.stat().st_ino, dir_ino)
+            self.assertEqual(copied.stat().st_ino, file_ino)
+            self.assertEqual(copied.read_bytes(), payload)
+            self.assertFalse(repo.exists())
+            self.assertTrue(any(line.startswith("moved ") for line in log))
+            self.assertFalse(any("sha256=" in line for line in log))
+
+    def test_move_leaves_an_existing_destination(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            dest = store / "hf" / "Qwen"
+            dest.mkdir(parents=True)
+            (dest / "config.json").write_text("keep", encoding="utf-8")
+            log = organize(found, store, mode="move")
+            self.assertEqual((dest / "config.json").read_text(encoding="utf-8"), "keep")
+            self.assertEqual((repo / "model.safetensors").read_bytes(), payload)
+            self.assertTrue(repo.is_dir())
+            self.assertTrue(any("appeared" in line for line in log))
+
+    def test_move_with_links_refuses_when_space_is_low(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            blob = root / "blob.safetensors"
+            blob.write_bytes(payload)
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload, link=blob)
+            store = root / "store"
+            store.mkdir()
+            found = self._dirs(repo.parent, store)
+            need = _copy_bytes_needed(len(payload) + len(b"{}"))
+
+            class Stat:
+                f_bavail = 1
+                f_frsize = 4096
+
+            with (
+                patch("weights.os.statvfs", return_value=Stat()),
+                patch("weights._transfer_file") as transfer,
+            ):
+                log = organize(found, store, mode="move")
+            transfer.assert_not_called()
+            text = "\n".join(log)
+            self.assertIn(human_bytes(need), text)
+            self.assertIn(human_bytes(4096), text)
+            self.assertIn("free space", text)
+            self.assertIn("Could not copy this model.", text)
+            self.assertFalse((store / "hf").exists())
+            self.assertTrue((repo / "model.safetensors").is_symlink())
+            self.assertEqual(blob.read_bytes(), payload)
+
+    def test_move_verify_failure_keeps_the_source(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            blob = root / "blob.safetensors"
+            blob.write_bytes(payload)
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload, link=blob)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            real = hash_path
+            calls = {"n": 0}
+
+            def fake(path: Path, algo: str = "sha256") -> str:
+                calls["n"] += 1
+                digest = real(path, algo)
+                if calls["n"] == 2:
+                    return "0" * 64
+                return digest
+
+            with patch("weights.hash_path", fake):
+                log = organize(found, store, mode="move")
+            self.assertTrue(repo.is_dir())
+            self.assertTrue((repo / "model.safetensors").is_symlink())
+            self.assertEqual(blob.read_bytes(), payload)
+            self.assertFalse((store / "hf" / "Qwen").exists())
+            self.assertTrue(any("checksum mismatch" in line for line in log))
+            self.assertFalse(any("removed source" in line for line in log))
+
+    def test_killed_bundle_copy_leaves_no_final_name(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            dest = store / "hf" / "Qwen"
+            stale = dest.with_name(dest.name + ".part")
+            stale.mkdir(parents=True)
+            (stale / "model.safetensors").write_bytes(b"short")
+            sentinel = store / "hf" / "keep.txt"
+            sentinel.write_text("keep", encoding="utf-8")
+
+            def die(src: Path, part: Path, linked: bool = False) -> None:
+                part.write_bytes(b"trunc")
+                raise OSError(errno.EIO, "killed")
+
+            with patch("weights._transfer_file", side_effect=die):
+                log = organize(found, store)
+            self.assertFalse(dest.exists())
+            self.assertFalse(stale.exists())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+            self.assertEqual((repo / "model.safetensors").read_bytes(), payload)
+            self.assertTrue(any("Could not copy this model." in line for line in log))
+            again = organize(found, store)
+            self.assertEqual((dest / "model.safetensors").read_bytes(), payload)
+            self.assertEqual((dest / "config.json").read_text(encoding="utf-8"), "{}")
+            self.assertFalse(stale.exists())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+            self.assertTrue(any(line.startswith("copied ") for line in again))
+
+    def test_source_removal_failure_leaves_a_complete_store_copy(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            blob = root / "blob.safetensors"
+            blob.write_bytes(payload)
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload, link=blob)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            real_unlink = Path.unlink
+
+            def boom(path: Path, *args: object, **kwargs: object) -> None:
+                if path.is_relative_to(repo):
+                    raise OSError(errno.EIO, "killed")
+                real_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", boom):
+                log = organize(found, store, mode="move")
+            copied = store / "hf" / "Qwen" / "model.safetensors"
+            self.assertEqual(copied.read_bytes(), payload)
+            self.assertEqual(
+                (store / "hf" / "Qwen" / "config.json").read_text(encoding="utf-8"),
+                "{}",
+            )
+            self.assertFalse(copied.with_name(copied.name + ".part").exists())
+            self.assertTrue((repo / "model.safetensors").is_symlink())
+            self.assertEqual(blob.read_bytes(), payload)
+            self.assertTrue(any("Kept source entries" in line for line in log))
+            self.assertFalse(any("removed source" in line for line in log))
+
+    def test_source_removal_keeps_unverified_entries(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            blob = root / "blob.safetensors"
+            blob.write_bytes(payload)
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload, link=blob)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            real_replace = os.replace
+
+            def add_extras(src: str | Path, dst: str | Path) -> None:
+                src_path = Path(src)
+                if src_path.name.endswith(".part"):
+                    (repo / "later.txt").write_text("later", encoding="utf-8")
+                    os.mkfifo(repo / "pipe")
+                real_replace(src, dst)
+
+            with (
+                patch("weights.os.replace", side_effect=add_extras),
+                patch("weights.shutil.rmtree", wraps=shutil.rmtree) as removed,
+            ):
+                log = organize(found, store, mode="move")
+            dest = store / "hf" / "Qwen"
+            self.assertEqual((dest / "model.safetensors").read_bytes(), payload)
+            self.assertTrue((repo / "later.txt").is_file())
+            self.assertTrue(stat.S_ISFIFO((repo / "pipe").stat().st_mode))
+            self.assertFalse((repo / "model.safetensors").exists())
+            self.assertFalse((repo / "config.json").exists())
+            text = "\n".join(log)
+            self.assertIn("later.txt", text)
+            self.assertIn("pipe", text)
+            self.assertIn("Kept source entries", text)
+            for call in removed.call_args_list:
+                self.assertNotEqual(Path(call.args[0]).resolve(), repo.resolve())
+
+    def test_failed_rename_deletes_nothing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            sentinel = store / "hf" / "keep.txt"
+            sentinel.parent.mkdir(parents=True)
+            sentinel.write_text("keep", encoding="utf-8")
+
+            def fail_replace(src: str | Path, dst: str | Path) -> None:
+                dest = Path(dst)
+                dest.mkdir(parents=True)
+                (dest / "keep.txt").write_text("keep", encoding="utf-8")
+                raise OSError(errno.EIO, "fail")
+
+            with patch("weights.os.replace", side_effect=fail_replace):
+                log = organize(found, store, mode="move")
+            text = "\n".join(log)
+            self.assertIn("Nothing was written", text)
+            self.assertIn("Organize is refused", text)
+            self.assertEqual((repo / "model.safetensors").read_bytes(), payload)
+            self.assertTrue(repo.is_dir())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+            planted = store / "hf" / "Qwen" / "keep.txt"
+            self.assertEqual(planted.read_text(encoding="utf-8"), "keep")
+
+    def test_exdev_and_readonly_parent_keep_the_source(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            real_replace = os.replace
+
+            def exdev(src: str | Path, dst: str | Path) -> None:
+                if not Path(src).name.endswith(".part"):
+                    raise OSError(errno.EXDEV, "cross-device")
+                real_replace(src, dst)
+
+            with patch("weights.os.replace", side_effect=exdev):
+                log = organize(found, store, mode="move")
+            dest = store / "hf" / "Qwen"
+            self.assertEqual((dest / "model.safetensors").read_bytes(), payload)
+            self.assertTrue(repo.is_dir())
+            self.assertEqual((repo / "model.safetensors").read_bytes(), payload)
+            self.assertTrue(any("kept source" in line for line in log))
+            self.assertFalse(any("removed source" in line for line in log))
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            with patch("weights.os.access", return_value=False):
+                log = organize(found, store, mode="move")
+            dest = store / "hf" / "Qwen"
+            self.assertEqual((dest / "model.safetensors").read_bytes(), payload)
+            self.assertNotEqual(dest.stat().st_ino, repo.stat().st_ino)
+            self.assertTrue(repo.is_dir())
+            self.assertTrue(any("kept source" in line and "not writable" in line for line in log))
+
+    def test_plain_english_for_enospc_unreadable_missing_link_and_chown(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+
+            def fill(src: Path, part: Path, linked: bool = False) -> None:
+                part.write_bytes(b"x")
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+            with patch("weights._transfer_file", side_effect=fill):
+                log = organize(found, store)
+            text = "\n".join(log)
+            self.assertIn("filled up", text)
+            self.assertIn("partial file was removed", text)
+            self.assertNotIn("Traceback", text)
+            self.assertFalse((store / "hf" / "Qwen").exists())
+            self.assertFalse((store / "hf" / "Qwen.part").exists())
+            self.assertEqual((repo / "model.safetensors").read_bytes(), payload)
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blob = root / "Downloads" / "plain.gguf"
+            blob.parent.mkdir()
+            blob.write_bytes(self._payload())
+            store = root / "store"
+            found = scan((blob.parent,), store)
+            real_open = open
+
+            def blocked(file: object, mode: str = "r", *args: object, **kwargs: object) -> object:
+                if Path(str(file)) == blob and "b" in mode:
+                    raise PermissionError(errno.EACCES, "denied")
+                return real_open(file, mode, *args, **kwargs)
+
+            with patch("builtins.open", side_effect=blocked):
+                log = organize(found, store)
+            text = "\n".join(log)
+            self.assertIn("cannot be read", text)
+            self.assertNotIn("Traceback", text)
+            self.assertFalse((store / "gguf" / "plain.gguf").exists())
+            self.assertEqual(blob.read_bytes(), self._payload())
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            blob = root / "blob.safetensors"
+            blob.write_bytes(payload)
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload, link=blob)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            import weights as weights_mod
+
+            real_transfer = weights_mod._transfer_file
+
+            def drop(src: Path, part: Path, linked: bool = False) -> None:
+                if linked:
+                    src.unlink()
+                real_transfer(src, part, linked=linked)
+
+            with patch("weights._transfer_file", side_effect=drop):
+                log = organize(found, store)
+            text = "\n".join(log)
+            self.assertIn("link target was removed", text)
+            self.assertNotIn("Traceback", text)
+            self.assertFalse((store / "hf" / "Qwen").exists())
+            self.assertFalse((store / "hf" / "Qwen.part").exists())
+            self.assertTrue((repo / "model.safetensors").is_symlink())
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+
+            def deny(dest: Path, uid: int, gid: int) -> None:
+                raise OSError(errno.EPERM, "not permitted")
+
+            with patch("weights._chown_tree", side_effect=deny):
+                log = organize(found, store, mode="move", uid=os.getuid(), gid=os.getgid())
+            dest = store / "hf" / "Qwen"
+            self.assertEqual((dest / "model.safetensors").read_bytes(), payload)
+            self.assertFalse(repo.exists())
+            text = "\n".join(log)
+            self.assertIn("Could not change the owner", text)
+            self.assertIn("in place", text)
+            self.assertTrue(any(line.startswith("moved ") for line in log))
+
+    def test_refused_bundle_keeps_earlier_success(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            incoming = root / "incoming"
+            good = incoming / "Aaa"
+            self._bundle(good, payload)
+            bad = incoming / "Zed"
+            bad.mkdir(parents=True)
+            (bad / "config.json").write_text("{}", encoding="utf-8")
+            (bad / "model.safetensors").write_bytes(payload)
+            (bad / "gone.safetensors").symlink_to("missing.safetensors")
+            store = root / "store"
+            found = tuple(item for item in scan((incoming,), store) if item.kind == "dir")
+            self.assertEqual(len(found), 2)
+            log = organize(found, store)
+            text = "\n".join(log)
+            self.assertIn("copied ", text)
+            self.assertIn(str(good), text)
+            self.assertIn("points nowhere", text)
+            self.assertEqual((store / "hf" / "Aaa" / "model.safetensors").read_bytes(), payload)
+            self.assertFalse((store / "hf" / "Zed").exists())
+
+    def test_skips_file_with_partial_sibling(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            aria = root / "incoming" / "aria.gguf"
+            aria.parent.mkdir(parents=True)
+            aria.write_bytes(payload)
+            (aria.parent / "aria.gguf.aria2").write_bytes(b"1")
+            part = root / "more" / "part.gguf"
+            part.parent.mkdir()
+            part.write_bytes(payload)
+            (part.parent / "part.gguf.part").write_bytes(b"2")
+            store = root / "store"
+            found = scan((aria.parent, part.parent), store)
+            self.assertEqual({item.state for item in found}, {"busy"})
+            log = organize(found, store)
+            text = "\n".join(log)
+            self.assertIn("aria.gguf.aria2", text)
+            self.assertIn("part.gguf.part", text)
+            self.assertIn("not finished", text)
+            self.assertFalse((store / "gguf").exists())
+            self.assertEqual(aria.read_bytes(), payload)
+            self.assertEqual(part.read_bytes(), payload)
+
+    def test_cross_device_move_checks_free_space(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload)
+            store = root / "store"
+            store.mkdir()
+            found = self._dirs(repo.parent, store)
+            need = _copy_bytes_needed(len(payload) + len(b"{}"))
+
+            class Stat:
+                f_bavail = 1
+                f_frsize = 4096
+
+            with (
+                patch("weights._same_device", return_value=False),
+                patch("weights.os.statvfs", return_value=Stat()),
+                patch("weights._transfer_file") as transfer,
+            ):
+                log = organize(found, store, mode="move")
+            transfer.assert_not_called()
+            text = "\n".join(log)
+            self.assertIn(human_bytes(need), text)
+            self.assertIn("free space", text)
+            self.assertEqual((repo / "model.safetensors").read_bytes(), payload)
+            self.assertFalse((store / "hf" / "Qwen").exists())
+
+    def test_link_appearing_before_rename_is_copied(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = self._payload()
+            repo = root / "incoming" / "Qwen"
+            self._bundle(repo, payload)
+            extra = root / "extra.safetensors"
+            extra.write_bytes(b"e" * 32)
+            store = root / "store"
+            found = self._dirs(repo.parent, store)
+            dir_ino = repo.stat().st_ino
+
+            def appear(src: Path, parent: Path) -> bool:
+                link = repo / "extra.safetensors"
+                if not link.exists():
+                    link.symlink_to(extra)
+                return True
+
+            with patch("weights._same_device", side_effect=appear):
+                log = organize(found, store, mode="move")
+            dest = store / "hf" / "Qwen"
+            copied = dest / "extra.safetensors"
+            self.assertTrue(stat.S_ISREG(os.lstat(copied).st_mode))
+            self.assertEqual(copied.read_bytes(), b"e" * 32)
+            self.assertNotEqual(dest.stat().st_ino, dir_ino)
+            self.assertFalse(repo.exists())
+            self.assertTrue(any("sha256=" in line for line in log))
+
+    def test_snapshot_collision_name_uses_the_revision(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def snap(rev: str) -> None:
+                folder = root / rev / "models--org--m" / "snapshots" / rev
+                folder.mkdir(parents=True)
+                (folder / "config.json").write_text("{}", encoding="utf-8")
+                (folder / "model.safetensors").write_bytes(self._payload())
+
+            snap("rev1")
+            snap("rev2")
+            store = root / "store"
+            found = tuple(
+                item
+                for item in scan((root / "rev1", root / "rev2"), store)
+                if item.kind == "dir"
+            )
+            names = {item.dest_name for item in found}
+            self.assertEqual(len(names), 2)
+            self.assertIn("org--m", names)
+            self.assertTrue(any(name.startswith("org--m-") for name in names))
+            self.assertNotIn("snapshots-org--m", names)
+            self.assertFalse(any(name.startswith("snapshots-") for name in names))
 
 
 if __name__ == "__main__":

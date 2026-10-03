@@ -63,6 +63,7 @@ from weights import (
     ANOTHER_DISK,
     UBUNTU_DISK,
     ForeignMountError,
+    OrganizeLinkError,
     catalog_dest,
     disk_words,
     download,
@@ -726,7 +727,7 @@ def _weights_page(win, user, status) -> Gtk.Widget:
                 uid=t.uid,
                 gid=t.gid,
             )
-        except ForeignMountError as exc:
+        except (ForeignMountError, OrganizeLinkError) as exc:
             status.set_text(str(exc))
             return
         status.set_text("\n".join(log))
