@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shutil
+import stat
 import subprocess
 import time
 import urllib.error
@@ -603,15 +605,20 @@ def _drop_obsolete_owned_binds(
     return leftovers
 
 
+def _missing_tool_message(tool: str) -> str:
+    return (
+        f"{tool} is not installed. "
+        "Publish stopped so your model files stay where they are."
+    )
+
+
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(cmd, check=False, capture_output=True, text=True)
     except FileNotFoundError:
-        if cmd and cmd[0] == "systemctl":
-            raise RuntimeError(
-                "systemctl is not installed. "
-                "Publish stopped so your model files stay where they are."
-            ) from None
+        tool = cmd[0] if cmd else ""
+        if tool in {"systemctl", "mount", "umount"}:
+            raise RuntimeError(_missing_tool_message(tool)) from None
         raise
 
 
@@ -712,8 +719,9 @@ def _start_daemon() -> None:
 
 def _lemonade_not_ready_message() -> str:
     return (
-        "Lemonade did not come back after the folder mounts. "
-        "Publish stopped before setting the model folder."
+        "The folder mounts are in place. "
+        "Lemonade did not answer, so the models folder was not set. "
+        "Run publish again."
     )
 
 
@@ -744,12 +752,71 @@ def _wait_for_config() -> None:
         time.sleep(min(CONFIG_READY_INTERVAL, remaining))
 
 
+def _mkdir_nofollow(path: Path) -> None:
+    """Create path and its parents. A symlink on the way is refused.
+
+    pathlib mkdir follows links. Publish runs as root, so a link under the
+    snap dest would create folders inside the user's tree.
+    """
+    if path.parent == path:
+        return
+    chain: list[Path] = []
+    current = path
+    while True:
+        try:
+            st = os.lstat(current)
+        except FileNotFoundError:
+            chain.append(current)
+            if current.parent == current:
+                raise RuntimeError(
+                    f"The folder {path} cannot be created. "
+                    "Publish stopped so your files stay where they are."
+                )
+            current = current.parent
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError(
+                f"A folder on the way to {path} is a symlink. "
+                "Publish stopped so your files stay where they are."
+            )
+        break
+    for directory in reversed(chain):
+        parent = directory.parent
+        try:
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"A folder on the way to {path} is a symlink. "
+                "Publish stopped so your files stay where they are."
+            ) from exc
+        try:
+            os.mkdir(directory.name, 0o755, dir_fd=parent_fd)
+        except FileExistsError:
+            try:
+                st = os.lstat(directory.name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"A folder on the way to {path} is a symlink. "
+                    "Publish stopped so your files stay where they are."
+                ) from exc
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+                raise RuntimeError(
+                    f"A folder on the way to {path} is a symlink. "
+                    "Publish stopped so your files stay where they are."
+                )
+        finally:
+            os.close(parent_fd)
+
+
 def _write_bind_unit(what: Path, where: Path) -> str:
     dest = _bind_dest(where)
     ancestor = _owned_ancestor_mount(where, dest)
     if ancestor is not None:
         raise RuntimeError(_still_mounted_message(ancestor))
-    where.mkdir(parents=True, exist_ok=True)
+    _mkdir_nofollow(where)
     unit = _escape_mount(where)
     text = mount_unit_text(what, where)
     path = Path("/etc/systemd/system") / unit
@@ -1177,62 +1244,203 @@ TUNING_LEDGER_KEYS = frozenset(
 )
 
 
-def tuning_ledger_path(home: Path) -> Path:
-    return home / ".config" / "ubuntuai" / "lemonade-tuning.json"
+# Lemonade config is system-wide. The ledger lives with it, not in a home directory.
+DEFAULT_TUNING_LEDGER_DIR = Path("/var/lib/ubuntuai")
+TUNING_LEDGER_DIR = DEFAULT_TUNING_LEDGER_DIR
+TUNING_LEDGER_NAME = "lemonade-tuning.json"
+_LEDGER_WRITE_FLAGS = (
+    os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY | os.O_CLOEXEC
+)
 
 
-def read_tuning_ledger(home: Path) -> dict[str, object] | None:
-    """None when this install has never recorded a write. {} is an empty ledger."""
-    path = tuning_ledger_path(home)
-    if not path.is_file():
-        return None
+def tuning_ledger_path(directory: Path | None = None) -> Path:
+    return (directory if directory is not None else TUNING_LEDGER_DIR) / TUNING_LEDGER_NAME
+
+
+def _ledger_dir_unsafe() -> str:
+    return (
+        "The Lemonade settings folder is not safe to use. "
+        "Publish stopped so your files stay unchanged."
+    )
+
+
+def _ledger_symlink_message() -> str:
+    return (
+        "The Lemonade settings record is a symlink. "
+        "Publish stopped so that file stays unchanged."
+    )
+
+
+def _corrupt_ledger_warning() -> str:
+    return (
+        "The saved Lemonade load settings could not be read. "
+        "Your model count is kept when it is not the Lemonade default. "
+        "The other load settings are set again."
+    )
+
+
+def _ledger_dir_is_trusted(st: os.stat_result) -> bool:
+    return st.st_uid == 0 and st.st_gid == 0
+
+
+def _ensure_ledger_dir(directory: Path) -> int:
+    """Return a dir fd for a real root-owned ledger directory. Caller closes it."""
+    parent = directory.parent
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+        parent_fd = os.open(
+            parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError as exc:
+        raise RuntimeError(_ledger_dir_unsafe()) from exc
+    try:
+        try:
+            os.mkdir(directory.name, 0o755, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+    finally:
+        os.close(parent_fd)
+    try:
+        dir_fd = os.open(
+            directory,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError as exc:
+        raise RuntimeError(_ledger_dir_unsafe()) from exc
+    try:
+        st = os.fstat(dir_fd)
+        if not stat.S_ISDIR(st.st_mode) or not _ledger_dir_is_trusted(st):
+            raise RuntimeError(_ledger_dir_unsafe())
+        os.fchmod(dir_fd, 0o755)
+    except Exception:
+        os.close(dir_fd)
+        raise
+    return dir_fd
+
+
+def _read_fd(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        block = os.read(fd, 65536)
+        if not block:
+            break
+        chunks.append(block)
+    return b"".join(chunks)
+
+
+def _load_ledger(directory: Path | None = None) -> tuple[dict[str, object] | None, str]:
+    """Return the ledger and a warning. None means there is no usable ledger."""
+    path = tuning_ledger_path(directory)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None, ""
+    except OSError as exc:
+        raise RuntimeError(_ledger_dir_unsafe()) from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise RuntimeError(_ledger_symlink_message())
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise RuntimeError(_ledger_dir_unsafe()) from exc
+    try:
+        raw = _read_fd(fd)
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return None, _corrupt_ledger_warning()
     if not isinstance(data, dict):
-        return {}
-    return {
-        str(key): value
-        for key, value in data.items()
-        if str(key) in TUNING_LEDGER_KEYS
-    }
+        return None, _corrupt_ledger_warning()
+    return (
+        {
+            str(key): value
+            for key, value in data.items()
+            if str(key) in TUNING_LEDGER_KEYS
+        },
+        "",
+    )
 
 
-def write_tuning_ledger(
-    home: Path,
-    values: dict[str, object],
-    *,
-    uid: int | None = None,
-    gid: int | None = None,
-) -> None:
-    path = tuning_ledger_path(home)
-    path.parent.mkdir(parents=True, exist_ok=True)
+def read_tuning_ledger(directory: Path | None = None) -> dict[str, object] | None:
+    values, _warning = _load_ledger(directory)
+    return values
+
+
+def _ledger_payload(values: dict[str, object]) -> bytes:
     kept = {
         str(key): value
         for key, value in values.items()
         if str(key) in TUNING_LEDGER_KEYS
     }
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(kept, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-    if uid is not None and gid is not None:
+    return (json.dumps(kept, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def write_tuning_ledger(
+    values: dict[str, object],
+    directory: Path | None = None,
+) -> None:
+    directory = directory if directory is not None else TUNING_LEDGER_DIR
+    payload = _ledger_payload(values)
+    dir_fd = _ensure_ledger_dir(directory)
+    tmp_name = f".{TUNING_LEDGER_NAME}.{secrets.token_hex(8)}.tmp"
+    fd = -1
+    renamed = False
+    try:
         try:
-            os.chown(path, uid, gid)
-        except OSError:
-            pass
+            final_st = os.lstat(TUNING_LEDGER_NAME, dir_fd=dir_fd)
+        except FileNotFoundError:
+            final_st = None
+        if final_st is not None and stat.S_ISLNK(final_st.st_mode):
+            raise RuntimeError(_ledger_symlink_message())
+        try:
+            fd = os.open(tmp_name, _LEDGER_WRITE_FLAGS, 0o644, dir_fd=dir_fd)
+        except OSError as exc:
+            raise RuntimeError(_ledger_dir_unsafe()) from exc
+        os.fchmod(fd, 0o644)
+        view = memoryview(payload)
+        while view:
+            wrote = os.write(fd, view)
+            if wrote <= 0:
+                raise OSError("The Lemonade settings record could not be saved.")
+            view = view[wrote:]
+        os.fsync(fd)
+        try:
+            final_st = os.lstat(TUNING_LEDGER_NAME, dir_fd=dir_fd)
+        except FileNotFoundError:
+            final_st = None
+        if final_st is not None and stat.S_ISLNK(final_st.st_mode):
+            raise RuntimeError(_ledger_symlink_message())
+        os.rename(
+            tmp_name,
+            TUNING_LEDGER_NAME,
+            src_dir_fd=dir_fd,
+            dst_dir_fd=dir_fd,
+        )
+        renamed = True
+        os.fsync(dir_fd)
+    finally:
+        opened = fd >= 0
+        if opened:
+            os.close(fd)
+        if opened and not renamed and dir_fd >= 0:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except OSError:
+                pass
+        if dir_fd >= 0:
+            os.close(dir_fd)
 
 
 def _remember_tuning(
-    home: Path,
     chosen: dict[str, object],
     *,
-    uid: int | None = None,
-    gid: int | None = None,
+    directory: Path | None = None,
     cli: bool = False,
 ) -> None:
-    prior = read_tuning_ledger(home) or {}
-    merged = dict(prior)
+    prior, _warning = _load_ledger(directory)
+    merged = dict(prior or {})
     merged.update(
         {key: value for key, value in chosen.items() if key in TUNING_LEDGER_KEYS}
     )
@@ -1252,7 +1460,7 @@ def _remember_tuning(
                 continue
             parsed = _as_int(raw_value)
             merged[key] = parsed if parsed is not None and key in numeric else raw_value
-    write_tuning_ledger(home, merged, uid=uid, gid=gid)
+    write_tuning_ledger(merged, directory)
 
 
 def _user_owns_key(
@@ -1383,14 +1591,17 @@ def verify_tuning(
     return True, ""
 
 
+def _with_ledger_warning(warning: str, text: str) -> str:
+    if warning and text:
+        return f"{warning}\n{text}"
+    return warning or text
+
+
 def apply_tuning(
     settings: dict[str, object],
     current: dict | None = None,
     factory: dict | None = None,
-    home: Path | None = None,
-    *,
-    uid: int | None = None,
-    gid: int | None = None,
+    ledger_dir: Path | None = None,
 ) -> str:
     # Compare with factory defaults and the ledger. /internal/config merges both.
     if current is None:
@@ -1402,10 +1613,10 @@ def apply_tuning(
         )
     if factory is None:
         factory = read_factory_defaults()
-    ledger = read_tuning_ledger(home) if home is not None else None
+    ledger, ledger_warning = _load_ledger(ledger_dir)
     chosen = tuning_to_apply(settings, current, factory, ledger)
     if not chosen:
-        return "lemonade load settings kept"
+        return _with_ledger_warning(ledger_warning, "lemonade load settings kept")
     body = json.dumps(chosen).encode("utf-8")
     req = urllib.request.Request(
         f"{LEMONADE_API}/internal/set",
@@ -1431,15 +1642,16 @@ def apply_tuning(
                 (p.stderr or p.stdout or "lemonade config set failed").strip()
             )
         cli = True
-    if home is not None:
-        _remember_tuning(home, chosen, uid=uid, gid=gid, cli=cli)
+    _remember_tuning(chosen, directory=ledger_dir, cli=cli)
     ok, miss = verify_tuning(chosen, read_config())
     if not ok:
-        return miss
-    return "lemonade load settings updated"
+        return _with_ledger_warning(ledger_warning, miss)
+    return _with_ledger_warning(ledger_warning, "lemonade load settings updated")
 
 
-def report_load_tuning(target: UserTarget, hw=None) -> str:
+def report_load_tuning(
+    target: UserTarget, hw=None, ledger_dir: Path | None = None
+) -> str:
     hw = hw or probe()
     largest = largest_gguf_bytes(target)
     settings = load_tuning(hw, largest)
@@ -1449,18 +1661,9 @@ def report_load_tuning(target: UserTarget, hw=None) -> str:
     lines: list[str] = []
     current = read_config()
     factory = read_factory_defaults()
-    ledger = read_tuning_ledger(target.home)
+    ledger, _ledger_warning = _load_ledger(ledger_dir)
     try:
-        lines.append(
-            apply_tuning(
-                settings,
-                current,
-                factory,
-                target.home,
-                uid=target.uid,
-                gid=target.gid,
-            )
-        )
+        lines.append(apply_tuning(settings, current, factory, ledger_dir))
     except RuntimeError:
         lines.append(
             "Lemonade did not accept the load settings. "

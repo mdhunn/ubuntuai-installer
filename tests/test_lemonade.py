@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
+import stat
 import subprocess
 import unittest
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -21,8 +24,10 @@ from lemonade import (
     LLAMACPP_MMAP_ARGS,
     LOAD_RISK_POLICY,
     OWNED_UNIT_DESC,
+    DEFAULT_TUNING_LEDGER_DIR,
     _daemon_was_running,
     _drop_bind_unit,
+    _mkdir_nofollow,
     _run,
     _unit_is_ours,
     _where_from_unit,
@@ -73,13 +78,42 @@ def _refuse_host_systemctl(*args: object, **kwargs: object) -> subprocess.Comple
     return _REAL_SUBPROCESS_RUN(*args, **kwargs)  # type: ignore[arg-type]
 
 
+_REAL_URLOPEN = urllib.request.urlopen
+_REAL_CREATE_CONNECTION = socket.create_connection
+
+
+def _request_url(req: object) -> str:
+    return str(getattr(req, "full_url", "") or req)
+
+
+def _refuse_lemonade_http(req: object, *args: object, **kwargs: object) -> object:
+    url = _request_url(req)
+    port = getattr(req, "port", None)
+    if port == 13305 or ":13305" in url:
+        raise AssertionError(f"a test reached Lemonade on port 13305: {url}")
+    return _REAL_URLOPEN(req, *args, **kwargs)  # type: ignore[arg-type]
+
+
+def _refuse_lemonade_socket(address: object, *args: object, **kwargs: object) -> socket.socket:
+    port = address[1] if isinstance(address, tuple) and len(address) > 1 else None
+    if port == 13305:
+        raise AssertionError(f"a test reached Lemonade socket {address}")
+    return _REAL_CREATE_CONNECTION(address, *args, **kwargs)  # type: ignore[arg-type]
+
+
 def setUpModule() -> None:
-    global _systemctl_guard
+    global _systemctl_guard, _http_guard, _socket_guard
     _systemctl_guard = patch("lemonade.subprocess.run", side_effect=_refuse_host_systemctl)
+    _http_guard = patch("lemonade.urllib.request.urlopen", side_effect=_refuse_lemonade_http)
+    _socket_guard = patch("socket.create_connection", side_effect=_refuse_lemonade_socket)
     _systemctl_guard.start()
+    _http_guard.start()
+    _socket_guard.start()
 
 
 def tearDownModule() -> None:
+    _socket_guard.stop()
+    _http_guard.stop()
     _systemctl_guard.stop()
 
 
@@ -1415,8 +1449,9 @@ class LemonadePublishTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as ctx:
                     publish(_target(home))
             message = str(ctx.exception)
-            self.assertIn("did not come back", message)
-            self.assertIn("model folder", message)
+            self.assertIn("in place", message)
+            self.assertIn("models folder was not set", message)
+            self.assertIn("Run publish again", message)
             self.assertNotIn("Traceback", message)
             self.assertEqual(events, ["start", "stop"])
             self.assertFalse(up["value"])
@@ -1491,6 +1526,45 @@ class LemonadePublishTests(unittest.TestCase):
         self.assertIn("model files stay where they are", text)
         self.assertNotIn("Errno", text)
         self.assertNotIn("Traceback", text)
+
+    def test_missing_mount_and_umount_are_plain_english(self) -> None:
+        for tool in ("mount", "umount"):
+            with self.subTest(tool=tool):
+                with patch(
+                    "lemonade.subprocess.run",
+                    side_effect=FileNotFoundError(2, "No such file", tool),
+                ):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        _run([tool, "/tmp/nowhere"])
+                text = str(ctx.exception)
+                self.assertIn(f"{tool} is not installed", text)
+                self.assertIn("model files stay where they are", text)
+                self.assertNotIn("Errno", text)
+                self.assertNotIn("Traceback", text)
+
+    def test_live_lemonade_port_is_refused(self) -> None:
+        req = urllib.request.Request("http://127.0.0.1:13305/internal/config")
+        with self.assertRaises(AssertionError) as http_ctx:
+            urllib.request.urlopen(req, timeout=1)
+        self.assertIn("13305", str(http_ctx.exception))
+        with self.assertRaises(AssertionError) as sock_ctx:
+            socket.create_connection(("127.0.0.1", 13305), timeout=1)
+        self.assertIn("13305", str(sock_ctx.exception))
+
+    def test_bind_mkdir_refuses_symlink(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            victim = home / "victim"
+            victim.mkdir()
+            (victim / "keep").write_bytes(b"stay")
+            dest = home / "dest"
+            dest.mkdir()
+            (dest / "chat").symlink_to(victim, target_is_directory=True)
+            with self.assertRaises(RuntimeError) as ctx:
+                _mkdir_nofollow(dest / "chat" / "src0")
+            self.assertIn("symlink", str(ctx.exception))
+            self.assertFalse((victim / "src0").exists())
+            self.assertEqual((victim / "keep").read_bytes(), b"stay")
 
     def test_host_systemctl_is_refused(self) -> None:
         with self.assertRaises(AssertionError) as ctx:
@@ -1584,6 +1658,11 @@ def _vulkan_igpu(ram_gib: int = 122) -> Hardware:
 
 
 class LemonadeLoadTuningTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._trust = patch("lemonade._ledger_dir_is_trusted", return_value=True)
+        self._trust.start()
+        self.addCleanup(self._trust.stop)
+
     def test_large_vulkan_igpu_lands_mmap(self) -> None:
         hw = _vulkan_igpu(122)
         huge = 105 * 1024**3
@@ -1654,7 +1733,6 @@ class LemonadeLoadTuningTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             home = Path(tmp)
             write_tuning_ledger(
-                home,
                 {
                     "max_loaded_models": 1,
                     "ctx_size": 4096,
@@ -1663,6 +1741,7 @@ class LemonadeLoadTuningTests(unittest.TestCase):
                     "llamacpp_args": LLAMACPP_MMAP_ARGS,
                     "llamacpp_vulkan_args": LLAMACPP_MMAP_ARGS,
                 },
+                home,
             )
             with (
                 patch("lemonade.read_config", side_effect=read),
@@ -1671,7 +1750,9 @@ class LemonadeLoadTuningTests(unittest.TestCase):
                 patch("lemonade.largest_gguf_bytes", return_value=105 * 1024**3),
                 patch("lemonade.shutil.which", return_value=None),
             ):
-                text = report_load_tuning(_target(home), _vulkan_igpu(122))
+                text = report_load_tuning(
+                    _target(home), _vulkan_igpu(122), ledger_dir=home
+                )
         self.assertEqual(reads, ["read"])
         self.assertIn("lemonade load settings kept", text)
         self.assertIn("Strong warning", text)
@@ -1714,20 +1795,20 @@ class LemonadeLoadTuningTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             home = Path(tmp)
             write_tuning_ledger(
-                home,
                 {
                     "max_loaded_models": 1,
                     "llamacpp_backend": "vulkan",
                     "llamacpp_args": "",
                     "llamacpp_vulkan_args": "",
                 },
+                home,
             )
             with (
                 patch("lemonade.read_config", side_effect=read),
                 patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
                 patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
             ):
-                msg = apply_tuning(defaults, home=home)
+                msg = apply_tuning(defaults, ledger_dir=home)
         self.assertEqual(order, ["read", "write", "read"])
         self.assertEqual(msg, "lemonade load settings updated")
         self.assertEqual(len(bodies), 1)
@@ -1771,12 +1852,14 @@ class LemonadeLoadTuningTests(unittest.TestCase):
             return _Resp()
 
         defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
-        with (
-            patch("lemonade.read_config", side_effect=read),
-            patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
-            patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
-        ):
-            msg = apply_tuning(defaults)
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with (
+                patch("lemonade.read_config", side_effect=read),
+                patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
+                patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
+            ):
+                msg = apply_tuning(defaults, ledger_dir=home)
         self.assertEqual(order[0], "read")
         self.assertLess(order.index("read"), order.index("write"))
         self.assertEqual(msg, "lemonade load settings updated")
@@ -1806,7 +1889,6 @@ class LemonadeLoadTuningTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             home = Path(tmp)
             write_tuning_ledger(
-                home,
                 {
                     "max_loaded_models": 1,
                     "ctx_size": 2048,
@@ -1815,6 +1897,7 @@ class LemonadeLoadTuningTests(unittest.TestCase):
                     "llamacpp_args": "",
                     "llamacpp_vulkan_args": "",
                 },
+                home,
             )
             with (
                 patch("lemonade.read_config", side_effect=read),
@@ -1822,7 +1905,7 @@ class LemonadeLoadTuningTests(unittest.TestCase):
                 patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
                 patch("lemonade.shutil.which", return_value=None),
             ):
-                msg = apply_tuning(defaults, home=home)
+                msg = apply_tuning(defaults, ledger_dir=home)
         self.assertEqual(msg, "lemonade load settings kept")
 
     def test_fresh_merged_defaults_get_our_tuning(self) -> None:
@@ -1850,12 +1933,14 @@ class LemonadeLoadTuningTests(unittest.TestCase):
             return _Resp()
 
         defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
-        with (
-            patch("lemonade.read_config", side_effect=read),
-            patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
-            patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
-        ):
-            msg = apply_tuning(defaults)
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with (
+                patch("lemonade.read_config", side_effect=read),
+                patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
+                patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
+            ):
+                msg = apply_tuning(defaults, ledger_dir=home)
         self.assertEqual(msg, "lemonade load settings updated")
         self.assertEqual(len(bodies), 1)
         body = bodies[0]
@@ -1899,7 +1984,9 @@ class LemonadeLoadTuningTests(unittest.TestCase):
                 patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
                 patch("lemonade.largest_gguf_bytes", return_value=105 * 1024**3),
             ):
-                text = report_load_tuning(_target(home), _vulkan_igpu(122))
+                text = report_load_tuning(
+                    _target(home), _vulkan_igpu(122), ledger_dir=home
+                )
             ledger = read_tuning_ledger(home)
         self.assertEqual(len(bodies), 1)
         body = bodies[0]
@@ -1920,26 +2007,59 @@ class LemonadeLoadTuningTests(unittest.TestCase):
     def test_ledger_round_trip_is_atomic(self) -> None:
         with TemporaryDirectory() as tmp:
             home = Path(tmp)
-            write_tuning_ledger(home, {"ctx_size": 4096, "max_loaded_models": 1})
+            write_tuning_ledger({"ctx_size": 4096, "max_loaded_models": 1}, home)
             path = tuning_ledger_path(home)
             self.assertEqual(read_tuning_ledger(home), {"ctx_size": 4096, "max_loaded_models": 1})
-            calls: list[tuple[Path, Path]] = []
-            real_replace = os.replace
+            calls: list[tuple[str, str]] = []
+            real_rename = os.rename
+            real_open = os.open
+            real_fsync = os.fsync
+            syncs = {"n": 0}
 
-            def spy(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
-                source = Path(src)
-                dest = Path(dst)
-                calls.append((source, dest))
-                self.assertTrue(source.is_file())
-                self.assertEqual(dest, path)
-                self.assertNotEqual(source.resolve(), path.resolve())
-                self.assertIn("2048", source.read_text(encoding="utf-8"))
-                real_replace(src, dst)
+            def spy_open(file: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+                if isinstance(file, str) and file.endswith(".tmp"):
+                    required = os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY | os.O_CLOEXEC
+                    self.assertEqual(flags & required, required)
+                    self.assertEqual(mode, 0o644)
+                if dir_fd is None:
+                    return real_open(file, flags, mode)  # type: ignore[arg-type]
+                return real_open(file, flags, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
 
-            with patch("lemonade.os.replace", side_effect=spy):
-                write_tuning_ledger(home, {"ctx_size": 2048, "max_loaded_models": 1})
+            def spy_rename(
+                src: str,
+                dst: str,
+                *,
+                src_dir_fd: int | None = None,
+                dst_dir_fd: int | None = None,
+            ) -> None:
+                calls.append((src, dst))
+                self.assertNotEqual(src, dst)
+                self.assertTrue(src.endswith(".tmp"))
+                self.assertEqual(dst, path.name)
+                fd = real_open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=src_dir_fd)
+                try:
+                    text = os.read(fd, 4096).decode("utf-8")
+                finally:
+                    os.close(fd)
+                self.assertIn("2048", text)
+                real_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+            def spy_fsync(fd: int) -> None:
+                syncs["n"] += 1
+                real_fsync(fd)
+
+            with (
+                patch("lemonade.os.open", side_effect=spy_open),
+                patch("lemonade.os.rename", side_effect=spy_rename),
+                patch("lemonade.os.fsync", side_effect=spy_fsync),
+                patch("lemonade.os.chown") as chown,
+                patch("lemonade.os.lchown") as lchown,
+            ):
+                write_tuning_ledger({"ctx_size": 2048, "max_loaded_models": 1}, home)
+            chown.assert_not_called()
+            lchown.assert_not_called()
             self.assertEqual(len(calls), 1)
-            self.assertFalse(calls[0][0].exists())
+            self.assertGreaterEqual(syncs["n"], 2)
             self.assertEqual(read_tuning_ledger(home)["ctx_size"], 2048)
             self.assertEqual(list(path.parent.glob("*.tmp")), [])
 
@@ -1971,13 +2091,13 @@ class LemonadeLoadTuningTests(unittest.TestCase):
         defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
         with TemporaryDirectory() as tmp:
             home = Path(tmp)
-            write_tuning_ledger(home, {"ctx_size": 4096, "max_loaded_models": 1})
+            write_tuning_ledger({"ctx_size": 4096, "max_loaded_models": 1}, home)
             with (
                 patch("lemonade.read_config", side_effect=read),
                 patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
                 patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
             ):
-                msg = apply_tuning(defaults, home=home)
+                msg = apply_tuning(defaults, ledger_dir=home)
             ledger = read_tuning_ledger(home)
         self.assertEqual(msg, "lemonade load settings updated")
         self.assertEqual(bodies[0]["ctx_size"], 2048)
@@ -2004,7 +2124,6 @@ class LemonadeLoadTuningTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             home = Path(tmp)
             write_tuning_ledger(
-                home,
                 {
                     "max_loaded_models": 1,
                     "ctx_size": 4096,
@@ -2013,6 +2132,7 @@ class LemonadeLoadTuningTests(unittest.TestCase):
                     "llamacpp_args": LLAMACPP_MMAP_ARGS,
                     "llamacpp_vulkan_args": LLAMACPP_MMAP_ARGS,
                 },
+                home,
             )
             before = tuning_ledger_path(home).read_bytes()
             with (
@@ -2021,7 +2141,7 @@ class LemonadeLoadTuningTests(unittest.TestCase):
                 patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
                 patch("lemonade.shutil.which", return_value=None),
             ):
-                msg = apply_tuning(defaults, home=home)
+                msg = apply_tuning(defaults, ledger_dir=home)
             self.assertEqual(tuning_ledger_path(home).read_bytes(), before)
         self.assertEqual(msg, "lemonade load settings kept")
         self.assertEqual(state["max_loaded_models"], 2)
@@ -2031,7 +2151,7 @@ class LemonadeLoadTuningTests(unittest.TestCase):
         defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
         with TemporaryDirectory() as tmp:
             home = Path(tmp)
-            write_tuning_ledger(home, {"ctx_size": 4096, "max_loaded_models": 2})
+            write_tuning_ledger({"ctx_size": 4096, "max_loaded_models": 2}, home)
             before = tuning_ledger_path(home).read_bytes()
 
             def urlopen(req: object, timeout: int = 3) -> object:
@@ -2042,7 +2162,7 @@ class LemonadeLoadTuningTests(unittest.TestCase):
                 patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
                 patch("lemonade.shutil.which", return_value=None),
             ):
-                msg = apply_tuning(defaults, home=home)
+                msg = apply_tuning(defaults, ledger_dir=home)
             self.assertEqual(tuning_ledger_path(home).read_bytes(), before)
         self.assertIn("did not report its load settings", msg)
         self.assertIn("left them unchanged", msg)
@@ -2064,7 +2184,7 @@ class LemonadeLoadTuningTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             home = Path(tmp)
-            write_tuning_ledger(home, {"ctx_size": 4096})
+            write_tuning_ledger({"ctx_size": 4096}, home)
             before = tuning_ledger_path(home).read_bytes()
             with (
                 patch("lemonade.read_config", side_effect=read),
@@ -2074,9 +2194,116 @@ class LemonadeLoadTuningTests(unittest.TestCase):
                 patch("lemonade._run", side_effect=run),
             ):
                 with self.assertRaises(RuntimeError) as ctx:
-                    apply_tuning(defaults, home=home)
+                    apply_tuning(defaults, ledger_dir=home)
             self.assertIn("config set failed", str(ctx.exception))
             self.assertEqual(tuning_ledger_path(home).read_bytes(), before)
+
+    def test_default_ledger_path_is_var_lib(self) -> None:
+        self.assertEqual(DEFAULT_TUNING_LEDGER_DIR, Path("/var/lib/ubuntuai"))
+        self.assertEqual(
+            tuning_ledger_path(),
+            Path("/var/lib/ubuntuai/lemonade-tuning.json"),
+        )
+
+    def _victim(self, directory: Path) -> Path:
+        victim = directory / "victim"
+        victim.write_bytes(b"do-not-touch")
+        os.chmod(victim, 0o640)
+        return victim
+
+    def _stamp(self, path: Path) -> tuple[bytes, int, int, int]:
+        st = os.lstat(path)
+        return (path.read_bytes(), st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode))
+
+    def test_symlink_temp_final_and_parent_are_refused(self) -> None:
+        cases = ("temp", "final", "parent")
+        for kind in cases:
+            with self.subTest(kind=kind):
+                with TemporaryDirectory() as tmp:
+                    home = Path(tmp)
+                    victim = self._victim(home)
+                    before = self._stamp(victim)
+                    ledger_dir = home / "ledger"
+                    if kind == "parent":
+                        real = home / "real"
+                        real.mkdir()
+                        victim = self._victim(real)
+                        before = self._stamp(victim)
+                        ledger_dir.symlink_to(real, target_is_directory=True)
+                    else:
+                        ledger_dir.mkdir()
+                    if kind == "final":
+                        tuning_ledger_path(ledger_dir).symlink_to(victim)
+                    token = "abcd1234abcd1234"
+                    with (
+                        patch("lemonade.secrets.token_hex", return_value=token),
+                        patch("lemonade.os.chown") as chown,
+                        patch("lemonade.os.lchown") as lchown,
+                    ):
+                        if kind == "temp":
+                            planted = ledger_dir / f".lemonade-tuning.json.{token}.tmp"
+                            planted.symlink_to(victim)
+                        with self.assertRaises(RuntimeError):
+                            write_tuning_ledger({"ctx_size": 2048}, ledger_dir)
+                    chown.assert_not_called()
+                    lchown.assert_not_called()
+                    self.assertEqual(self._stamp(victim), before)
+                    if kind == "parent":
+                        self.assertFalse((home / "real" / "lemonade-tuning.json").exists())
+
+    def _corrupt_migrates(self, payload: bytes) -> None:
+        factory = _merged_factory()
+        state = json.loads(json.dumps(factory))
+        state["max_loaded_models"] = 2
+        state["ctx_size"] = 4096
+        bodies: list[dict] = []
+
+        class _Resp:
+            def __enter__(self) -> _Resp:
+                return self
+
+            def __exit__(self, *args: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def read() -> dict:
+            return json.loads(json.dumps(state))
+
+        def urlopen(req: object, timeout: int = 3) -> _Resp:
+            body = json.loads(req.data.decode())  # type: ignore[attr-defined]
+            bodies.append(body)
+            state.update(body)
+            return _Resp()
+
+        defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            tuning_ledger_path(home).write_bytes(payload)
+            self.assertIsNone(read_tuning_ledger(home))
+            with (
+                patch("lemonade.read_config", side_effect=read),
+                patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
+                patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
+            ):
+                msg = apply_tuning(defaults, ledger_dir=home)
+        self.assertIn("could not be read", msg)
+        self.assertIn("set again", msg)
+        self.assertEqual(len(bodies), 1)
+        self.assertNotIn("max_loaded_models", bodies[0])
+        self.assertEqual(bodies[0]["ctx_size"], 2048)
+        self.assertEqual(state["max_loaded_models"], 2)
+        self.assertEqual(state["ctx_size"], 2048)
+
+    def test_corrupt_json_is_no_ledger(self) -> None:
+        self._corrupt_migrates(b"{")
+
+    def test_non_utf8_ledger_is_no_ledger(self) -> None:
+        self._corrupt_migrates(b"\xff\xfe")
+
+    def test_non_dict_ledger_is_no_ledger(self) -> None:
+        self._corrupt_migrates(b"[1, 2]")
 
 
 class LemonadeLoadRiskTests(unittest.TestCase):
@@ -2198,6 +2425,9 @@ class LemonadePublishTuningTests(unittest.TestCase):
                 patch("lemonade._restart_snap"),
                 patch("lemonade.probe", return_value=hw),
                 patch("lemonade.largest_gguf_bytes", return_value=105 * 1024**3),
+                patch("lemonade.read_config", return_value=_merged_factory()),
+                patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
+                patch("lemonade._load_ledger", return_value=(None, "")),
                 patch("lemonade.apply_tuning", side_effect=record_apply),
             ):
                 msg = publish(_target(home))
@@ -2220,6 +2450,9 @@ class LemonadePublishTuningTests(unittest.TestCase):
                     ),
                 ),
                 patch("lemonade.largest_gguf_bytes", return_value=105 * 1024**3),
+                patch("lemonade.read_config", return_value=_merged_factory()),
+                patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
+                patch("lemonade._load_ledger", return_value=(None, "")),
             ):
                 text = report_load_tuning(_target(home), hw)
             self.assertIn("still published", text)
