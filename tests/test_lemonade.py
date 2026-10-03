@@ -21,11 +21,14 @@ from lemonade import (
     APPLY_PUBLISH_VERB,
     BindMount,
     HUGE_GGUF_BYTES,
+    INSTALLER_WRITTEN_VALUES,
     LLAMACPP_MMAP_ARGS,
     LOAD_RISK_POLICY,
     OWNED_UNIT_DESC,
     DEFAULT_TUNING_LEDGER_DIR,
     _daemon_was_running,
+    _installer_wrote_value,
+    _values_equal,
     _drop_bind_unit,
     _mkdir_nofollow,
     _run,
@@ -1978,7 +1981,8 @@ class LemonadeLoadTuningTests(unittest.TestCase):
         body = bodies[0]
         self.assertEqual(body["ctx_size"], defaults["ctx_size"])
         self.assertEqual(body["global_timeout"], defaults["global_timeout"])
-        self.assertEqual(body["max_loaded_models"], 1)
+        self.assertNotIn("max_loaded_models", body)
+        self.assertEqual(state["max_loaded_models"], 1)
         self.assertEqual(body["llamacpp_backend"], "vulkan")
         self.assertEqual(body["llamacpp_args"], LLAMACPP_MMAP_ARGS)
 
@@ -2035,6 +2039,259 @@ class LemonadeLoadTuningTests(unittest.TestCase):
         self.assertNotIn("max_loaded_models", ledger)
         self.assertIn("2 models", text)
         self.assertNotIn("keep one model", text)
+
+    def _drive(self, state: dict, defaults: dict) -> tuple[str, list[dict], dict | None]:
+        bodies: list[dict] = []
+
+        class _Resp:
+            def __enter__(self) -> _Resp:
+                return self
+
+            def __exit__(self, *_args: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def read() -> dict:
+            return json.loads(json.dumps(state))
+
+        def urlopen(req: object, timeout: int = 3) -> _Resp:
+            body = json.loads(req.data.decode())  # type: ignore[attr-defined]
+            bodies.append(body)
+            state.update(body)
+            return _Resp()
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with (
+                patch("lemonade.read_config", side_effect=read),
+                patch("lemonade.read_factory_defaults", side_effect=_merged_factory),
+                patch("lemonade.urllib.request.urlopen", side_effect=urlopen),
+            ):
+                msg = apply_tuning(defaults, ledger_dir=home)
+            ledger = read_tuning_ledger(home)
+        return msg, bodies, ledger
+
+    def test_no_ledger_keeps_ctx_262144(self) -> None:
+        defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
+        for ctx in (262144, "262144"):
+            with self.subTest(ctx=ctx):
+                state = _merged_factory()
+                state["ctx_size"] = ctx
+                msg, bodies, _ledger = self._drive(state, defaults)
+                self.assertIn("updated", msg)
+                self.assertTrue(bodies)
+                for body in bodies:
+                    self.assertNotIn("ctx_size", body)
+                self.assertEqual(state["ctx_size"], ctx)
+
+    def test_no_ledger_retunes_ctx_4096(self) -> None:
+        defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
+        for ctx in (4096, "4096", "  4096  "):
+            with self.subTest(ctx=ctx):
+                state = _merged_factory()
+                state["ctx_size"] = ctx
+                _msg, bodies, ledger = self._drive(state, defaults)
+                self.assertEqual(len(bodies), 1)
+                self.assertEqual(bodies[0]["ctx_size"], 2048)
+                self.assertEqual(state["ctx_size"], 2048)
+                self.assertIsNotNone(ledger)
+                assert ledger is not None
+                self.assertEqual(ledger["ctx_size"], 2048)
+
+    def test_no_ledger_matching_vulkan_backend_is_not_posted(self) -> None:
+        state = _merged_factory()
+        state["llamacpp"]["backend"] = "vulkan"
+        small = load_tuning(_vulkan_igpu(32), 1 * 1024**3)
+        msg, bodies, ledger = self._drive(state, small)
+        self.assertEqual(msg, "lemonade load settings kept")
+        self.assertEqual(bodies, [])
+        self.assertIsNone(ledger)
+        self.assertEqual(state["llamacpp"]["backend"], "vulkan")
+
+        state = _merged_factory()
+        state["llamacpp"]["backend"] = "vulkan"
+        state["ctx_size"] = 4096
+        large = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
+        self.assertEqual(large["llamacpp_backend"], "vulkan")
+        _msg, bodies, ledger = self._drive(state, large)
+        self.assertEqual(len(bodies), 1)
+        self.assertNotIn("llamacpp_backend", bodies[0])
+        self.assertEqual(bodies[0]["ctx_size"], 2048)
+        self.assertEqual(state["llamacpp"]["backend"], "vulkan")
+        self.assertIsNotNone(ledger)
+        assert ledger is not None
+        self.assertEqual(ledger["llamacpp_backend"], "vulkan")
+
+    def test_no_ledger_keeps_custom_llamacpp_args(self) -> None:
+        defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
+        self.assertEqual(defaults["llamacpp_args"], LLAMACPP_MMAP_ARGS)
+        for args in ("--threads 8", "  --threads 8  "):
+            with self.subTest(args=args):
+                state = _merged_factory()
+                state["llamacpp"]["args"] = args
+                _msg, bodies, ledger = self._drive(state, defaults)
+                self.assertTrue(bodies)
+                for body in bodies:
+                    self.assertNotIn("llamacpp_args", body)
+                    self.assertNotIn("llamacpp_vulkan_args", body)
+                    self.assertNotIn(LLAMACPP_MMAP_ARGS, json.dumps(body))
+                self.assertEqual(state["llamacpp"]["args"], args)
+                self.assertIsNotNone(ledger)
+                assert ledger is not None
+                self.assertNotIn("llamacpp_args", ledger)
+                self.assertNotIn("llamacpp_vulkan_args", ledger)
+
+    def test_no_ledger_trimmed_mmap_args_stay_ours(self) -> None:
+        defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
+        state = _merged_factory()
+        state["ctx_size"] = 4096
+        state["llamacpp"]["args"] = "  --load-mode mmap  "
+        _msg, bodies, ledger = self._drive(state, defaults)
+        self.assertEqual(len(bodies), 1)
+        self.assertNotIn("llamacpp_args", bodies[0])
+        self.assertNotIn(LLAMACPP_MMAP_ARGS, json.dumps(bodies[0]))
+        self.assertEqual(state["llamacpp"]["args"], "  --load-mode mmap  ")
+        self.assertIsNotNone(ledger)
+        assert ledger is not None
+        self.assertEqual(ledger["llamacpp_args"], LLAMACPP_MMAP_ARGS)
+
+    def test_no_ledger_keeps_max_loaded_models_2(self) -> None:
+        defaults = load_tuning(_vulkan_igpu(122), 105 * 1024**3)
+        for count in (2, "2"):
+            with self.subTest(count=count):
+                state = _merged_factory()
+                state["max_loaded_models"] = count
+                msg, bodies, ledger = self._drive(state, defaults)
+                self.assertIn("updated", msg)
+                for body in bodies:
+                    self.assertNotIn("max_loaded_models", body)
+                self.assertEqual(state["max_loaded_models"], count)
+                self.assertIsNotNone(ledger)
+                assert ledger is not None
+                self.assertNotIn("max_loaded_models", ledger)
+
+    def test_load_tuning_values_stay_in_installer_written(self) -> None:
+        gib = 1024**3
+        ram_gibs = (8, 16, 32, 64, 122, 256, 512)
+        fracs = (0.0, 0.10, 0.34, 0.35, 0.49, 0.50, 0.69, 0.70, 0.90)
+        absolutes = (0, 2 * gib, 79 * gib, 80 * gib, 105 * gib)
+
+        def machines(ram_gib: int) -> tuple[Hardware, ...]:
+            ram = ram_gib * gib
+            return (
+                Hardware(
+                    cpu_name="strix",
+                    ram_bytes=ram,
+                    devices=(
+                        Device("igpu", "amd", "8060S", "/dev/dri/renderD128", "vulkan"),
+                        Device("cpu", "cpu", "cpu", None, "cpu"),
+                    ),
+                ),
+                Hardware(
+                    cpu_name="strix",
+                    ram_bytes=ram,
+                    gfx="gfx1151",
+                    devices=(
+                        Device("igpu", "amd", "8060S", "/dev/dri/renderD128", "rocm"),
+                        Device("cpu", "cpu", "cpu", None, "cpu"),
+                    ),
+                ),
+                Hardware(
+                    cpu_name="amd",
+                    ram_bytes=ram,
+                    devices=(
+                        Device("dgpu", "amd", "Radeon RX 7600", "/dev/dri/renderD128", "rocm"),
+                        Device("cpu", "cpu", "cpu", None, "cpu"),
+                    ),
+                ),
+                Hardware(
+                    cpu_name="amd",
+                    ram_bytes=ram,
+                    devices=(
+                        Device("dgpu", "amd", "Radeon RX 7900 XT", "/dev/dri/renderD128", "vulkan"),
+                        Device("cpu", "cpu", "cpu", None, "cpu"),
+                    ),
+                ),
+                Hardware(
+                    cpu_name="intel",
+                    ram_bytes=ram,
+                    devices=(
+                        Device("igpu", "intel", "Arc", "/dev/dri/renderD128", "vulkan"),
+                        Device("cpu", "cpu", "cpu", None, "cpu"),
+                    ),
+                ),
+                Hardware(
+                    cpu_name="intel",
+                    ram_bytes=ram,
+                    devices=(
+                        Device("igpu", "intel", "UHD", None, "cpu"),
+                        Device("cpu", "cpu", "cpu", None, "cpu"),
+                    ),
+                ),
+                Hardware(
+                    cpu_name="nvidia",
+                    ram_bytes=ram,
+                    devices=(
+                        Device("dgpu", "nvidia", "RTX 3070", "/dev/dri/renderD128", "cuda"),
+                        Device("cpu", "cpu", "cpu", None, "cpu"),
+                    ),
+                ),
+                Hardware(
+                    cpu_name="cpu",
+                    ram_bytes=ram,
+                    devices=(Device("cpu", "cpu", "cpu", None, "cpu"),),
+                ),
+                Hardware(
+                    cpu_name="amd",
+                    ram_bytes=ram,
+                    devices=(
+                        Device("igpu", "amd", "Raphael", "/dev/dri/renderD128", "rocm"),
+                        Device("cpu", "cpu", "cpu", None, "cpu"),
+                    ),
+                ),
+            )
+
+        misses: set[tuple[str, str]] = set()
+        saw_mmap = False
+        saw_plain = False
+        backends: set[object] = set()
+        ctxs: set[object] = set()
+        for ram_gib in ram_gibs:
+            for hw in machines(ram_gib):
+                sizes = [int(hw.ram_bytes * frac) for frac in fracs]
+                sizes.extend(int(hw.ram_bytes * frac) + 1 for frac in fracs)
+                sizes.extend(absolutes)
+                for size in sizes:
+                    tun = load_tuning(hw, size)
+                    if tun.get("llamacpp_args") == LLAMACPP_MMAP_ARGS:
+                        saw_mmap = True
+                    else:
+                        saw_plain = True
+                    backends.add(tun.get("llamacpp_backend"))
+                    ctxs.add(tun.get("ctx_size"))
+                    for key, value in tun.items():
+                        allowed = INSTALLER_WRITTEN_VALUES.get(key)
+                        if allowed is None or not any(
+                            _values_equal(value, item) for item in allowed
+                        ):
+                            misses.add((key, repr(value)))
+        self.assertEqual(misses, set())
+        self.assertTrue(saw_mmap)
+        self.assertTrue(saw_plain)
+        self.assertEqual(backends, {"auto", "vulkan", "rocm"})
+        self.assertTrue({-1, 2048, 4096, 8192} <= ctxs)
+        self.assertTrue(_installer_wrote_value("ctx_size", "4096"))
+        self.assertTrue(_installer_wrote_value("ctx_size", "  4096"))
+        self.assertFalse(_installer_wrote_value("ctx_size", 262144))
+        self.assertFalse(_installer_wrote_value("ctx_size", "262144"))
+        self.assertTrue(_installer_wrote_value("global_timeout", "2400"))
+        self.assertTrue(_installer_wrote_value("llamacpp_args", "  --load-mode mmap  "))
+        self.assertFalse(_installer_wrote_value("llamacpp_args", " --threads 8 "))
+        self.assertTrue(_installer_wrote_value("llamacpp_vulkan_args", ""))
+        self.assertFalse(_installer_wrote_value("max_loaded_models", 2))
+        self.assertTrue(_installer_wrote_value("max_loaded_models", "1"))
 
     def test_ledger_round_trip_is_atomic(self) -> None:
         with TemporaryDirectory() as tmp:

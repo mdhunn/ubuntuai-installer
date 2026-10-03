@@ -1079,6 +1079,19 @@ def risk_english(
     )
 
 
+# Values load_tuning can write, plus any earlier release. With no ledger, a
+# non-factory value is ours only when it appears here. max_loaded_models is
+# listed for the drift guard. Any non-factory count stays the user's.
+INSTALLER_WRITTEN_VALUES: dict[str, frozenset[object]] = {
+    "ctx_size": frozenset({-1, 2048, 4096, 8192}),
+    "global_timeout": frozenset({600, 1200, 1800, 2400}),
+    "llamacpp_backend": frozenset({"auto", "vulkan", "rocm"}),
+    "llamacpp_args": frozenset({"", LLAMACPP_MMAP_ARGS}),
+    "llamacpp_vulkan_args": frozenset({"", LLAMACPP_MMAP_ARGS}),
+    "max_loaded_models": frozenset({1}),
+}
+
+
 def load_tuning(hw, largest_bytes: int) -> dict[str, object]:
     ram = max(int(getattr(hw, "ram_bytes", 0) or 0), 1)
     frac = largest_bytes / ram
@@ -1290,7 +1303,8 @@ def _corrupt_ledger_warning() -> str:
     return (
         "The saved Lemonade load settings could not be read. "
         "Your model count is kept when it is not the Lemonade default. "
-        "The other load settings are set again."
+        "Other load settings are set again only when they match a value "
+        "this installer writes."
     )
 
 
@@ -1478,22 +1492,37 @@ def _remember_tuning(
     write_tuning_ledger(merged, directory)
 
 
+def _installer_wrote_value(key: str, value: object) -> bool:
+    allowed = INSTALLER_WRITTEN_VALUES.get(key)
+    if not allowed:
+        return False
+    return any(_values_equal(value, item) for item in allowed)
+
+
 def _user_owns_key(
     current: dict,
     factory: dict,
     ledger: dict[str, object] | None,
     key: str,
 ) -> bool:
-    """True when the live value is the user's, not ours and not the factory value.
+    """True when the live value belongs to the user.
 
-    No ledger is the migration case. A non-factory max_loaded_models stays.
-    Every other key is still ours and can be retuned.
+    With a ledger, the value differs from the factory default and from
+    the last value this installer wrote.
+
+    With no ledger, a non-factory max_loaded_models belongs to the user.
+    Any other non-factory value belongs to the user when this installer
+    cannot write that value.
     """
     if not _is_set(current, key):
         return False
     differs = _user_overrode(current, factory, key)
     if ledger is None:
-        return key == "max_loaded_models" and differs
+        if not differs:
+            return False
+        if key == "max_loaded_models":
+            return True
+        return not _installer_wrote_value(key, current.get(key))
     if not differs:
         return False
     if key not in ledger:
@@ -1525,28 +1554,48 @@ def read_factory_defaults() -> dict:
     return json.loads(json.dumps(SHIPPED_DEFAULTS))
 
 
+def _tuning_plan(
+    defaults: dict[str, object],
+    current: dict,
+    factory: dict | None = None,
+    ledger: dict[str, object] | None = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Split installer-owned keys into values to post and values that already match.
+
+    A matching value is not posted. It is still recorded when another key
+    is written, so the next ledger run does not treat it as user-set.
+    """
+    if not _config_known(current):
+        return {}, {}
+    if factory is None:
+        factory = read_factory_defaults()
+    flat = _flatten_config(current)
+    flat_factory = _flatten_config(factory) if factory else {}
+    post: dict[str, object] = {}
+    matched: dict[str, object] = {}
+    for key, value in defaults.items():
+        if key in {"llamacpp_args", "llamacpp_vulkan_args"}:
+            user_owns = _load_mode_user_owns(flat, flat_factory, ledger)
+        else:
+            user_owns = _user_owns_key(flat, flat_factory, ledger, key)
+        if user_owns:
+            continue
+        if _is_set(flat, key) and _values_equal(flat.get(key), value):
+            matched[key] = value
+            continue
+        post[key] = value
+    return post, matched
+
+
 def tuning_to_apply(
     defaults: dict[str, object],
     current: dict,
     factory: dict | None = None,
     ledger: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    """Write a default only when the live value is still ours or still factory."""
-    if not _config_known(current):
-        return {}
-    if factory is None:
-        factory = read_factory_defaults()
-    flat = _flatten_config(current)
-    flat_factory = _flatten_config(factory) if factory else {}
-    chosen: dict[str, object] = {}
-    for key, value in defaults.items():
-        if key in {"llamacpp_args", "llamacpp_vulkan_args"}:
-            if _load_mode_user_owns(flat, flat_factory, ledger):
-                continue
-        elif _user_owns_key(flat, flat_factory, ledger, key):
-            continue
-        chosen[key] = value
-    return chosen
+    """Keys to write. Skip user-owned keys and keys that already match."""
+    post, _matched = _tuning_plan(defaults, current, factory, ledger)
+    return post
 
 
 def effective_max_loaded(
@@ -1629,7 +1678,7 @@ def apply_tuning(
     if factory is None:
         factory = read_factory_defaults()
     ledger, ledger_warning = _load_ledger(ledger_dir)
-    chosen = tuning_to_apply(settings, current, factory, ledger)
+    chosen, matched = _tuning_plan(settings, current, factory, ledger)
     if not chosen:
         return _with_ledger_warning(ledger_warning, "lemonade load settings kept")
     body = json.dumps(chosen).encode("utf-8")
@@ -1658,7 +1707,7 @@ def apply_tuning(
             )
         cli = True
     try:
-        _remember_tuning(chosen, directory=ledger_dir, cli=cli)
+        _remember_tuning({**matched, **chosen}, directory=ledger_dir, cli=cli)
     except (OSError, RuntimeError):
         return _with_ledger_warning(ledger_warning, _ledger_write_failed_message())
     ok, miss = verify_tuning(chosen, read_config())
