@@ -80,6 +80,7 @@ from weights import (
     ANOTHER_DISK,
     UBUNTU_DISK,
     ForeignMountError,
+    OrganizeLinkError,
     catalog_dest,
     disk_words,
     download,
@@ -622,7 +623,7 @@ def _qt_weights(win, user, status) -> QWidget:
                 uid=t.uid,
                 gid=t.gid,
             )
-        except ForeignMountError as exc:
+        except (ForeignMountError, OrganizeLinkError) as exc:
             status.setText(str(exc))
             return
         status.setText("\n".join(log))

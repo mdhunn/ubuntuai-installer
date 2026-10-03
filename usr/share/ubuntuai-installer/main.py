@@ -30,6 +30,7 @@ from repair import (
 from weights import (
     ANOTHER_DISK,
     ForeignMountError,
+    OrganizeLinkError,
     download,
     human_bytes,
     load_catalog as load_weight_catalog,
@@ -209,6 +210,15 @@ def cmd_scan_weights(user: str, extra: tuple[str, ...] = ()) -> int:
     return 0
 
 
+def _organize_line_failed(line: str) -> bool:
+    return (
+        line.startswith("Organize is refused")
+        or line.startswith("Could not copy this model.")
+        or line.startswith("Could not change the owner")
+        or line.startswith("checksum mismatch")
+    )
+
+
 def cmd_organize_weights(
     user: str,
     mode: str,
@@ -218,7 +228,7 @@ def cmd_organize_weights(
 ) -> int:
     t = target_for(user)
     roots = _roots(user, extra)
-    found = tuple(f for f in scan(roots, t.model_root) if f.state == "new")
+    found = tuple(f for f in scan(roots, t.model_root) if f.state in {"new", "busy"})
     if not found:
         print("nothing new to organize")
         return 0
@@ -232,12 +242,17 @@ def cmd_organize_weights(
             gid=t.gid,
             dry_run=dry_run,
         )
-    except ForeignMountError as exc:
+    except (ForeignMountError, OrganizeLinkError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    failed = False
     for line in log:
-        print(line)
-    return 0
+        if _organize_line_failed(line):
+            print(line, file=sys.stderr)
+            failed = True
+        else:
+            print(line)
+    return 1 if failed else 0
 
 
 def cmd_repair(
