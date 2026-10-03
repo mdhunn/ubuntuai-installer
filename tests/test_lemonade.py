@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import unittest
@@ -45,7 +46,9 @@ from paths import (
     SNAP_LEMONADE_MODELS,
     is_home_path,
     lemonade_extra_models_dir,
+    user_config_path,
 )
+from weights import is_foreign_mount
 
 
 def _target(
@@ -68,6 +71,16 @@ def _write_gguf(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"G" * 2048)
     return path
+
+
+def _write_scan_folders(home: Path, folders: tuple[Path, ...]) -> None:
+    path = user_config_path(home)
+    path.resolve().relative_to(home.resolve())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"scan_folders": [str(p) for p in folders]}) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _seed_unit(
@@ -216,6 +229,152 @@ class LemonadePublishTests(unittest.TestCase):
                 bind_mounts(src, dest),
                 (BindMount(extra.resolve(), dest),),
             )
+
+    def test_saved_scan_folder_with_gguf_is_a_source(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "AI models"
+            _write_gguf(extra / "chat.gguf")
+            store = home / "Models" / "gguf"
+            _write_gguf(store / "store.gguf")
+            scan = home / "Models" / "lemonade" / "chat"
+            _write_gguf(scan / "local.gguf")
+            _write_scan_folders(home, (scan,))
+            src = gguf_sources(_target(home))
+            self.assertEqual(
+                src,
+                (extra.resolve(), store.resolve(), scan.resolve()),
+            )
+
+    def test_foreign_mount_scan_folder_is_excluded(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "AI models"
+            _write_gguf(extra / "chat.gguf")
+            local = home / "local-weights"
+            _write_gguf(local / "ok.gguf")
+            foreign = home / "usb-weights"
+            _write_gguf(foreign / "ext.gguf")
+            _write_scan_folders(home, (foreign, local))
+            with patch("weights._FOREIGN_PREFIXES", (foreign.resolve(),)):
+                self.assertTrue(is_foreign_mount(foreign))
+                self.assertFalse(is_foreign_mount(local))
+                self.assertFalse(is_foreign_mount(extra))
+                src = gguf_sources(_target(home, extra=(extra,)))
+            self.assertEqual(src, (extra.resolve(), local.resolve()))
+            self.assertNotIn(foreign.resolve(), src)
+
+    def test_scan_folder_nested_under_extra_collapses(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "AI models"
+            _write_gguf(extra / "outer.gguf")
+            nested = extra / "lemonade" / "chat"
+            _write_gguf(nested / "inner.gguf")
+            _write_scan_folders(home, (nested,))
+            src = gguf_sources(_target(home, extra=(extra,)))
+            self.assertEqual(src, (extra.resolve(),))
+            dest = Path(tmp) / "ubuntuai-models"
+            self.assertEqual(
+                bind_mounts(src, dest),
+                (BindMount(extra.resolve(), dest),),
+            )
+
+    def test_scan_folder_containing_existing_root_collapses(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bucket = home / "bucket"
+            extra = bucket / "AI models"
+            _write_gguf(extra / "a.gguf")
+            store = home / "Models"
+            gguf = store / "gguf"
+            _write_gguf(gguf / "inner.gguf")
+            _write_scan_folders(home, (bucket, store))
+            src = gguf_sources(_target(home, extra=(extra,), model_root=store))
+            self.assertEqual(src, (store.resolve(), bucket.resolve()))
+            self.assertNotIn(extra.resolve(), src)
+            self.assertNotIn(gguf.resolve(), src)
+            dest = Path(tmp) / "ubuntuai-models"
+            self.assertEqual(
+                bind_mounts(src, dest),
+                (
+                    BindMount(store.resolve(), dest / "chat" / "src0"),
+                    BindMount(bucket.resolve(), dest / "chat" / "src1"),
+                ),
+            )
+
+    def test_scan_folder_equal_or_overlapping_roots_are_not_duplicated(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "AI models"
+            _write_gguf(extra / "a.gguf")
+            store = home / "Models" / "gguf"
+            _write_gguf(store / "b.gguf")
+            alias = home / "alias-ai"
+            alias.symlink_to(extra)
+            overlap = store / "nested"
+            _write_gguf(overlap / "c.gguf")
+            _write_scan_folders(home, (extra, store, alias, overlap))
+            src = gguf_sources(_target(home))
+            self.assertEqual(src, (extra.resolve(), store.resolve()))
+            self.assertEqual(len(src), len(set(src)))
+
+    def test_srcn_order_stable_across_runs_and_when_scan_folder_added(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "AI models"
+            _write_gguf(extra / "a.gguf")
+            store = home / "Models" / "gguf"
+            _write_gguf(store / "b.gguf")
+            later = home / "scan-z"
+            earlier = home / "scan-m"
+            _write_gguf(later / "z.gguf")
+            _write_gguf(earlier / "m.gguf")
+            _write_scan_folders(home, (later, earlier))
+            target = _target(home)
+            first = gguf_sources(target)
+            second = gguf_sources(target)
+            self.assertEqual(
+                first,
+                (extra.resolve(), store.resolve(), earlier.resolve(), later.resolve()),
+            )
+            self.assertEqual(first, second)
+            dest = Path(tmp) / "ubuntuai-models"
+            mounts = bind_mounts(first, dest)
+            self.assertEqual(
+                tuple((m.what, m.where.name) for m in mounts),
+                (
+                    (extra.resolve(), "src0"),
+                    (store.resolve(), "src1"),
+                    (earlier.resolve(), "src2"),
+                    (later.resolve(), "src3"),
+                ),
+            )
+
+            added = home / "scan-a"
+            _write_gguf(added / "n.gguf")
+            _write_scan_folders(home, (later, added, earlier))
+            third = gguf_sources(target)
+            fourth = gguf_sources(target)
+            expected = (
+                extra.resolve(),
+                store.resolve(),
+                added.resolve(),
+                earlier.resolve(),
+                later.resolve(),
+            )
+            self.assertEqual(third, expected)
+            self.assertEqual(third, fourth)
+            self.assertEqual(third[0], extra.resolve())
+            self.assertEqual(third[1], store.resolve())
+
+            tail = home / "scan-zz"
+            _write_gguf(tail / "t.gguf")
+            _write_scan_folders(home, (later, added, earlier, tail))
+            fifth = gguf_sources(target)
+            self.assertEqual(fifth[:-1], third)
+            self.assertEqual(fifth[-1], tail.resolve())
+            self.assertEqual(gguf_sources(target), fifth)
 
     def test_snap_extra_dir(self) -> None:
         dest = extra_dir("snap")

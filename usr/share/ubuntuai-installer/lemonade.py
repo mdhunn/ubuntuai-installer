@@ -27,8 +27,9 @@ from paths import (
     SNAP_LEMONADE_MODELS,
     is_home_path,
     lemonade_extra_models_dir,
+    user_config_path,
 )
-from weights import UA, human_bytes
+from weights import UA, human_bytes, is_foreign_mount, normalize_scan_folder
 
 SNAP_COMMON = SNAP_LEMONADE_COMMON
 SNAP_EXTRA = SNAP_LEMONADE_MODELS
@@ -219,7 +220,47 @@ def _search_roots(target: UserTarget) -> tuple[Path, ...]:
     gguf = target.model_root / "gguf"
     if not _any_gguf(gguf):
         add(target.model_root)
+    # Scan folders stay after the built-in roots so existing srcN units
+    # keep their numbers. Path order is applied inside _saved_scan_roots.
+    for folder in _saved_scan_roots(target):
+        add(folder)
     return tuple(roots)
+
+
+def _saved_scan_roots(target: UserTarget) -> tuple[Path, ...]:
+    """Saved scan folders in resolved-path order, foreign mounts omitted.
+
+    Callers append these after extra paths and the gguf store. The same
+    set then keeps the same srcN. Bind units are read-write, so a foreign
+    mount stays out while that residual is parked.
+    """
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for item in _scan_folder_config(target):
+        try:
+            folder = normalize_scan_folder(item, target.home)
+        except ValueError:
+            continue
+        if folder in seen or is_foreign_mount(folder):
+            continue
+        seen.add(folder)
+        found.append(folder)
+    found.sort(key=lambda path: str(path))
+    return tuple(found)
+
+
+def _scan_folder_config(target: UserTarget) -> list[object]:
+    path = user_config_path(target.home)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("scan_folders") or []
+    return raw if isinstance(raw, list) else []
 
 
 def _any_gguf(root: Path) -> bool:
