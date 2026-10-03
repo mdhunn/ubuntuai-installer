@@ -73,8 +73,10 @@ def namespace_child() -> None:
     source = base / "AI models"
     emb = source / "embeddings"
     emb.mkdir(parents=True)
+    from weights import gguf_architecture_header
+
     (emb / "file.gguf").write_bytes(b"G" * 32)
-    (source / "chat.gguf").write_bytes(b"C" * 32)
+    (source / "chat.gguf").write_bytes(gguf_architecture_header("llama"))
     dest = base / "dest"
     (dest / "embeddings").mkdir(parents=True)
     (dest / "chat").mkdir(parents=True)
@@ -488,6 +490,248 @@ class LemonadeMountNamespaceTests(unittest.TestCase):
         finally:
             if base.exists():
                 shutil.rmtree(base, ignore_errors=True)
+
+    def test_migrate_from_whole_tree_keeps_embeddings(self) -> None:
+        if os.geteuid() != 0:
+            self.skipTest("namespace mount test needs root")
+        if shutil.which("unshare") is None or shutil.which("mount") is None:
+            self.skipTest("unshare or mount is not installed")
+        base = Path("/tmp") / f"ubuntuai-ns-migrate-{os.getpid()}"
+        base.mkdir(parents=True, exist_ok=False)
+        env = os.environ.copy()
+        env["UBUNTUAI_PKG"] = str(PKG)
+        env["UBUNTUAI_TESTS"] = str(Path(__file__).resolve().parent)
+        env["UBUNTUAI_NS_BASE"] = str(base)
+        code = (
+            "import os, sys\n"
+            "sys.path[:0] = [os.environ['UBUNTUAI_TESTS'], os.environ['UBUNTUAI_PKG']]\n"
+            "import test_lemonade_mount_ns as ns\n"
+            "ns.namespace_migrate_child()\n"
+        )
+        try:
+            result = subprocess.run(
+                ["unshare", "-m", "--propagation", "private", sys.executable, "-c", code],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            lines = {
+                item.split("=", 1)[0]: item.split("=", 1)[1]
+                for item in result.stdout.splitlines()
+                if "=" in item
+            }
+            self.assertEqual(lines["MIG_HOST_EMB"], "file.gguf")
+            self.assertEqual(lines["MIG_HOST_EMB_MOUNT"], "0")
+            self.assertEqual(lines["MIG_DEST_EMB"], "file.gguf")
+            self.assertEqual(lines["MIG_CHAT"], "model.gguf")
+            self.assertEqual(lines["MIG_VOICE_EXISTS"], "1")
+            self.assertEqual(lines["MIG_GEMMA_EXISTS"], "1")
+            self.assertEqual(lines["MIG_STAGE_MOUNTED"], "0")
+            self.assertEqual(lines["MIG_BACKUP"], "1")
+            self.assertEqual(lines["MIG_MSG_VOICE"], "1")
+            self.assertEqual(lines["MIG_SLAVE_EMB"], "file.gguf")
+            self.assertEqual(lines["LEFT"], "none")
+            host_hits = [
+                line
+                for line in Path("/proc/self/mountinfo").read_text().splitlines()
+                if str(base) in line
+            ]
+            self.assertEqual(host_hits, [])
+        finally:
+            if base.exists():
+                shutil.rmtree(base, ignore_errors=True)
+
+
+def namespace_migrate_child() -> None:
+    import lemonade
+    from domain import UserTarget
+    from weights import gguf_architecture_header
+
+    def ns_ino(pid: str) -> int:
+        return os.stat(f"/proc/{pid}/ns/mnt").st_ino
+
+    if ns_ino("self") == ns_ino("1"):
+        sys.stderr.write("unshare did not create a mount namespace\n")
+        raise SystemExit(2)
+
+    subprocess.run(["mount", "--make-rshared", "/"], check=True)
+    base = Path(os.environ["UBUNTUAI_NS_BASE"])
+    source = base / "AI models"
+    emb = source / "embeddings"
+    emb.mkdir(parents=True)
+    (emb / "file.gguf").write_bytes(b"G" * 32)
+    (source / "chat.gguf").write_bytes(gguf_architecture_header("llama"))
+    dest = base / "dest"
+    (dest / "embeddings").mkdir(parents=True)
+    (dest / "chat" / "src0").mkdir(parents=True)
+    home = base / "home"
+    home.mkdir()
+    units = base / "units"
+    units.mkdir()
+    state = base / "state"
+    lemonade.STAGE_DIR = state / "stage"
+    lemonade.UNIT_BACKUP_DIR = state / "unit-backups"
+    lemonade.SYSTEM_UNIT_DIR = units
+    stage = lemonade.STAGE_DIR
+    stage.mkdir(parents=True)
+    (stage / "src0").mkdir()
+
+    real_run = subprocess.run
+
+    def fake_run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        argv = [str(part) for part in cmd]
+        tool = Path(argv[0]).name if argv else ""
+        if tool == "systemctl":
+            if len(argv) > 1 and argv[1] == "is-active":
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            if "enable" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if tool in {"mount", "umount"}:
+            return real_run(argv, check=False, capture_output=True, text=True)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    lemonade._run = fake_run
+    lemonade.detect = lambda: "snap"
+    lemonade.extra_dir = lambda kind: dest
+    lemonade._config_answers = lambda: True
+    lemonade._set_extra_models_dir = lambda path: None
+    lemonade.report_load_tuning = lambda target, hw=None: ""
+
+    def mount_ok(argv: list[str]) -> None:
+        result = real_run(argv, check=False, capture_output=True, text=True)
+        if result.returncode != 0:
+            sys.stderr.write(f"{' '.join(argv)} -> {result.returncode} {result.stderr}\n")
+            raise SystemExit(7)
+
+    def unescape(raw: str) -> str:
+        return raw.replace("\\040", " ").replace("\\011", "\t").replace("\\134", "\\")
+
+    def mounted(path: Path) -> bool:
+        wanted = str(path)
+        for line in Path("/proc/self/mountinfo").read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and unescape(parts[4]) == wanted:
+                return True
+        return False
+
+    def listing(path: Path) -> str:
+        if not path.is_dir():
+            return "MISSING"
+        names = sorted(os.listdir(path))
+        return ",".join(names) if names else "EMPTY"
+
+    mount_ok(["mount", "-o", "bind,rprivate", str(stage), str(stage)])
+    mount_ok(["mount", "-o", "bind,rprivate", str(source), str(stage / "src0")])
+    mount_ok(["mount", "--bind", str(emb), str(dest / "embeddings")])
+    mount_ok(
+        [
+            "mount",
+            "-t",
+            "tmpfs",
+            "-o",
+            "ro,nosuid,nodev,noexec,size=64k,mode=0555",
+            "tmpfs",
+            str(stage / "src0" / "embeddings"),
+        ]
+    )
+    mount_ok(["mount", "--rbind", str(stage / "src0"), str(dest / "chat" / "src0")])
+    (units / "stage.mount").write_text(
+        lemonade.mount_unit_text(stage, stage, options="bind,rprivate,nofail"),
+        encoding="utf-8",
+    )
+    (units / "stage-src.mount").write_text(
+        lemonade.mount_unit_text(
+            source, stage / "src0", options="bind,rprivate,nofail"
+        ),
+        encoding="utf-8",
+    )
+    (units / "cover.mount").write_text(
+        lemonade.cover_unit_text(stage / "src0" / "embeddings", "stage-src.mount"),
+        encoding="utf-8",
+    )
+    (units / "rbind.mount").write_text(
+        lemonade.mount_unit_text(
+            stage / "src0", dest / "chat" / "src0", options="rbind,nofail"
+        ),
+        encoding="utf-8",
+    )
+    (units / "carried.mount").write_text(
+        lemonade.cover_unit_text(dest / "chat" / "src0" / "embeddings", "rbind.mount"),
+        encoding="utf-8",
+    )
+    (units / "emb.mount").write_text(
+        lemonade.mount_unit_text(emb, dest / "embeddings"),
+        encoding="utf-8",
+    )
+    (source / "chat.gguf").unlink()
+    gemma = source / "gemma" / "model.gguf"
+    gemma.parent.mkdir()
+    gemma.write_bytes(gguf_architecture_header("llama"))
+    voice = source / "voice" / "model.gguf"
+    voice.parent.mkdir()
+    voice.write_bytes(gguf_architecture_header("moss-tts-delay"))
+
+    target = UserTarget(
+        name="owner",
+        uid=0,
+        gid=0,
+        home=home,
+        model_root=source,
+        extra_model_paths=(),
+        bind="127.0.0.1",
+    )
+    try:
+        msg = lemonade.publish(target)
+    except Exception as exc:
+        sys.stderr.write(f"publish failed: {exc}\n")
+        raise SystemExit(5) from exc
+    if msg.startswith("ERROR"):
+        sys.stderr.write(msg + "\n")
+        raise SystemExit(5)
+    print(f"MIG_HOST_EMB={listing(emb)}")
+    print(f"MIG_HOST_EMB_MOUNT={int(mounted(emb))}")
+    print(f"MIG_DEST_EMB={listing(dest / 'embeddings')}")
+    print(f"MIG_CHAT={listing(dest / 'chat' / 'src0')}")
+    print(f"MIG_VOICE_EXISTS={int(voice.is_file())}")
+    print(f"MIG_GEMMA_EXISTS={int(gemma.is_file())}")
+    print(f"MIG_STAGE_MOUNTED={int(mounted(stage))}")
+    backups = list((state / "unit-backups").glob("*")) if (state / "unit-backups").is_dir() else []
+    print(f"MIG_BACKUP={int(bool(backups))}")
+    print(f"MIG_MSG_VOICE={int(str(voice) in msg)}")
+    plan = lemonade._snap_mount_plan(target, dest, lemonade.gguf_sources(target))
+    for _ in range(2):
+        for cmd in lemonade.unmount_commands(plan):
+            real_run(list(cmd), check=False, capture_output=True, text=True)
+    left: list[str] = []
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        mountpoint = unescape(parts[4])
+        if mountpoint == str(base) or mountpoint.startswith(str(base) + "/"):
+            left.append(mountpoint)
+    print("LEFT=" + (",".join(left) if left else "none"))
+    # The slave namespace must still see the host embeddings files.
+    code = (
+        "import os\n"
+        "from pathlib import Path\n"
+        f"base = Path({str(base)!r})\n"
+        "names = sorted(os.listdir(base / 'AI models' / 'embeddings'))\n"
+        "print(','.join(names) if names else 'EMPTY')\n"
+    )
+    slave = real_run(
+        ["unshare", "-m", "--propagation", "slave", sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if slave.returncode != 0:
+        sys.stderr.write(slave.stderr)
+        raise SystemExit(slave.returncode or 4)
+    print("MIG_SLAVE_EMB=" + slave.stdout.strip())
 
 
 if __name__ == "__main__":

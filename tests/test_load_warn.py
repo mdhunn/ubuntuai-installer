@@ -14,6 +14,7 @@ from lemonade import (
     model_gguf_bytes,
     risk_english,
 )
+from weights import gguf_architecture_header
 from load_warn import (
     SCOPE,
     SOFT_BODY,
@@ -146,7 +147,8 @@ class LoadWarnSurfaceTests(unittest.TestCase):
             home = Path(tmp)
             extra = home / "AI models"
             extra.mkdir()
-            (extra / "huge.gguf").write_bytes(b"G" * 2048)
+            blob = gguf_architecture_header("llama")
+            (extra / "huge.gguf").write_bytes(blob + b"\0" * (2048 - len(blob)))
             (home / "Models" / "gguf").mkdir(parents=True)
             hw = _igpu(1)
             # 2048 B on 1 GiB RAM is ok.
@@ -176,7 +178,8 @@ class LoadWarnSurfaceTests(unittest.TestCase):
             home = Path(tmp)
             extra = home / "AI models"
             extra.mkdir()
-            (extra / "big.gguf").write_bytes(b"G" * 4096)
+            blob = gguf_architecture_header("llama")
+            (extra / "big.gguf").write_bytes(blob + b"\0" * (4096 - len(blob)))
             (home / "Models" / "gguf").mkdir(parents=True)
             (home / "Models" / "gguf" / "tiny.gguf").write_bytes(b"G" * 64)
             hw = _igpu(122)
