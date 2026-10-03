@@ -75,6 +75,15 @@ class ApplyTests(unittest.TestCase):
             home=Path(pw.pw_dir),
             model_root=Path(pw.pw_dir) / "Models",
         )
+        self._scratch = TemporaryDirectory()
+        self.addCleanup(self._scratch.cleanup)
+        log_path = Path(self._scratch.name) / "apply.log"
+        for item in (
+            patch("apply.new_apply_log", return_value=log_path),
+            patch("apply._write_user_config"),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
 
     def test_package_regex(self) -> None:
         self.assertTrue(PKG_RE.match("libggml0-backend-vulkan"))
@@ -505,14 +514,22 @@ class ApplyTests(unittest.TestCase):
         self.assertTrue(final.done)
 
     def test_env_quotes_model_root_with_space(self) -> None:
-        pw = pwd.getpwuid(os.getuid())
-        home = Path(pw.pw_dir)
-        with TemporaryDirectory(dir=home, prefix="AI models ") as folder:
-            root = Path(folder)
+        with TemporaryDirectory() as folder:
+            home = Path(folder)
+            root = home / "AI models"
+
+            class PW:
+                pw_name = "tester"
+                pw_uid = os.getuid()
+                pw_gid = os.getgid()
+                pw_dir = str(home)
+
+            pw = PW()
             with TemporaryDirectory() as etc:
                 etc_path = Path(etc)
                 env = etc_path / "ubuntuai.env"
                 with (
+                    patch("apply.pwd.getpwnam", return_value=pw),
                     patch("apply.ENV_FILE", env),
                     patch("apply.PROFILE_FILE", etc_path / "ubuntuai.sh"),
                     patch("apply.LIMITS_FILE", etc_path / "limits.conf"),

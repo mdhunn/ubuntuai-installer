@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -17,6 +18,9 @@ from domain import CatalogWeight, FileHash, FoundWeight, UserTarget
 from paths import DEFAULT_MODEL_DIRNAME, LEGACY_MODEL_DIRNAME, WEIGHTS_FILE
 
 MIN_BYTES = 64 * 1024
+# One percent, and at least 1 MiB, so a copy that barely fits still has room to finish.
+COPY_FREE_MARGIN_MIN = 1024 * 1024
+COPY_PART_SUFFIX = ".part"
 SKIP_NAMES = {"desktop.ini", "thumbs.db", ".ds_store"}
 SKIP_WALK_DIRS = {".git", "__pycache__", "blobs", ".cache"}
 WEIGHT_SUFFIXES = {
@@ -949,19 +953,163 @@ def _remove_source(path: Path, kind: str) -> None:
     path.unlink()
 
 
-def _copy_into_store(item: FoundWeight, dest: Path, uid: int | None, gid: int | None) -> None:
-    # A foreign tree must land as real files. Links back to that mount are refused.
-    if item.kind == "dir":
-        shutil.copytree(item.path, dest, symlinks=not foreign_source(item))
-        if uid is not None and gid is not None:
-            for dirpath, _dirnames, filenames in os.walk(dest):
-                os.chown(dirpath, uid, gid)
-                for name in filenames:
-                    os.chown(Path(dirpath) / name, uid, gid)
+def _copy_part(dest: Path) -> Path:
+    return dest.with_name(dest.name + COPY_PART_SUFFIX)
+
+
+def _clear_copy_temp(dest: Path) -> None:
+    """Drop a leftover temp. A killed copy must not be treated as the model."""
+    part = _copy_part(dest)
+    try:
+        if part.is_dir() and not part.is_symlink():
+            shutil.rmtree(part)
+        elif part.exists() or part.is_symlink():
+            part.unlink()
+    except OSError:
+        pass
+
+
+def _discard_store_entry(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
         return
-    shutil.copy2(item.path, dest)
+    kind = "dir" if path.is_dir() and not path.is_symlink() else "file"
+    _remove_source(path, kind)
+
+
+def _copy_bytes_needed(size: int) -> int:
+    margin = max(COPY_FREE_MARGIN_MIN, size // 100)
+    return size + margin
+
+
+def _require_copy_space(directory: Path, nbytes: int) -> None:
+    need = _copy_bytes_needed(nbytes)
+    try:
+        st = os.statvfs(directory)
+        free = int(st.f_bavail) * int(st.f_frsize)
+    except OSError as exc:
+        raise RuntimeError(
+            "Could not copy this model. Free space could not be checked."
+        ) from exc
+    if free < need:
+        raise RuntimeError(
+            "Could not copy this model. The disk does not have enough free space. "
+            f"The copy needs {human_bytes(need)} and {human_bytes(free)} is free."
+        )
+
+
+def _fsync_dir(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _finish_store_file(path: Path, uid: int | None, gid: int | None) -> None:
+    # The store file is 0644. The source mode is not kept.
+    os.chmod(path, 0o644)
+    if uid is not None and gid is not None and not path.is_symlink():
+        os.chown(path, uid, gid)
+
+
+def _transfer_file(src: Path, part: Path) -> None:
+    with open(src, "rb") as rf, open(part, "wb") as wf:
+        while True:
+            chunk = rf.read(1024 * 1024)
+            if not chunk:
+                break
+            wf.write(chunk)
+        wf.flush()
+        os.fsync(wf.fileno())
+
+
+def _raise_copy_error(exc: Exception) -> None:
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        raise RuntimeError(
+            "Could not copy this model. The disk filled up during the copy. "
+            "The partial file was removed."
+        ) from exc
+    raise exc
+
+
+def _copy_file_into_store(
+    src: Path,
+    dest: Path,
+    uid: int | None,
+    gid: int | None,
+    algo: str,
+    src_hash: str,
+) -> None:
+    # Temp sits next to the final name so the rename stays on one filesystem.
+    # The final name appears only after the checksum matches.
+    _require_copy_space(dest.parent, src.stat().st_size)
+    part = _copy_part(dest)
+    _clear_copy_temp(dest)
+    try:
+        _transfer_file(src, part)
+        _finish_store_file(part, uid, gid)
+        if hash_path(part, algo) != src_hash:
+            raise RuntimeError(
+                f"checksum mismatch copying {src}. The store file was not kept."
+            )
+        os.replace(part, dest)
+        _fsync_dir(dest.parent)
+    except Exception as exc:
+        _clear_copy_temp(dest)
+        _raise_copy_error(exc)
+
+
+def _copy_tree_into_store(
+    item: FoundWeight,
+    dest: Path,
+    uid: int | None,
+    gid: int | None,
+    algo: str,
+    src_hash: str,
+) -> None:
+    _require_copy_space(dest.parent, _dir_size(item.path))
+    part = _copy_part(dest)
+    _clear_copy_temp(dest)
+    try:
+        # A foreign tree must land as real files. Links back to that mount are refused.
+        shutil.copytree(item.path, part, symlinks=not foreign_source(item))
+        for dirpath, _dirnames, filenames in os.walk(part):
+            if uid is not None and gid is not None:
+                os.chown(dirpath, uid, gid)
+            for name in filenames:
+                fp = Path(dirpath) / name
+                if fp.is_symlink():
+                    continue
+                _finish_store_file(fp, uid, gid)
+                with open(fp, "rb") as fh:
+                    os.fsync(fh.fileno())
+        if hash_path(part, algo) != src_hash:
+            raise RuntimeError(
+                f"checksum mismatch copying {item.path}. The store file was not kept."
+            )
+        os.replace(part, dest)
+        _fsync_dir(dest.parent)
+    except Exception as exc:
+        _clear_copy_temp(dest)
+        _raise_copy_error(exc)
+
+
+def _copy_into_store(
+    item: FoundWeight,
+    dest: Path,
+    uid: int | None,
+    gid: int | None,
+    *,
+    algo: str,
+    src_hash: str,
+) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
     if uid is not None and gid is not None:
-        os.chown(dest, uid, gid)
+        os.chown(dest.parent, uid, gid)
+    if item.kind == "dir":
+        _copy_tree_into_store(item, dest, uid, gid, algo, src_hash)
+        return
+    _copy_file_into_store(item.path, dest, uid, gid, algo, src_hash)
 
 
 def organize(
@@ -1004,14 +1152,17 @@ def organize(
         parent_writable = os.access(item.path.parent, os.W_OK)
         algo = integrity_algo_for(item)
         src_hash = hash_path(item.path, algo)
-        _copy_into_store(item, dest, uid, gid)
-        dest_hash = hash_path(dest, algo)
-        if dest_hash != src_hash:
-            _remove_source(dest, item.kind)
-            log.append(f"checksum mismatch after {mode} {item.path} -> {dest} ({algo})")
-            continue
+        try:
+            _copy_into_store(item, dest, uid, gid, algo=algo, src_hash=src_hash)
+        except RuntimeError as exc:
+            if "checksum mismatch" in str(exc):
+                log.append(
+                    f"checksum mismatch after {mode} {item.path} -> {dest} ({algo})"
+                )
+                continue
+            raise
         verb = "copied" if mode == "copy" else "moved"
-        log.append(f"{verb} {item.path} -> {dest} {algo}={dest_hash[:12]}")
+        log.append(f"{verb} {item.path} -> {dest} {algo}={src_hash[:12]}")
         if want_remove:
             if not parent_writable:
                 log.append(f"kept source {item.path} (not writable)")
@@ -1025,6 +1176,77 @@ def organize(
 
 def catalog_dest(model: CatalogWeight, model_root: Path) -> Path:
     return model_root / model.subdir / model.filename
+
+
+def _catalog_file_complete(path: Path, model: CatalogWeight) -> bool:
+    """True when the store file matches the catalog size and published checksum.
+
+    A short file left by a killed copy is not complete.
+    """
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= 0:
+        return False
+    published = model.published_hash()
+    if published:
+        try:
+            if hash_file(path, published.algo) != published.hexdigest.lower():
+                return False
+        except (OSError, ValueError):
+            return False
+    if model.bytes > 0 and size != model.bytes:
+        return False
+    if model.bytes <= 0 and published is None:
+        return False
+    return True
+
+
+def _store_file_complete(
+    dest: Path, source: FoundWeight | None, model: CatalogWeight
+) -> bool:
+    if source is None:
+        return _catalog_file_complete(dest, model)
+    if not dest.is_file() or dest.is_symlink():
+        return False
+    try:
+        size = dest.stat().st_size
+        src_size = source.path.stat().st_size
+    except OSError:
+        return False
+    if size <= 0 or size != src_size:
+        return False
+    algo = integrity_algo_for(source)
+    try:
+        return hash_file(dest, algo) == hash_file(source.path, algo)
+    except (OSError, ValueError):
+        return False
+
+
+def _matching_source(
+    model: CatalogWeight,
+    target: UserTarget,
+    extra: tuple[Path, ...],
+    dest: Path,
+) -> FoundWeight | None:
+    roots = scan_roots(target.home, target.model_root, extra)
+    try:
+        dest_real = dest.resolve() if dest.exists() or dest.is_symlink() else None
+    except OSError:
+        dest_real = None
+    for item in scan(roots, target.model_root):
+        if item.path.name != model.filename:
+            continue
+        try:
+            if dest_real is not None and item.path.resolve() == dest_real:
+                continue
+        except OSError:
+            continue
+        return item
+    return None
 
 
 def verify_download(
@@ -1069,15 +1291,14 @@ def download(
     expected: FileHash | None = None,
 ) -> str:
     dest = catalog_dest(model, model_root)
+    _clear_copy_temp(dest)
     if (dest.exists() or dest.is_symlink()) and not force:
-        return f"already {dest}"
+        if _catalog_file_complete(dest, model):
+            return f"already {dest}"
     if dry_run:
         return f"download {model.id} -> {dest} ({human_bytes(model.bytes)})"
-    if force and (dest.exists() or dest.is_symlink()):
-        if dest.is_dir() and not dest.is_symlink():
-            shutil.rmtree(dest)
-        else:
-            dest.unlink()
+    if dest.exists() or dest.is_symlink():
+        _discard_store_entry(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if uid is not None and gid is not None:
         os.chown(dest.parent, uid, gid)
@@ -1124,45 +1345,43 @@ def ensure_weight(
     dry_run: bool = False,
 ) -> str:
     dest = catalog_dest(model, target.model_root)
-    if dest.exists() or dest.is_symlink():
+    _clear_copy_temp(dest)
+    source = _matching_source(model, target, extra, dest)
+    # A short file at the final name is a killed copy. It is not the model.
+    if _store_file_complete(dest, source, model):
         return f"already {dest}"
-    roots = scan_roots(target.home, target.model_root, extra)
-    for item in scan(roots, target.model_root):
-        if item.path.name != model.filename:
-            continue
-        try:
-            if item.path.resolve() == dest.resolve():
-                return f"already {dest}"
-        except OSError:
-            pass
-        # Copy or move places a real file in the store. A symlink is not offered.
-        # Move removes the original and always asks, so Apply copies.
-        if dry_run:
-            return f"copy {item.path} -> {dest}"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if target.uid is not None:
-            os.chown(dest.parent, target.uid, target.gid)
-        algo = integrity_algo_for(item)
-        src_hash = hash_path(item.path, algo)
-        _copy_into_store(item, dest, target.uid, target.gid)
-        if hash_path(dest, algo) != src_hash:
-            _remove_source(dest, item.kind)
-            raise RuntimeError(
-                f"checksum mismatch copying {item.path}. The store file was not kept."
+    # Copy or move places a real file in the store. A symlink is not offered.
+    # Move removes the original and always asks, so Apply copies.
+    if dry_run:
+        if source is None:
+            return download(
+                model,
+                target.model_root,
+                uid=target.uid,
+                gid=target.gid,
+                dry_run=True,
             )
-        return f"copied {item.path} -> {dest}"
+        return f"copy {source.path} -> {dest}"
+    if dest.exists() or dest.is_symlink():
+        _discard_store_entry(dest)
+    if source is None:
 
-    def prog(done: int, total: int) -> None:
-        if on_progress:
-            on_progress(
-                f"Downloading {model.filename}: {human_bytes(done)} / {human_bytes(total)}"
-            )
+        def prog(done: int, total: int) -> None:
+            if on_progress:
+                on_progress(
+                    f"Downloading {model.filename}: {human_bytes(done)} / {human_bytes(total)}"
+                )
 
-    return download(
-        model,
-        target.model_root,
-        on_progress=prog,
-        uid=target.uid,
-        gid=target.gid,
-        dry_run=dry_run,
+        return download(
+            model,
+            target.model_root,
+            on_progress=prog,
+            uid=target.uid,
+            gid=target.gid,
+        )
+    algo = integrity_algo_for(source)
+    src_hash = hash_path(source.path, algo)
+    _copy_into_store(
+        source, dest, target.uid, target.gid, algo=algo, src_hash=src_hash
     )
+    return f"copied {source.path} -> {dest}"

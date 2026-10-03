@@ -107,6 +107,7 @@ class EnsureWeightTests(unittest.TestCase):
             extra.mkdir()
             blob = extra / model.filename
             blob.write_bytes(b"g" * (128 * 1024))
+            os.chmod(blob, 0o777)
             store = home / "Models"
             store.mkdir()
             target = UserTarget(
@@ -122,6 +123,7 @@ class EnsureWeightTests(unittest.TestCase):
             self.assertFalse(dest.is_symlink())
             self.assertFalse(os.path.samefile(dest, blob))
             self.assertEqual(dest.read_bytes(), blob.read_bytes())
+            self.assertEqual(dest.stat().st_mode & 0o777, 0o644)
             self.assertTrue(blob.is_file())
             self.assertTrue(msg.startswith("copied"))
 

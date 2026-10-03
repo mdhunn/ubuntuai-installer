@@ -489,6 +489,8 @@ def execute_plan(
                                 "A downloaded model file did not match the checksum "
                                 "published on its page. The broken file was not kept."
                             )
+                        elif detail.startswith("Could not copy"):
+                            english = detail
                         elif "incomplete download" in low or "empty download" in low:
                             english = (
                                 "A downloaded model file was incomplete or the wrong size. "

@@ -412,6 +412,120 @@ class SpaceSafeOutputTests(unittest.TestCase):
             self.assertEqual(from_env.returncode, 0, from_env.stderr)
             self.assertEqual(from_env.stdout, str(other_file))
 
+    def _gguf(self, folder: Path, name: str = "voice.gguf") -> Path:
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / name
+        path.write_bytes(b"g" * 32)
+        return path
+
+    def test_launcher_json_load_keeps_escaped_paths(self) -> None:
+        cases = (
+            ("cafè models", "\\u00e8"),
+            ("back\\slash", "\\\\"),
+            ('say"hi', '\\"'),
+        )
+        for dirname, needle in cases:
+            with self.subTest(dirname=dirname):
+                with TemporaryDirectory() as tmp:
+                    home = Path(tmp)
+                    lib = home / "lib"
+                    self._fake_openmoss(lib)
+                    root = home / dirname
+                    wanted = self._gguf(root / "openmoss")
+                    legacy = self._gguf(home / "Models" / "openmoss", "legacy.gguf")
+                    xdg = home / "cfg"
+                    cfg = xdg / "ubuntuai" / "config.json"
+                    cfg.parent.mkdir(parents=True)
+                    cfg.write_text(
+                        json.dumps({"model_root": str(root)}) + "\n",
+                        encoding="utf-8",
+                    )
+                    self.assertIn(needle, cfg.read_text(encoding="utf-8"))
+                    script = launcher_script(lib, 8081, home / "AI models")
+                    env = self._launcher_env(home)
+                    env["XDG_CONFIG_HOME"] = str(xdg)
+                    found = self._run_launcher(script, env)
+                    self.assertEqual(found.returncode, 0, found.stderr)
+                    self.assertEqual(found.stdout, str(wanted))
+                    self.assertNotEqual(found.stdout, str(legacy))
+
+    def test_launcher_config_failure_falls_through(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            outside = Path(tmp + "-out")
+            outside.mkdir()
+            lib = home / "lib"
+            self._fake_openmoss(lib)
+            decoy = self._gguf(outside / "openmoss", "decoy.gguf")
+            wanted = self._gguf(home / "From env" / "openmoss", "env.gguf")
+            xdg = home / "cfg"
+            cfg = xdg / "ubuntuai" / "config.json"
+            cfg.parent.mkdir(parents=True)
+            cfg.write_text(
+                json.dumps({"model_root": str(outside)}) + "\n",
+                encoding="utf-8",
+            )
+            env_path = home / "ubuntuai.env"
+            env_path.write_text(
+                f"UBUNTUAI_MODELS={shlex.quote(str(home / 'From env'))}\n",
+                encoding="utf-8",
+            )
+            script = launcher_script(lib, 8081, home / "AI models")
+            env = self._launcher_env(home)
+            env["XDG_CONFIG_HOME"] = str(xdg)
+            env["UBUNTUAI_ENV_FILE"] = str(env_path)
+            found = self._run_launcher(script, env)
+            self.assertEqual(found.returncode, 0, found.stderr)
+            self.assertEqual(found.stdout, str(wanted))
+            self.assertNotEqual(found.stdout, str(decoy))
+
+            cfg.write_text("{not json\n", encoding="utf-8")
+            broken = self._run_launcher(script, env)
+            self.assertEqual(broken.returncode, 0, broken.stderr)
+            self.assertEqual(broken.stdout, str(wanted))
+
+            env_path.unlink()
+            env["UBUNTUAI_ENV_FILE"] = str(home / "missing.env")
+            baked = self._run_launcher(script, env)
+            self.assertIn("no GGUF", baked.stderr)
+            self.assertIn(str(home / "AI models" / "openmoss"), baked.stderr)
+
+    def test_launcher_relative_config_stays_under_home(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            lib = home / "lib"
+            self._fake_openmoss(lib)
+            wanted = self._gguf(home / "Rel models" / "openmoss", "rel.gguf")
+            legacy = self._gguf(home / "Models" / "openmoss", "legacy.gguf")
+            xdg = home / "cfg"
+            cfg = xdg / "ubuntuai" / "config.json"
+            cfg.parent.mkdir(parents=True)
+            cfg.write_text(
+                json.dumps({"model_root": "Rel models"}) + "\n",
+                encoding="utf-8",
+            )
+            script = launcher_script(lib, 8081, home / "AI models")
+            env = self._launcher_env(home)
+            env["XDG_CONFIG_HOME"] = str(xdg)
+            found = self._run_launcher(script, env)
+            self.assertEqual(found.returncode, 0, found.stderr)
+            self.assertEqual(found.stdout, str(wanted))
+            self.assertNotEqual(found.stdout, str(legacy))
+
+            decoy_root = home.parent / f"outside-{home.name}"
+            cfg.write_text(
+                json.dumps({"model_root": f"../{decoy_root.name}"}) + "\n",
+                encoding="utf-8",
+            )
+            try:
+                decoy = self._gguf(decoy_root / "openmoss", "escape.gguf")
+                escaped = self._run_launcher(script, env)
+                self.assertEqual(escaped.returncode, 0, escaped.stderr)
+                self.assertEqual(escaped.stdout, str(legacy))
+                self.assertNotEqual(escaped.stdout, str(decoy))
+            finally:
+                shutil.rmtree(decoy_root, ignore_errors=True)
+
     def test_systemd_escape_round_trip_for_a_spaced_path(self) -> None:
         escape = shutil.which("systemd-escape")
         if not escape:

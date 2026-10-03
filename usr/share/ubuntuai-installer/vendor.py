@@ -45,9 +45,40 @@ expand_tilde() {{
 
 root=""
 if [ -f "$CONFIG" ]; then
-  raw=$(sed -n 's/.*"model_root"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$CONFIG" | head -n 1)
+  raw=$(python3 -c 'import json,sys,os
+p=sys.argv[1]
+home=sys.argv[2]
+try:
+    fh=open(p,encoding="utf-8")
+    data=json.load(fh)
+    fh.close()
+except Exception:
+    raise SystemExit(1)
+if not isinstance(data,dict):
+    raise SystemExit(1)
+root=data.get("model_root")
+if not isinstance(root,str) or not root.strip():
+    raise SystemExit(1)
+root=root.strip()
+if root=="~":
+    root=home
+elif root.startswith("~/"):
+    root=os.path.join(home,root[2:])
+elif root.startswith("~"):
+    root=os.path.expanduser(root)
+if not os.path.isabs(root):
+    root=os.path.join(home,root)
+try:
+    home_real=os.path.realpath(home)
+    root_real=os.path.realpath(root)
+except OSError:
+    raise SystemExit(1)
+if os.path.commonpath((home_real,root_real))!=home_real:
+    raise SystemExit(1)
+sys.stdout.write(root)
+' "$CONFIG" "$HOME" 2>/dev/null) || raw=""
   if [ -n "$raw" ]; then
-    root=$(expand_tilde "$raw")
+    root=$raw
   fi
 fi
 if [ -z "$root" ] && [ -n "${{UBUNTUAI_MODELS:-}}" ]; then

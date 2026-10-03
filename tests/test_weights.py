@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import http.server
 import io
@@ -791,6 +792,109 @@ class ForeignMountTests(unittest.TestCase):
             self.assertEqual(dest.read_bytes(), payload)
             self.assertEqual(blob.read_bytes(), payload)
             self.assertIn("copied ", out.getvalue())
+
+
+class StoreCopySafetyTests(unittest.TestCase):
+    def _model(self, nbytes: int) -> CatalogWeight:
+        return CatalogWeight(
+            id="copy-probe",
+            title="Copy",
+            summary="",
+            subdir="gguf",
+            filename="model.gguf",
+            url="https://example.invalid/model.gguf",
+            bytes=nbytes,
+            workflows=(),
+        )
+
+    def _place(self, home: Path, nbytes: int) -> tuple[Path, Path, bytes, Path, UserTarget]:
+        extra = home / "stash"
+        extra.mkdir()
+        blob = extra / "model.gguf"
+        payload = b"g" * nbytes
+        blob.write_bytes(payload)
+        os.chmod(blob, 0o777)
+        store = home / "AI models"
+        store.mkdir()
+        target = UserTarget(
+            name="tester",
+            uid=os.getuid(),
+            gid=os.getgid(),
+            home=home,
+            model_root=store,
+        )
+        return extra, blob, payload, store, target
+
+    def test_disk_full_refuses_and_leaves_no_partial(self) -> None:
+        nbytes = 2 * 1024 * 1024
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra, _blob, _payload, store, target = self._place(home, nbytes)
+            model = self._model(nbytes)
+            dest = store / "gguf" / model.filename
+
+            class Stat:
+                f_bavail = 128
+                f_frsize = 4096
+
+            with patch("weights.os.statvfs", return_value=Stat()):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ensure_weight(model, target, (extra,))
+            text = str(ctx.exception)
+            self.assertIn("Could not copy this model.", text)
+            self.assertIn("free space", text)
+            self.assertIn("512 KiB", text)
+            self.assertFalse(dest.exists())
+            self.assertFalse(dest.with_name(dest.name + ".part").exists())
+
+            def fill_then_fail(src: Path, part: Path) -> None:
+                part.write_bytes(b"x" * 4096)
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+            with patch("weights._transfer_file", side_effect=fill_then_fail):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ensure_weight(model, target, (extra,))
+            self.assertIn("filled up", str(ctx.exception))
+            self.assertIn("partial file was removed", str(ctx.exception))
+            self.assertFalse(dest.exists())
+            self.assertFalse(dest.with_name(dest.name + ".part").exists())
+
+    def test_interrupted_copy_is_not_already(self) -> None:
+        nbytes = 128 * 1024
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra, _blob, payload, store, target = self._place(home, nbytes)
+            model = self._model(nbytes)
+            dest = store / "gguf" / model.filename
+            dest.parent.mkdir(parents=True)
+            dest.write_bytes(b"p" * (64 * 1024))
+            part = dest.with_name(dest.name + ".part")
+            part.write_bytes(b"t" * 1024)
+            msg = ensure_weight(model, target, (extra,))
+            self.assertTrue(msg.startswith("copied"), msg)
+            self.assertFalse(msg.startswith("already"))
+            self.assertEqual(dest.read_bytes(), payload)
+            self.assertFalse(part.exists())
+            self.assertEqual(dest.stat().st_mode & 0o777, 0o644)
+            again = ensure_weight(model, target, (extra,))
+            self.assertTrue(again.startswith("already"), again)
+
+    def test_stale_temp_is_removed(self) -> None:
+        nbytes = 128 * 1024
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra, _blob, payload, store, target = self._place(home, nbytes)
+            model = self._model(nbytes)
+            dest = store / "gguf" / model.filename
+            part = dest.with_name(dest.name + ".part")
+            part.parent.mkdir(parents=True)
+            part.write_bytes(b"stale" * 20000)
+            msg = ensure_weight(model, target, (extra,))
+            self.assertTrue(msg.startswith("copied"), msg)
+            self.assertFalse(part.exists())
+            self.assertEqual(dest.read_bytes(), payload)
+            self.assertFalse(dest.read_bytes().startswith(b"stale"))
+            self.assertEqual(dest.stat().st_mode & 0o777, 0o644)
 
 
 if __name__ == "__main__":
