@@ -47,6 +47,10 @@ ALLOWED_LINES = {
         "usr/share/ubuntuai-installer/paths.py",
         'LEGACY_MODEL_DIRNAME = "Models"',
     ): "constant for the previous folder name. search only. not the default",
+    (
+        "AGENTS.md",
+        "21. Lemonade must see the GGUF files the installer already has. The snap cannot follow `~/Models` symlinks and cannot read `/home` as `extra_models_dir`. Bind the real trees (often `~/AI models`) into `/var/snap/lemonade-server/common/ubuntuai-models` and set `extra_models_dir`.",
+    ): "AGENTS.md is unchanged in this PR. The sentence names the previous folder in the Lemonade symlink note. A wording change needs owner approval.",
 }
 
 # ui/ is owned by another team. Hits belong here instead of an edit.
