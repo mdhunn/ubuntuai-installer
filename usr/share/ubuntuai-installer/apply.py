@@ -7,6 +7,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -597,15 +598,18 @@ def write_core_files(user: str, model_root: str, bind: str) -> None:
     ETC = ENV_FILE.parent
     ETC.mkdir(parents=True, exist_ok=True)
     env = (
-        f"UBUNTUAI_MODELS={root}\n"
-        f"UBUNTUAI_BIND={bind}\n"
+        f"UBUNTUAI_MODELS={shlex.quote(str(root))}\n"
+        f"UBUNTUAI_BIND={shlex.quote(bind)}\n"
         f"UBUNTUAI_USER={user}\n"
     )
     ENV_FILE.write_text(env, encoding="utf-8")
     os.chmod(ENV_FILE, 0o644)
+    env_ref = shlex.quote(str(ENV_FILE))
     PROFILE_FILE.write_text(
         "# Ubuntu AI Installer\n"
-        "[ -r /etc/ubuntuai/ubuntuai.env ] && . /etc/ubuntuai/ubuntuai.env\n"
+        f"[ -r {env_ref} ] && . {env_ref}\n"
+        "export UBUNTUAI_MODELS\n"
+        "export UBUNTUAI_BIND\n"
         "[ -d \"$HOME/.local/bin\" ] && case \":$PATH:\" in\n"
         "  *\":$HOME/.local/bin:\"*) ;;\n"
         "  *) PATH=\"$HOME/.local/bin:$PATH\" ;;\n"

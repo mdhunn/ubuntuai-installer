@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import pwd
+import shlex
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -19,6 +21,7 @@ from apply import (
     execute_plan,
     explain_apt_failure,
     format_failure,
+    write_core_files,
 )
 from progress import ProgressEvent, ProgressPump, download_english
 from catalog import load_workflows
@@ -485,6 +488,78 @@ class ApplyTests(unittest.TestCase):
         self.assertIsNotNone(final)
         assert final is not None
         self.assertTrue(final.done)
+
+    def test_env_quotes_model_root_with_space(self) -> None:
+        pw = pwd.getpwuid(os.getuid())
+        home = Path(pw.pw_dir)
+        with TemporaryDirectory(dir=home, prefix="AI models ") as folder:
+            root = Path(folder)
+            with TemporaryDirectory() as etc:
+                etc_path = Path(etc)
+                env = etc_path / "ubuntuai.env"
+                with (
+                    patch("apply.ENV_FILE", env),
+                    patch("apply.PROFILE_FILE", etc_path / "ubuntuai.sh"),
+                    patch("apply.LIMITS_FILE", etc_path / "limits.conf"),
+                ):
+                    write_core_files(pw.pw_name, str(root), "127.0.0.1")
+                text = env.read_text(encoding="utf-8")
+                line = next(
+                    item
+                    for item in text.splitlines()
+                    if item.startswith("UBUNTUAI_MODELS=")
+                )
+                self.assertEqual(
+                    line,
+                    f"UBUNTUAI_MODELS={shlex.quote(str(root.resolve()))}",
+                )
+                completed = subprocess.run(
+                    [
+                        "sh",
+                        "-c",
+                        '. "$1"; printf %s "$UBUNTUAI_MODELS"',
+                        "sh",
+                        str(env),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout, str(root.resolve()))
+                profile = (etc_path / "ubuntuai.sh").read_text(encoding="utf-8")
+                self.assertIn("export UBUNTUAI_MODELS\n", profile)
+                self.assertIn("export UBUNTUAI_BIND\n", profile)
+                self.assertIn(f"UBUNTUAI_BIND={shlex.quote('127.0.0.1')}", text)
+                self.assertIn(shlex.quote(str(env)), profile)
+                child = subprocess.run(
+                    [
+                        "sh",
+                        "-c",
+                        ". \"$1\"; sh -c 'printf %s \"$UBUNTUAI_MODELS\"'",
+                        "sh",
+                        str(etc_path / "ubuntuai.sh"),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(child.returncode, 0, child.stderr)
+                self.assertEqual(child.stdout, str(root.resolve()))
+                bind_child = subprocess.run(
+                    [
+                        "sh",
+                        "-c",
+                        ". \"$1\"; sh -c 'printf %s \"$UBUNTUAI_BIND\"'",
+                        "sh",
+                        str(etc_path / "ubuntuai.sh"),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(bind_child.returncode, 0, bind_child.stderr)
+                self.assertEqual(bind_child.stdout, "127.0.0.1")
 
 
 if __name__ == "__main__":
