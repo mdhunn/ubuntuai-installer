@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import pwd
 import re
 import shlex
 import shutil
@@ -17,18 +16,19 @@ from unittest.mock import patch
 
 from support import ROOT
 
-from apply import quote_desktop_exec, run_privileged, write_core_files
+from apply import execute_plan, run_privileged, write_core_files
+from domain import Action, UserTarget
 from lemonade import (
     _escape_mount,
     _what_from_unit,
     _where_from_unit,
     mount_unit_text,
-    quote_systemd_exec,
 )
 from main import _parser, config_main, installer_main
 from paths import DEFAULT_MODEL_DIRNAME, LEGACY_MODEL_DIRNAME
 from users import default_model_root, target_for
-from vendor import LAUNCHER
+from vendor import launcher_script
+from weights import load_catalog
 
 
 HARDCODE = re.compile(r"~/Models|\$HOME/Models|(?<![A-Za-z0-9_])[\"']Models[\"']")
@@ -57,44 +57,14 @@ ALLOWED_LINES = {
 UI_FOLLOWUPS: tuple[str, ...] = ()
 
 
-def _parse_desktop_exec(value: str) -> list[str]:
-    args: list[str] = []
-    buf: list[str] = []
-    i = 0
-    quoted = False
-    while i < len(value):
-        ch = value[i]
-        if quoted:
-            if ch == "\\" and i + 1 < len(value):
-                buf.append(value[i + 1])
-                i += 2
-                continue
-            if ch == '"':
-                quoted = False
-                i += 1
-                continue
-            buf.append(ch)
-            i += 1
-            continue
-        if ch.isspace():
-            if buf:
-                args.append("".join(buf))
-                buf = []
-            i += 1
-            continue
-        if ch == '"':
-            quoted = True
-            i += 1
-            continue
-        if ch == "\\" and i + 1 < len(value):
-            buf.append(value[i + 1])
-            i += 2
-            continue
-        buf.append(ch)
-        i += 1
-    if buf:
-        args.append("".join(buf))
-    return [arg.replace("%%", "%") for arg in args]
+def _passwd(home: Path):
+    class PW:
+        pw_name = "tester"
+        pw_uid = os.getuid()
+        pw_gid = os.getgid()
+        pw_dir = str(home)
+
+    return PW()
 
 
 def _shipped_files() -> list[Path]:
@@ -122,13 +92,7 @@ class DefaultModelRootTests(unittest.TestCase):
         return env
 
     def _pw(self, home: Path):
-        class PW:
-            pw_name = "tester"
-            pw_uid = os.getuid()
-            pw_gid = os.getgid()
-            pw_dir = str(home)
-
-        return PW()
+        return _passwd(home)
 
     def test_default_is_ai_models_when_nothing_is_saved(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -237,18 +201,55 @@ class DefaultModelRootTests(unittest.TestCase):
             self.assertEqual(str(from_file.model_root), str(saved))
             self.assertEqual(env_path.read_bytes(), env_before)
 
+    def test_tilde_uses_passwd_home_when_process_home_is_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cfg = home / ".config" / "ubuntuai" / "config.json"
+            cfg.parent.mkdir(parents=True)
+            cfg.write_text(
+                json.dumps({"model_root": "~/Models"}) + "\n",
+                encoding="utf-8",
+            )
+            before = cfg.read_bytes()
+            env = self._home_env(home)
+            env["HOME"] = "/root"
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch("users._pw", return_value=self._pw(home)),
+                patch("users.ENV_FILE", home / "missing.env"),
+            ):
+                target = target_for("tester")
+            self.assertEqual(target.model_root, home / "Models")
+            self.assertNotEqual(Path(target.model_root), Path("/root/Models"))
+            self.assertEqual(cfg.read_bytes(), before)
+
+            cfg.unlink()
+            env_path = home / "ubuntuai.env"
+            env_path.write_text("UBUNTUAI_MODELS='~/Models'\n", encoding="utf-8")
+            env_before = env_path.read_bytes()
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch("users._pw", return_value=self._pw(home)),
+                patch("users.ENV_FILE", env_path),
+            ):
+                from_file = target_for("tester")
+            self.assertEqual(from_file.model_root, home / "Models")
+            self.assertFalse(str(from_file.model_root).startswith("/root"))
+            self.assertEqual(env_path.read_bytes(), env_before)
+
 
 class SpaceSafeOutputTests(unittest.TestCase):
     def test_env_profile_and_argv_keep_the_spaced_path(self) -> None:
-        pw = pwd.getpwuid(os.getuid())
-        home = Path(pw.pw_dir)
-        with TemporaryDirectory(dir=home) as tmp:
-            root = Path(tmp) / "AI models"
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            pw = _passwd(home)
+            root = home / "AI models"
             with TemporaryDirectory() as etc:
                 etc_path = Path(etc)
                 env = etc_path / "ubuntuai.env"
                 profile = etc_path / "ubuntuai.sh"
                 with (
+                    patch("apply.pwd.getpwnam", return_value=pw),
                     patch("apply.ENV_FILE", env),
                     patch("apply.PROFILE_FILE", profile),
                     patch("apply.LIMITS_FILE", etc_path / "limits.conf"),
@@ -304,69 +305,112 @@ class SpaceSafeOutputTests(unittest.TestCase):
             self.assertIn(str(root), cmd)
             self.assertFalse(run.call_args.kwargs.get("shell", False))
 
-    def test_launcher_shell_keeps_a_spaced_model_dir(self) -> None:
-        script = LAUNCHER.format(
-            libdir="/tmp/lib dir",
-            port=8081,
-            models_dir=DEFAULT_MODEL_DIRNAME,
-        )
-        self.assertIn('"${UBUNTUAI_MODELS:-$HOME/AI models}/openmoss"', script)
-        self.assertNotIn("$HOME/Models", script)
-        syntax = subprocess.run(
-            ["sh", "-n"],
-            input=script,
-            text=True,
-            capture_output=True,
+    def _fake_openmoss(self, lib: Path) -> None:
+        lib.mkdir(parents=True, exist_ok=True)
+        server = lib / "moss-tts-server"
+        server.write_text('#!/bin/sh\nprintf %s "$2"\n', encoding="utf-8")
+        server.chmod(0o755)
+
+    def _launcher_env(self, home: Path) -> dict[str, str]:
+        env = os.environ.copy()
+        env.pop("UBUNTUAI_MODELS", None)
+        env.pop("XDG_CONFIG_HOME", None)
+        env["HOME"] = str(home)
+        env["UBUNTUAI_ENV_FILE"] = str(home / "missing.env")
+        return env
+
+    def _run_launcher(self, script: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["sh", "-c", script],
             check=False,
+            capture_output=True,
+            text=True,
+            env=env,
         )
-        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+    def test_launcher_shell_keeps_a_spaced_model_dir(self) -> None:
         with TemporaryDirectory() as tmp:
             home = Path(tmp) / "Ada Lovelace"
-            home.mkdir()
-            env = os.environ.copy()
-            env.pop("UBUNTUAI_MODELS", None)
-            env["HOME"] = str(home)
-            unset = subprocess.run(
-                ["sh", "-c", script],
-                check=False,
-                capture_output=True,
+            lib = home / "lib dir"
+            self._fake_openmoss(lib)
+            baked = home / "AI models"
+            script = launcher_script(lib, 8081, baked)
+            syntax = subprocess.run(
+                ["sh", "-n"],
+                input=script,
                 text=True,
-                env=env,
+                capture_output=True,
+                check=False,
             )
-            self.assertIn(str(home / "AI models" / "openmoss"), unset.stderr)
+            self.assertEqual(syntax.returncode, 0, syntax.stderr)
+            self.assertIn(shlex.quote(str(baked)), script)
+            self.assertNotIn("$HOME/Models}/openmoss", script)
+            env = self._launcher_env(home)
+            missing = self._run_launcher(script, env)
+            self.assertIn("no GGUF", missing.stderr)
+            self.assertIn(str(baked / "openmoss"), missing.stderr)
             env["UBUNTUAI_MODELS"] = str(home / "Old models")
-            set_env = subprocess.run(
-                ["sh", "-c", script],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=env,
-            )
-            self.assertIn(str(home / "Old models" / "openmoss"), set_env.stderr)
+            overridden = self._run_launcher(script, env)
+            self.assertIn(str(home / "Old models" / "openmoss"), overridden.stderr)
+            self.assertNotIn("no GGUF in " + str(baked), overridden.stderr)
 
-    def test_desktop_exec_quotes_a_spaced_path(self) -> None:
-        model = "/home/user/AI models/chat.gguf"
-        argv = ["ubuntuai-openmoss", "--model", model]
-        line = quote_desktop_exec(argv)
-        self.assertIn('"/home/user/AI models/chat.gguf"', line)
-        self.assertEqual(_parse_desktop_exec(line), argv)
-        percent = "/tmp/AI 100% models"
-        percent_line = quote_desktop_exec(["tool", percent])
-        self.assertIn("100%%", percent_line)
-        self.assertEqual(_parse_desktop_exec(percent_line), ["tool", percent])
-        desktop_dir = ROOT / "usr" / "share" / "applications"
-        seen = 0
-        for path in sorted(desktop_dir.glob("*.desktop")):
-            for raw in path.read_text(encoding="utf-8").splitlines():
-                if not raw.startswith("Exec="):
-                    continue
-                seen += 1
-                value = raw.split("=", 1)[1]
-                parsed = _parse_desktop_exec(value)
-                self.assertEqual(quote_desktop_exec(parsed), value)
-                self.assertTrue(parsed)
-                self.assertNotIn(" ", parsed[0])
-        self.assertGreaterEqual(seen, 2)
+    def test_launcher_finds_legacy_openmoss_without_env(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            lib = home / "lib"
+            self._fake_openmoss(lib)
+            legacy = home / "Models" / "openmoss"
+            legacy.mkdir(parents=True)
+            gguf = legacy / "moss-tts-local-q.gguf"
+            gguf.write_bytes(b"g" * 32)
+            (legacy / "skip.extras.gguf").write_bytes(b"x")
+            script = launcher_script(lib, 8081, home / "AI models")
+            found = self._run_launcher(script, self._launcher_env(home))
+            self.assertEqual(found.returncode, 0, found.stderr)
+            self.assertEqual(found.stdout, str(gguf))
+            self.assertNotIn("no GGUF", found.stderr)
+
+    def test_launcher_honors_config_and_env_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            lib = home / "lib"
+            self._fake_openmoss(lib)
+            legacy = home / "Models" / "openmoss"
+            legacy.mkdir(parents=True)
+            (legacy / "legacy.gguf").write_bytes(b"L")
+            custom = home / "Custom models" / "openmoss"
+            custom.mkdir(parents=True)
+            wanted = custom / "custom.gguf"
+            wanted.write_bytes(b"C")
+            other = home / "Other models" / "openmoss"
+            other.mkdir(parents=True)
+            other_file = other / "other.gguf"
+            other_file.write_bytes(b"O")
+            xdg = home / "cfg"
+            cfg = xdg / "ubuntuai" / "config.json"
+            cfg.parent.mkdir(parents=True)
+            cfg.write_text(
+                json.dumps({"model_root": "~/Custom models"}) + "\n",
+                encoding="utf-8",
+            )
+            script = launcher_script(lib, 8081, home / "AI models")
+            env = self._launcher_env(home)
+            env["XDG_CONFIG_HOME"] = str(xdg)
+            from_config = self._run_launcher(script, env)
+            self.assertEqual(from_config.returncode, 0, from_config.stderr)
+            self.assertEqual(from_config.stdout, str(wanted))
+
+            cfg.unlink()
+            env_path = home / "ubuntuai.env"
+            env_path.write_text(
+                f"UBUNTUAI_MODELS={shlex.quote('~/Other models')}\n",
+                encoding="utf-8",
+            )
+            env = self._launcher_env(home)
+            env["UBUNTUAI_ENV_FILE"] = str(env_path)
+            from_env = self._run_launcher(script, env)
+            self.assertEqual(from_env.returncode, 0, from_env.stderr)
+            self.assertEqual(from_env.stdout, str(other_file))
 
     def test_systemd_escape_round_trip_for_a_spaced_path(self) -> None:
         escape = shutil.which("systemd-escape")
@@ -392,32 +436,46 @@ class SpaceSafeOutputTests(unittest.TestCase):
         )
         self.assertEqual(back.returncode, 0, back.stderr)
         self.assertEqual(back.stdout.strip(), str(where))
-        analyze = shutil.which("systemd-analyze")
-        # Unit-name escape already ran. ExecStart verify needs systemd-analyze.
-        if not analyze:
-            return
-        model = "/home/user/AI models/chat.gguf"
-        exec_line = quote_systemd_exec(["/usr/bin/true", model, "/tmp/100% x"])
-        self.assertIn('"/home/user/AI models/chat.gguf"', exec_line)
-        self.assertIn('"/tmp/100%% x"', exec_line)
-        unit = (
-            "[Unit]\n"
-            "Description=quote test\n"
-            "\n"
-            "[Service]\n"
-            "Type=oneshot\n"
-            f"ExecStart={exec_line}\n"
-        )
+
+
+class LegacyWeightTests(unittest.TestCase):
+    def test_dry_run_plans_no_symlink_for_a_legacy_whisper_file(self) -> None:
+        model = next(w for w in load_catalog() if w.id == "whisper-base-en")
         with TemporaryDirectory() as tmp:
-            path = Path(tmp) / "quote-test.service"
-            path.write_text(unit, encoding="utf-8")
-            verified = subprocess.run(
-                [analyze, "--man=no", "verify", str(path)],
-                check=False,
-                capture_output=True,
-                text=True,
+            home = Path(tmp)
+            legacy_dir = home / "Models" / "whisper"
+            legacy_dir.mkdir(parents=True)
+            blob = legacy_dir / model.filename
+            payload = b"g" * (128 * 1024)
+            blob.write_bytes(payload)
+            root = home / "AI models"
+            target = UserTarget(
+                name="tester",
+                uid=os.getuid(),
+                gid=os.getgid(),
+                home=home,
+                model_root=root,
             )
-        self.assertEqual(verified.returncode, 0, verified.stderr)
+            actions = (
+                Action("model_dirs", f"create dirs under {root}", ("whisper",)),
+                Action("weights", "copy or download required weights", (model.id,)),
+            )
+            with (
+                patch("apply.pwd.getpwnam", return_value=_passwd(home)),
+                patch("apply.saved_scan_folders", return_value=()),
+            ):
+                log = execute_plan(actions, target, dry_run=True)
+            joined = "\n".join(log)
+            self.assertNotIn("symlink", joined)
+            self.assertFalse(any(line.startswith("link ") for line in log))
+            self.assertFalse(any(line.startswith("move ") for line in log))
+            self.assertTrue(any(line.startswith("copy ") for line in log))
+            self.assertIn(str(blob), joined)
+            self.assertIn(str(root / "whisper" / model.filename), joined)
+            self.assertEqual(blob.read_bytes(), payload)
+            self.assertFalse(blob.is_symlink())
+            self.assertFalse((root / "whisper" / model.filename).exists())
+            self.assertFalse(any(path.is_symlink() for path in home.rglob("*")))
 
 
 class ShippedDefaultTests(unittest.TestCase):

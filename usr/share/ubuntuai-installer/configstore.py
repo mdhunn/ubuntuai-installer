@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 from paths import user_config_path
-from users import target_for
+from users import expand_against_home, target_for
 from weights import normalize_scan_folder
 
 
@@ -48,7 +48,7 @@ def save(user: str, updates: dict) -> Path:
         raise ValueError("bind must be 127.0.0.1 or 0.0.0.0")
     raw_root = str(data.get("model_root") or "").strip()
     if raw_root:
-        root = Path(raw_root).expanduser()
+        root = expand_against_home(raw_root, t.home)
         if not root.is_absolute():
             root = t.home / root
         try:

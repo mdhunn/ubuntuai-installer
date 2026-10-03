@@ -1135,26 +1135,22 @@ def ensure_weight(
                 return f"already {dest}"
         except OSError:
             pass
+        # Copy or move places a real file in the store. A symlink is not offered.
+        # Move removes the original and always asks, so Apply copies.
         if dry_run:
-            verb = "copy" if foreign_source(item) else "link"
-            return f"{verb} {item.path} -> {dest}"
+            return f"copy {item.path} -> {dest}"
         dest.parent.mkdir(parents=True, exist_ok=True)
         if target.uid is not None:
             os.chown(dest.parent, target.uid, target.gid)
-        if foreign_source(item):
-            algo = integrity_algo_for(item)
-            src_hash = hash_path(item.path, algo)
-            _copy_into_store(item, dest, target.uid, target.gid)
-            if hash_path(dest, algo) != src_hash:
-                _remove_source(dest, item.kind)
-                raise RuntimeError(
-                    f"checksum mismatch copying {item.path}. The store file was not kept."
-                )
-            return f"copied {item.path} -> {dest}"
-        dest.symlink_to(item.path)
-        if target.uid is not None:
-            os.lchown(dest, target.uid, target.gid)
-        return f"linked {item.path} -> {dest}"
+        algo = integrity_algo_for(item)
+        src_hash = hash_path(item.path, algo)
+        _copy_into_store(item, dest, target.uid, target.gid)
+        if hash_path(dest, algo) != src_hash:
+            _remove_source(dest, item.kind)
+            raise RuntimeError(
+                f"checksum mismatch copying {item.path}. The store file was not kept."
+            )
+        return f"copied {item.path} -> {dest}"
 
     def prog(done: int, total: int) -> None:
         if on_progress:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import tarfile
 import urllib.parse
@@ -11,7 +12,7 @@ import urllib.request
 from pathlib import Path
 
 from domain import Hardware, UserTarget
-from paths import DEFAULT_MODEL_DIRNAME, VENDORS_FILE
+from paths import LEGACY_MODEL_DIRNAME, VENDORS_FILE
 from weights import UA, hash_file, human_bytes, lookup_published_hash
 
 WRAPPER = """#!/bin/sh
@@ -22,22 +23,87 @@ exec "$DIR/{binary}" "$@"
 
 LAUNCHER = """#!/bin/sh
 DIR="{libdir}"
-MODELS="${{UBUNTUAI_MODELS:-$HOME/{models_dir}}}/openmoss"
-MODEL=""
-for f in "$MODELS"/moss-tts-local*.gguf "$MODELS"/*.gguf; do
-  case "$f" in
-    *.extras.gguf) continue ;;
-    *.gguf) MODEL="$f"; break ;;
+BAKED={baked_root}
+ENV_FILE="${{UBUNTUAI_ENV_FILE:-/etc/ubuntuai/ubuntuai.env}}"
+CONFIG="${{XDG_CONFIG_HOME:-$HOME/.config}}/ubuntuai/config.json"
+LEGACY="$HOME/{legacy_name}"
+
+expand_tilde() {{
+  case "$1" in
+    "~")
+      printf %s "$HOME"
+      ;;
+    "~/"*)
+      rest=${{1#"~/"}}
+      printf %s "$HOME/$rest"
+      ;;
+    *)
+      printf %s "$1"
+      ;;
   esac
-done
-if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
-  echo "ubuntuai-openmoss: no GGUF in $MODELS" >&2
+}}
+
+root=""
+if [ -f "$CONFIG" ]; then
+  raw=$(sed -n 's/.*"model_root"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$CONFIG" | head -n 1)
+  if [ -n "$raw" ]; then
+    root=$(expand_tilde "$raw")
+  fi
+fi
+if [ -z "$root" ] && [ -n "${{UBUNTUAI_MODELS:-}}" ]; then
+  root=$(expand_tilde "$UBUNTUAI_MODELS")
+fi
+if [ -z "$root" ] && [ -r "$ENV_FILE" ]; then
+  raw=$(. "$ENV_FILE"; printf %s "${{UBUNTUAI_MODELS:-}}")
+  if [ -n "$raw" ]; then
+    root=$(expand_tilde "$raw")
+  fi
+fi
+if [ -z "$root" ]; then
+  root=$BAKED
+fi
+
+find_gguf() {{
+  dir=$1
+  for f in "$dir"/moss-tts-local*.gguf "$dir"/*.gguf; do
+    case "$f" in
+      *.extras.gguf) continue ;;
+      *.gguf)
+        if [ -f "$f" ]; then
+          printf %s "$f"
+          return 0
+        fi
+        ;;
+    esac
+  done
+  return 1
+}}
+
+MODEL=$(find_gguf "$root/openmoss" || true)
+if [ -z "$MODEL" ]; then
+  legacy="$LEGACY/openmoss"
+  if [ "$legacy" != "$root/openmoss" ]; then
+    MODEL=$(find_gguf "$legacy" || true)
+  fi
+fi
+if [ -z "$MODEL" ]; then
+  echo "ubuntuai-openmoss: no GGUF in $root/openmoss" >&2
   exit 1
 fi
 HOST="${{UBUNTUAI_BIND:-127.0.0.1}}"
 export LD_LIBRARY_PATH="$DIR${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
 exec "$DIR/moss-tts-server" --model "$MODEL" --host "$HOST" --port {port} --webui-dir "$DIR/webui" "$@"
 """
+
+
+def launcher_script(libdir: Path | str, port: int, model_root: Path | str) -> str:
+    """OpenMOSS launcher. model_root is the resolved store, shell-quoted into the script."""
+    return LAUNCHER.format(
+        libdir=str(libdir),
+        port=int(port),
+        baked_root=shlex.quote(str(model_root)),
+        legacy_name=LEGACY_MODEL_DIRNAME,
+    )
 
 
 def load_vendors(path: Path | None = None) -> dict:
@@ -184,11 +250,7 @@ def install_vendor(
     if launcher:
         script = bindir / launcher
         script.write_text(
-            LAUNCHER.format(
-                libdir=str(libdir),
-                port=int(spec.get("port") or 8081),
-                models_dir=DEFAULT_MODEL_DIRNAME,
-            ),
+            launcher_script(libdir, int(spec.get("port") or 8081), target.model_root),
             encoding="utf-8",
         )
         os.chmod(script, 0o755)

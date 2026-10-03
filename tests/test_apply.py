@@ -409,7 +409,7 @@ class ApplyTests(unittest.TestCase):
 
         events: list[object] = []
         actions = (
-            Action("weights", "link or download required weights", ("whisper-base-en",)),
+            Action("weights", "copy or download required weights", ("whisper-base-en",)),
         )
         with patch("apply.ensure_weight", side_effect=fake_ensure):
             execute_plan(
@@ -442,7 +442,7 @@ class ApplyTests(unittest.TestCase):
             return "downloaded"
 
         actions = (
-            Action("weights", "link or download required weights", ("whisper-base-en",)),
+            Action("weights", "copy or download required weights", ("whisper-base-en",)),
         )
         with patch("apply.ensure_weight", side_effect=fake_ensure):
             execute_plan(
@@ -486,7 +486,7 @@ class ApplyTests(unittest.TestCase):
             return "downloaded"
 
         actions = (
-            Action("weights", "link or download required weights", ("whisper-base-en",)),
+            Action("weights", "copy or download required weights", ("whisper-base-en",)),
         )
         with patch("apply.ensure_weight", side_effect=fake_ensure):
             execute_plan(

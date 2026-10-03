@@ -104,11 +104,27 @@ def load_saved_bind(home: Path) -> str:
     return "127.0.0.1"
 
 
+def expand_against_home(text: str, home: Path) -> Path:
+    """Expand a leading ~ against the target user's passwd home.
+
+    Path.expanduser() follows the process HOME. pkexec sets HOME=/root,
+    so a tilde path in config would resolve under /root and be rejected.
+    """
+    if text == "~":
+        return home
+    if text.startswith("~/"):
+        rest = text[2:]
+        return home / rest if rest else home
+    if text.startswith("~"):
+        return Path(text).expanduser()
+    return Path(text)
+
+
 def _path_under_home(home: Path, raw: str) -> Path | None:
     text = raw.strip()
     if not text:
         return None
-    root = Path(text).expanduser()
+    root = expand_against_home(text, home)
     if not root.is_absolute():
         root = home / root
     try:

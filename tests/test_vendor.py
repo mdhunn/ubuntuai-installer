@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tarfile
 import unittest
 from pathlib import Path
@@ -96,7 +97,7 @@ def os_getgid() -> int:
 
 
 class EnsureWeightTests(unittest.TestCase):
-    def test_links_existing_filename(self) -> None:
+    def test_copies_existing_filename(self) -> None:
         model = next(
             w for w in load_catalog(PKG / "weights.json") if w.id == "whisper-base-en"
         )
@@ -117,9 +118,12 @@ class EnsureWeightTests(unittest.TestCase):
             )
             msg = ensure_weight(model, target, (extra,))
             dest = store / "whisper" / model.filename
-            self.assertTrue(dest.is_symlink())
-            self.assertEqual(dest.resolve(), blob.resolve())
-            self.assertTrue(msg.startswith("linked"))
+            self.assertTrue(dest.is_file())
+            self.assertFalse(dest.is_symlink())
+            self.assertFalse(os.path.samefile(dest, blob))
+            self.assertEqual(dest.read_bytes(), blob.read_bytes())
+            self.assertTrue(blob.is_file())
+            self.assertTrue(msg.startswith("copied"))
 
     def test_ggml_bin_is_whisper(self) -> None:
         self.assertEqual(classify(Path("/x/ggml-base.en.bin")), "whisper")

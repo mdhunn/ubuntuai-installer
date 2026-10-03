@@ -18,6 +18,7 @@ from domain import Action, Hardware, UserTarget, Workflow
 from paths import ENV_FILE, LIMITS_FILE, LIMITS_TEMPLATE, PROFILE_FILE, helper_path
 from progress import ProgressEvent, download_english, emit, english_for_action, new_apply_log
 from lemonade import APPLY_PUBLISH_VERB, detect as lemonade_detect
+from users import expand_against_home
 from vendor import install_vendor
 from weights import ensure_weight, load_catalog as load_weight_catalog
 
@@ -74,7 +75,7 @@ def ensure_ggml_vulkan(packages: list[str] | tuple[str, ...]) -> list[str]:
 def assert_model_root(user: str, model_root: Path) -> Path:
     pw = pwd.getpwnam(user)
     home = Path(pw.pw_dir).resolve()
-    root = model_root.expanduser()
+    root = expand_against_home(str(model_root), Path(pw.pw_dir))
     if not root.is_absolute():
         root = home / root
     root = root.resolve(strict=False)
@@ -163,7 +164,7 @@ def build_plan(
     unique_weights = tuple(dict.fromkeys(weight_ids))
     if unique_weights:
         actions.append(
-            Action("weights", "link or download required weights", unique_weights)
+            Action("weights", "copy or download required weights", unique_weights)
         )
     if lemonade_detect():
         actions.append(
@@ -592,26 +593,6 @@ def _write_user_config(target: UserTarget, model_root: Path) -> None:
     cfg.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     os.chown(cfg, target.uid, target.gid)
     os.chown(cfg.parent, target.uid, target.gid)
-
-
-def quote_desktop_exec(argv: list[str]) -> str:
-    """Exec value per the desktop entry spec. A space stays inside quotes."""
-    return " ".join(_quote_desktop_arg(word) for word in argv)
-
-
-def _quote_desktop_arg(arg: str) -> str:
-    # % is a field code. A literal percent is %%.
-    text = arg.replace("%", "%%")
-    reserved = set(" \t\n\"'\\><~|&;$*?#()`")
-    if not any(ch in reserved for ch in text):
-        return text
-    out = ['"']
-    for ch in text:
-        if ch in {'"', "\\", "`", "$"}:
-            out.append("\\")
-        out.append(ch)
-    out.append('"')
-    return "".join(out)
 
 
 def write_core_files(user: str, model_root: str, bind: str) -> None:

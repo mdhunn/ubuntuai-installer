@@ -263,19 +263,6 @@ def owned_bind_wheres(
     return tuple(found)
 
 
-def quote_systemd_exec(argv: list[str]) -> str:
-    """One ExecStart value. systemd splits on spaces and expands % specifiers."""
-    return " ".join(_quote_systemd_word(word) for word in argv)
-
-
-def _quote_systemd_word(text: str) -> str:
-    needs_quote = any(ch.isspace() for ch in text) or any(ch in text for ch in '"\\%')
-    escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
-    if needs_quote:
-        return f'"{escaped}"'
-    return escaped
-
-
 def quote_unit_path(path: Path) -> str:
     # RequiresMountsFor= splits on spaces. Quotes keep ~/AI models as one path.
     # % starts a specifier inside the quoted value too.
