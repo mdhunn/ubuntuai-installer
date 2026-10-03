@@ -481,14 +481,23 @@ def installer_main(argv: list[str] | None = None) -> int:
             print(f"  {p}")
         return 0
     if args.publish_lemonade:
+        if args.dry_run:
+            from lemonade import publish_plan
+
+            print(publish_plan(target_for(user)).strip())
+            return 0
         from apply import run_privileged
         from lemonade import APPLY_PUBLISH_VERB
 
-        rc, out = run_privileged(APPLY_PUBLISH_VERB, [user], dry_run=args.dry_run)
+        rc, out = run_privileged(
+            APPLY_PUBLISH_VERB,
+            [user],
+            on_line=lambda line: print(line, flush=True),
+        )
         if rc != 0:
-            print(out or "lemonade publish failed", file=sys.stderr)
+            if not (out or "").strip():
+                print("lemonade publish failed", file=sys.stderr)
             return 1
-        print((out or "published").strip())
         return 0
     if args.list:
         return cmd_list(user)
