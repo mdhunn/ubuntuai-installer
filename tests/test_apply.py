@@ -5,6 +5,7 @@ import pwd
 import shlex
 import subprocess
 import unittest
+import urllib.error
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -75,6 +76,15 @@ class ApplyTests(unittest.TestCase):
             home=Path(pw.pw_dir),
             model_root=Path(pw.pw_dir) / "Models",
         )
+        self._scratch = TemporaryDirectory()
+        self.addCleanup(self._scratch.cleanup)
+        log_path = Path(self._scratch.name) / "apply.log"
+        for item in (
+            patch("apply.new_apply_log", return_value=log_path),
+            patch("apply._write_user_config"),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
 
     def test_package_regex(self) -> None:
         self.assertTrue(PKG_RE.match("libggml0-backend-vulkan"))
@@ -387,6 +397,48 @@ class ApplyTests(unittest.TestCase):
             )
             self.assertIn("Finished.", log_file.read_text(encoding="utf-8"))
 
+    def test_failed_weight_download_keeps_the_existing_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = home / "AI models"
+            dest = store / "gguf" / "Qwen3-0.6B-Q8_0.gguf"
+            dest.parent.mkdir(parents=True)
+            payload = b"user-file" * 10000
+            dest.write_bytes(payload)
+            target = UserTarget(
+                name="tester",
+                uid=os.getuid(),
+                gid=os.getgid(),
+                home=home,
+                model_root=store,
+            )
+            actions = (
+                Action(
+                    "weights",
+                    "copy or download required weights",
+                    ("qwen3-0.6b-q8_0",),
+                ),
+            )
+
+            class PW:
+                pw_name = "tester"
+                pw_uid = os.getuid()
+                pw_gid = os.getgid()
+                pw_dir = str(home)
+
+            with (
+                patch("apply.pwd.getpwnam", return_value=PW()),
+                patch("apply.saved_scan_folders", return_value=()),
+                patch(
+                    "weights.urllib.request.urlopen",
+                    side_effect=urllib.error.URLError("offline"),
+                ),
+            ):
+                with self.assertRaises(ApplyError):
+                    execute_plan(actions, target, hw=_hw_strix(), dry_run=False)
+            self.assertEqual(dest.read_bytes(), payload)
+            self.assertFalse(dest.with_name(dest.name + ".part").exists())
+
     def test_execute_plan_relays_weight_download_strings(self) -> None:
         ticks = (
             "Downloading ggml-base.en.bin: 256 KiB / 1.0 MiB",
@@ -409,7 +461,7 @@ class ApplyTests(unittest.TestCase):
 
         events: list[object] = []
         actions = (
-            Action("weights", "link or download required weights", ("whisper-base-en",)),
+            Action("weights", "copy or download required weights", ("whisper-base-en",)),
         )
         with patch("apply.ensure_weight", side_effect=fake_ensure):
             execute_plan(
@@ -442,7 +494,7 @@ class ApplyTests(unittest.TestCase):
             return "downloaded"
 
         actions = (
-            Action("weights", "link or download required weights", ("whisper-base-en",)),
+            Action("weights", "copy or download required weights", ("whisper-base-en",)),
         )
         with patch("apply.ensure_weight", side_effect=fake_ensure):
             execute_plan(
@@ -486,7 +538,7 @@ class ApplyTests(unittest.TestCase):
             return "downloaded"
 
         actions = (
-            Action("weights", "link or download required weights", ("whisper-base-en",)),
+            Action("weights", "copy or download required weights", ("whisper-base-en",)),
         )
         with patch("apply.ensure_weight", side_effect=fake_ensure):
             execute_plan(
@@ -505,14 +557,22 @@ class ApplyTests(unittest.TestCase):
         self.assertTrue(final.done)
 
     def test_env_quotes_model_root_with_space(self) -> None:
-        pw = pwd.getpwuid(os.getuid())
-        home = Path(pw.pw_dir)
-        with TemporaryDirectory(dir=home, prefix="AI models ") as folder:
-            root = Path(folder)
+        with TemporaryDirectory() as folder:
+            home = Path(folder)
+            root = home / "AI models"
+
+            class PW:
+                pw_name = "tester"
+                pw_uid = os.getuid()
+                pw_gid = os.getgid()
+                pw_dir = str(home)
+
+            pw = PW()
             with TemporaryDirectory() as etc:
                 etc_path = Path(etc)
                 env = etc_path / "ubuntuai.env"
                 with (
+                    patch("apply.pwd.getpwnam", return_value=pw),
                     patch("apply.ENV_FILE", env),
                     patch("apply.PROFILE_FILE", etc_path / "ubuntuai.sh"),
                     patch("apply.LIMITS_FILE", etc_path / "limits.conf"),

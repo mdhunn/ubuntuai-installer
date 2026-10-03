@@ -2,7 +2,7 @@
 
 Adds a local-AI workstation layer to Ubuntu or an official flavor. It does not replace the desktop.
 
-A checked box must become a working install. Archive packages are installed with apt. OpenMOSS is fetched from a pinned GitHub release into `~/.local`. Required model files are copied from folders you already have, or downloaded into `~/Models`.
+A checked box must become a working install. Archive packages are installed with apt. OpenMOSS is fetched from a pinned GitHub release into `~/.local`. Required model files are copied from folders you already have, or downloaded into `~/AI models`.
 
 The analog is [Ubuntu Studio Installer](https://ubuntustudio.org/ubuntu-studio-installer/). Core plumbing first. Workflow checkboxes second. A config tool instead of Audio Configuration.
 
@@ -14,7 +14,7 @@ This host is an AMD Ryzen AI MAX+ 395 (Strix Halo) on Ubuntu 26.04.
 - NPU. XDNA2 at `/dev/accel/accel0`.
 - Archive packages. `llama.cpp-tools` and `libggml0-backend-vulkan`.
 
-The installer puts the seated desktop user in `render` and `video`, sets `memlock` for `@render`, creates `~/Models`, and can install the chat stack from Ubuntu. It will not download 20 GB of weights. It will not silently rewrite NPU firmware. The login name comes from the environment (`SUDO_USER`, `PKEXEC_UID`, `UBUNTUAI_USER`, or the current uid).
+The installer puts the seated desktop user in `render` and `video`, sets `memlock` for `@render`, creates `~/AI models`, and can install the chat stack from Ubuntu. It will not download 20 GB of weights. It will not silently rewrite NPU firmware. The login name comes from the environment (`SUDO_USER`, `PKEXEC_UID`, `UBUNTUAI_USER`, or the current uid).
 
 ## Install from this tree
 

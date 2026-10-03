@@ -17,7 +17,12 @@ PROFILE_FILE = Path("/etc/profile.d/ubuntuai.sh")
 LIMITS_FILE = Path("/etc/security/limits.d/30-ubuntuai.conf")
 USER_CONFIG_NAME = Path("ubuntuai") / "config.json"
 
-# Lemonade snap ProtectHome cannot read /home or follow ~/Models symlinks.
+# New installs. A saved model_root or UBUNTUAI_MODELS is left unchanged.
+DEFAULT_MODEL_DIRNAME = "AI models"
+# Previous writable root. Search only.
+LEGACY_MODEL_DIRNAME = "Models"
+
+# Lemonade snap ProtectHome cannot read /home or follow symlinks.
 SNAP_LEMONADE_COMMON = Path("/var/snap/lemonade-server/common")
 SNAP_LEMONADE_MODELS = SNAP_LEMONADE_COMMON / "ubuntuai-models"
 

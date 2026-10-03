@@ -5,11 +5,17 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import shlex
 import subprocess
 from pathlib import Path
 
 from domain import UserTarget
-from paths import user_config_path
+from paths import (
+    DEFAULT_MODEL_DIRNAME,
+    ENV_FILE,
+    LEGACY_MODEL_DIRNAME,
+    user_config_path,
+)
 
 
 def _pw(name: str) -> pwd.struct_passwd:
@@ -57,20 +63,26 @@ def _seated_user() -> str | None:
 
 
 def default_model_root(home: Path) -> Path:
-    preferred = home / "Models"
-    legacy = home / "AI models"
-    if preferred.exists():
-        return preferred
-    if legacy.exists() and os.access(legacy, os.W_OK):
-        return legacy
-    return preferred
+    return home / DEFAULT_MODEL_DIRNAME
 
 
 def extra_model_paths(home: Path, model_root: Path) -> tuple[Path, ...]:
+    try:
+        chosen = model_root.resolve()
+    except OSError:
+        chosen = model_root
     extras: list[Path] = []
-    legacy = home / "AI models"
-    if legacy.exists() and legacy.resolve() != model_root.resolve():
-        extras.append(legacy)
+    for name in (LEGACY_MODEL_DIRNAME, DEFAULT_MODEL_DIRNAME):
+        path = home / name
+        if not path.exists():
+            continue
+        try:
+            same = path.resolve() == chosen
+        except OSError:
+            same = False
+        if same:
+            continue
+        extras.append(path)
     return tuple(extras)
 
 
@@ -92,11 +104,27 @@ def load_saved_bind(home: Path) -> str:
     return "127.0.0.1"
 
 
-def load_saved_model_root(home: Path) -> Path | None:
-    raw = str(_saved_cfg(home).get("model_root") or "").strip()
-    if not raw:
+def expand_against_home(text: str, home: Path) -> Path:
+    """Expand a leading ~ against the target user's passwd home.
+
+    Path.expanduser() follows the process HOME. pkexec sets HOME=/root,
+    so a tilde path in config would resolve under /root and be rejected.
+    """
+    if text == "~":
+        return home
+    if text.startswith("~/"):
+        rest = text[2:]
+        return home / rest if rest else home
+    if text.startswith("~"):
+        return Path(text).expanduser()
+    return Path(text)
+
+
+def _path_under_home(home: Path, raw: str) -> Path | None:
+    text = raw.strip()
+    if not text:
         return None
-    root = Path(raw).expanduser()
+    root = expand_against_home(text, home)
     if not root.is_absolute():
         root = home / root
     try:
@@ -106,13 +134,68 @@ def load_saved_model_root(home: Path) -> Path | None:
     return root
 
 
+def load_saved_model_root(home: Path) -> Path | None:
+    return _path_under_home(home, str(_saved_cfg(home).get("model_root") or ""))
+
+
+def _env_assignment(line: str) -> tuple[str, str] | None:
+    text = line.strip()
+    if not text or text.startswith("#"):
+        return None
+    if text.startswith("export "):
+        text = text[len("export ") :].strip()
+    name, sep, raw = text.partition("=")
+    if sep != "=":
+        return None
+    name = name.strip()
+    if not name:
+        return None
+    try:
+        parts = shlex.split(raw, posix=True)
+    except ValueError:
+        return None
+    if len(parts) != 1:
+        return None
+    return name, parts[0]
+
+
+def _env_file_value(key: str, path: Path | None = None) -> str:
+    src = path if path is not None else ENV_FILE
+    try:
+        text = src.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    found = ""
+    for line in text.splitlines():
+        parsed = _env_assignment(line)
+        if parsed is None:
+            continue
+        name, value = parsed
+        if name == key:
+            found = value
+    return found
+
+
+def load_env_model_root(home: Path) -> Path | None:
+    raw = os.environ.get("UBUNTUAI_MODELS") or ""
+    if raw.strip():
+        found = _path_under_home(home, raw)
+        if found is not None:
+            return found
+    return _path_under_home(home, _env_file_value("UBUNTUAI_MODELS"))
+
+
 def target_for(user: str, model_root: Path | None = None) -> UserTarget:
     pw = _pw(user)
     home = Path(pw.pw_dir)
     if model_root is not None:
         root = Path(model_root)
     else:
-        root = load_saved_model_root(home) or default_model_root(home)
+        root = (
+            load_saved_model_root(home)
+            or load_env_model_root(home)
+            or default_model_root(home)
+        )
     return UserTarget(
         name=pw.pw_name,
         uid=pw.pw_uid,

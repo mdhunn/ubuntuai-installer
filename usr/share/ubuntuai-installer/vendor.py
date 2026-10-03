@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import tarfile
 import urllib.parse
@@ -11,7 +12,7 @@ import urllib.request
 from pathlib import Path
 
 from domain import Hardware, UserTarget
-from paths import VENDORS_FILE
+from paths import LEGACY_MODEL_DIRNAME, VENDORS_FILE
 from weights import UA, hash_file, human_bytes, lookup_published_hash
 
 WRAPPER = """#!/bin/sh
@@ -22,22 +23,121 @@ exec "$DIR/{binary}" "$@"
 
 LAUNCHER = """#!/bin/sh
 DIR="{libdir}"
-MODELS="${{UBUNTUAI_MODELS:-$HOME/Models}}/openmoss"
-MODEL=""
-for f in "$MODELS"/moss-tts-local*.gguf "$MODELS"/*.gguf; do
-  case "$f" in
-    *.extras.gguf) continue ;;
-    *.gguf) MODEL="$f"; break ;;
-  esac
-done
-if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
-  echo "ubuntuai-openmoss: no GGUF in $MODELS" >&2
+BAKED={baked_root}
+ENV_FILE="${{UBUNTUAI_ENV_FILE:-/etc/ubuntuai/ubuntuai.env}}"
+CONFIG="${{XDG_CONFIG_HOME:-$HOME/.config}}/ubuntuai/config.json"
+LEGACY="$HOME/{legacy_name}"
+
+accept_under_home() {{
+  python3 -c 'import sys,os
+raw=sys.argv[1]
+home=sys.argv[2]
+root=raw.strip()
+if not root:
+    raise SystemExit(1)
+if root=="~":
+    root=home
+elif root.startswith("~/"):
+    root=os.path.join(home,root[2:])
+elif root.startswith("~"):
+    root=os.path.expanduser(root)
+if not os.path.isabs(root):
+    root=os.path.join(home,root)
+try:
+    home_real=os.path.realpath(home)
+    root_real=os.path.realpath(root)
+except OSError:
+    raise SystemExit(1)
+if os.path.commonpath((home_real,root_real))!=home_real:
+    raise SystemExit(1)
+sys.stdout.write(root)
+' "$1" "$HOME" 2>/dev/null
+}}
+
+root=""
+if [ -f "$CONFIG" ]; then
+  raw=$(python3 -c 'import json,sys
+p=sys.argv[1]
+try:
+    fh=open(p,encoding="utf-8")
+    data=json.load(fh)
+    fh.close()
+except Exception:
+    raise SystemExit(1)
+if not isinstance(data,dict):
+    raise SystemExit(1)
+root=data.get("model_root")
+if not isinstance(root,str) or not root.strip():
+    raise SystemExit(1)
+sys.stdout.write(root.strip())
+' "$CONFIG" 2>/dev/null) || raw=""
+  if [ -n "$raw" ]; then
+    accepted=$(accept_under_home "$raw") || accepted=""
+    if [ -n "$accepted" ]; then
+      root=$accepted
+    fi
+  fi
+fi
+if [ -z "$root" ] && [ -n "${{UBUNTUAI_MODELS:-}}" ]; then
+  accepted=$(accept_under_home "$UBUNTUAI_MODELS") || accepted=""
+  if [ -n "$accepted" ]; then
+    root=$accepted
+  fi
+fi
+if [ -z "$root" ] && [ -r "$ENV_FILE" ]; then
+  raw=$(. "$ENV_FILE"; printf %s "${{UBUNTUAI_MODELS:-}}")
+  if [ -n "$raw" ]; then
+    accepted=$(accept_under_home "$raw") || accepted=""
+    if [ -n "$accepted" ]; then
+      root=$accepted
+    fi
+  fi
+fi
+if [ -z "$root" ]; then
+  root=$BAKED
+fi
+
+find_gguf() {{
+  dir=$1
+  for f in "$dir"/moss-tts-local*.gguf "$dir"/*.gguf; do
+    case "$f" in
+      *.extras.gguf) continue ;;
+      *.gguf)
+        if [ -f "$f" ]; then
+          printf %s "$f"
+          return 0
+        fi
+        ;;
+    esac
+  done
+  return 1
+}}
+
+MODEL=$(find_gguf "$root/openmoss" || true)
+if [ -z "$MODEL" ]; then
+  legacy="$LEGACY/openmoss"
+  if [ "$legacy" != "$root/openmoss" ]; then
+    MODEL=$(find_gguf "$legacy" || true)
+  fi
+fi
+if [ -z "$MODEL" ]; then
+  echo "ubuntuai-openmoss: no GGUF in $root/openmoss" >&2
   exit 1
 fi
 HOST="${{UBUNTUAI_BIND:-127.0.0.1}}"
 export LD_LIBRARY_PATH="$DIR${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
 exec "$DIR/moss-tts-server" --model "$MODEL" --host "$HOST" --port {port} --webui-dir "$DIR/webui" "$@"
 """
+
+
+def launcher_script(libdir: Path | str, port: int, model_root: Path | str) -> str:
+    """OpenMOSS launcher. model_root is the resolved store, shell-quoted into the script."""
+    return LAUNCHER.format(
+        libdir=str(libdir),
+        port=int(port),
+        baked_root=shlex.quote(str(model_root)),
+        legacy_name=LEGACY_MODEL_DIRNAME,
+    )
 
 
 def load_vendors(path: Path | None = None) -> dict:
@@ -184,7 +284,7 @@ def install_vendor(
     if launcher:
         script = bindir / launcher
         script.write_text(
-            LAUNCHER.format(libdir=str(libdir), port=int(spec.get("port") or 8081)),
+            launcher_script(libdir, int(spec.get("port") or 8081), target.model_root),
             encoding="utf-8",
         )
         os.chmod(script, 0o755)

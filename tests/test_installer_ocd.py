@@ -7,6 +7,7 @@ import pwd
 import re
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from support import PKG
@@ -183,6 +184,15 @@ class InstallerPlanTests(unittest.TestCase):
     def setUp(self) -> None:
         self.wfs = load_workflows(PKG / "workflows.json")
         self.target = _target()
+        self._scratch = TemporaryDirectory()
+        self.addCleanup(self._scratch.cleanup)
+        log_path = Path(self._scratch.name) / "apply.log"
+        for item in (
+            patch("apply.new_apply_log", return_value=log_path),
+            patch("apply._write_user_config"),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
 
     def test_duplicate_apt_packages_are_unique(self) -> None:
         with patch("apply.dpkg_installed", return_value=False), patch(

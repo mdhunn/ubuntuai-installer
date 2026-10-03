@@ -59,7 +59,7 @@ Canonical-supported Ubuntu releases and flavors are in scope. The Strix Halo exi
 
 Ollama, llama.cpp, ComfyUI, and FastFlowLM must not each grow a private blob tree.
 
-Default writable root is `~/Models`. Existing trees such as `~/AI models` are extra search paths. They are not overwritten.
+Default writable root is `~/AI models`. Existing trees such as `~/Models` are extra search paths. They are not overwritten.
 
 The store is format-aware. GGUF is one format, not the only one.
 
@@ -75,7 +75,7 @@ gguf safetensors mmproj loras vae clip whisper embeddings flm openmoss
 hf onnx pytorch diffusers controlnet unet exl2
 ```
 
-The Weights tab scans `~/AI models`, Downloads, Hugging Face cache, ComfyUI `models`, and `q4nx_files`, plus any folders the user adds. Added folders are stored in `~/.config/ubuntuai/config.json` as `scan_folders`. Scanning `/` is refused. New files are checkboxed. Organize offers copy or move. Symlink organize is not offered. Copy and move place a real file in the store. The original is removed only after the checksum of source and destination match. If the file is a catalog download, that checksum uses the algorithm published on its page. Move always asks for that removal. Copy asks with a checkbox. Catalog downloads are unchecked by default and land in the matching subdir.
+The Weights tab scans `~/AI models`, an existing `~/Models` tree, Downloads, Hugging Face cache, ComfyUI `models`, and `q4nx_files`, plus any folders the user adds. Added folders are stored in `~/.config/ubuntuai/config.json` as `scan_folders`. Scanning `/` is refused. New files are checkboxed. Organize offers copy or move. Symlink organize is not offered. Copy and move place a real file in the store. The original is removed only after the checksum of source and destination match. If the file is a catalog download, that checksum uses the algorithm published on its page. Move always asks for that removal. Copy asks with a checkbox. Catalog downloads are unchecked by default and land in the matching subdir.
 
 ## Repair
 
@@ -124,13 +124,13 @@ The desktop user is never a literal in the tree. `guess_user()` reads the enviro
 
 Prefer Ubuntu archive packages. On 26.04 that includes `llama.cpp-tools`, `libggml0-backend-vulkan`, `libggml0-backend-hip`, `rocminfo`, `whisper.cpp`, `rhvoice`, and `espeak-ng`.
 
-Lemonade (snap) is a separate server on `127.0.0.1:13305`. Store organize defaults to copy. The snap cannot follow those links and cannot use `~/Models` as `extra_models_dir`. Apply bind-mounts the real GGUF trees into snap common and sets `extra_models_dir`.
+Lemonade (snap) is a separate server on `127.0.0.1:13305`. Store organize defaults to copy. The snap cannot follow those links and cannot use `~/AI models` as `extra_models_dir`. Apply bind-mounts the real GGUF trees into snap common and sets `extra_models_dir`.
 
 Vendor tarballs (OpenMOSS) and catalog models upgrade through the Updates tab. Diagnose, then Approve. Numbered GGUF shards (`-00001-of-00004`) stay one directory. On a 122 GiB APU, a model that uses more than half of RAM gets a small context, a long first-load timeout, and a single loaded model.
 
 When the archive cannot ship a runtime, `vendors.json` names a pinned archive, install prefix, and binaries. OpenMOSS is `pwilkin/openmoss` Vulkan Linux x64 into `~/.local/lib/ubuntuai/openmoss`, with wrappers in `~/.local/bin`. CUDA archives are not the default. They are 650 MiB and Vulkan already runs on NVIDIA.
 
-Required weights live in `weights.json` and are listed on the workflow as `required_weights`. Apply order is: reuse a file already in the scan roots, else download into `~/Models/<subdir>`. Whisper's required ggml is small and is fetched when STT is selected. OpenMOSS local GGUF plus sidecar is large and is fetched only when that TTS box is checked.
+Required weights live in `weights.json` and are listed on the workflow as `required_weights`. Apply order is: reuse a file already in the scan roots, else download into `~/AI models/<subdir>`. Whisper's required ggml is small and is fetched when STT is selected. OpenMOSS local GGUF plus sidecar is large and is fetched only when that TTS box is checked.
 
 Speech defaults stay the engines that become usable with a small apt transaction: RHVoice TTS and whisper.cpp STT. OpenMOSS is the quality TTS option. Checking it installs the server and the GGUF pair. eSpeak NG is the always-on floor. `ubuntuai-speech` on the CLI expands to the two recommended engines.
 

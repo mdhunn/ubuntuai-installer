@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import http.server
 import io
@@ -7,6 +8,7 @@ import os
 import pwd
 import threading
 import unittest
+import urllib.error
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -26,6 +28,7 @@ from weights import (
     classify,
     detect_bundle,
     disk_words,
+    _open_part,
     download,
     ensure_weight,
     foreign_source,
@@ -791,6 +794,288 @@ class ForeignMountTests(unittest.TestCase):
             self.assertEqual(dest.read_bytes(), payload)
             self.assertEqual(blob.read_bytes(), payload)
             self.assertIn("copied ", out.getvalue())
+
+
+class StoreCopySafetyTests(unittest.TestCase):
+    def _model(self, nbytes: int) -> CatalogWeight:
+        return CatalogWeight(
+            id="copy-probe",
+            title="Copy",
+            summary="",
+            subdir="gguf",
+            filename="model.gguf",
+            url="https://example.invalid/model.gguf",
+            bytes=nbytes,
+            workflows=(),
+        )
+
+    def _place(self, home: Path, nbytes: int) -> tuple[Path, Path, bytes, Path, UserTarget]:
+        extra = home / "stash"
+        extra.mkdir()
+        blob = extra / "model.gguf"
+        payload = b"g" * nbytes
+        blob.write_bytes(payload)
+        os.chmod(blob, 0o777)
+        store = home / "AI models"
+        store.mkdir()
+        target = UserTarget(
+            name="tester",
+            uid=os.getuid(),
+            gid=os.getgid(),
+            home=home,
+            model_root=store,
+        )
+        return extra, blob, payload, store, target
+
+    def test_disk_full_refuses_and_leaves_no_partial(self) -> None:
+        nbytes = 2 * 1024 * 1024
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra, _blob, _payload, store, target = self._place(home, nbytes)
+            model = self._model(nbytes)
+            dest = store / "gguf" / model.filename
+
+            class Stat:
+                f_bavail = 128
+                f_frsize = 4096
+
+            with patch("weights.os.statvfs", return_value=Stat()):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ensure_weight(model, target, (extra,))
+            text = str(ctx.exception)
+            self.assertIn("Could not copy this model.", text)
+            self.assertIn("free space", text)
+            self.assertIn("512 KiB", text)
+            self.assertFalse(dest.exists())
+            self.assertFalse(dest.with_name(dest.name + ".part").exists())
+
+            def fill_then_fail(src: Path, part: Path) -> None:
+                part.write_bytes(b"x" * 4096)
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+            with patch("weights._transfer_file", side_effect=fill_then_fail):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ensure_weight(model, target, (extra,))
+            self.assertIn("filled up", str(ctx.exception))
+            self.assertIn("partial file was removed", str(ctx.exception))
+            self.assertFalse(dest.exists())
+            self.assertFalse(dest.with_name(dest.name + ".part").exists())
+
+    def test_interrupted_copy_is_not_already(self) -> None:
+        nbytes = 128 * 1024
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra, _blob, payload, store, target = self._place(home, nbytes)
+            model = self._model(nbytes)
+            dest = store / "gguf" / model.filename
+            dest.parent.mkdir(parents=True)
+            dest.write_bytes(b"p" * (64 * 1024))
+            part = dest.with_name(dest.name + ".part")
+            part.write_bytes(b"t" * 1024)
+            msg = ensure_weight(model, target, (extra,))
+            self.assertTrue(msg.startswith("copied"), msg)
+            self.assertFalse(msg.startswith("already"))
+            self.assertEqual(dest.read_bytes(), payload)
+            self.assertFalse(part.exists())
+            self.assertEqual(dest.stat().st_mode & 0o777, 0o644)
+            again = ensure_weight(model, target, (extra,))
+            self.assertTrue(again.startswith("already"), again)
+
+    def test_stale_temp_is_removed(self) -> None:
+        nbytes = 128 * 1024
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra, _blob, payload, store, target = self._place(home, nbytes)
+            model = self._model(nbytes)
+            dest = store / "gguf" / model.filename
+            part = dest.with_name(dest.name + ".part")
+            part.parent.mkdir(parents=True)
+            part.write_bytes(b"stale" * 20000)
+            msg = ensure_weight(model, target, (extra,))
+            self.assertTrue(msg.startswith("copied"), msg)
+            self.assertFalse(part.exists())
+            self.assertEqual(dest.read_bytes(), payload)
+            self.assertFalse(dest.read_bytes().startswith(b"stale"))
+            self.assertEqual(dest.stat().st_mode & 0o777, 0o644)
+
+    def test_part_open_does_not_follow_a_symlink(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sentinel = root / "sentinel"
+            sentinel.write_bytes(b"precious")
+            part = root / "model.gguf.part"
+            part.symlink_to(sentinel)
+            with self.assertRaises(OSError):
+                _open_part(part)
+            self.assertEqual(sentinel.read_bytes(), b"precious")
+            self.assertTrue(part.is_symlink())
+
+    def test_catalog_file_is_not_replaced_by_a_shorter_find(self) -> None:
+        model = next(w for w in load_catalog() if w.id == "whisper-base-en")
+        self.assertEqual(model.bytes, 147964211)
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            store = home / "AI models"
+            dest = store / model.subdir / model.filename
+            dest.parent.mkdir(parents=True)
+            dest.write_bytes(b"")
+            os.truncate(dest, model.bytes)
+            partial_dir = home / "Downloads"
+            partial_dir.mkdir()
+            partial = partial_dir / model.filename
+            partial.write_bytes(b"p" * (100 * 1024))
+            target = UserTarget(
+                name="tester",
+                uid=os.getuid(),
+                gid=os.getgid(),
+                home=home,
+                model_root=store,
+            )
+            msg = ensure_weight(model, target)
+            self.assertTrue(msg.startswith("already"), msg)
+            self.assertEqual(dest.stat().st_size, model.bytes)
+            with dest.open("rb") as fh:
+                self.assertEqual(fh.read(1), b"\0")
+            self.assertEqual(partial.read_bytes(), b"p" * (100 * 1024))
+            self.assertFalse(dest.with_name(dest.name + ".part").exists())
+
+    def test_short_find_is_skipped_and_not_copied(self) -> None:
+        model = next(w for w in load_catalog() if w.id == "whisper-base-en")
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            partial = home / "Downloads" / model.filename
+            partial.parent.mkdir()
+            partial.write_bytes(b"p" * (100 * 1024))
+            store = home / "AI models"
+            store.mkdir()
+            dest = store / model.subdir / model.filename
+            target = UserTarget(
+                name="tester",
+                uid=os.getuid(),
+                gid=os.getgid(),
+                home=home,
+                model_root=store,
+            )
+            planned = ensure_weight(model, target, dry_run=True)
+            self.assertIn("Skipped", planned)
+            self.assertIn(str(partial), planned)
+            self.assertIn("100 KiB", planned)
+            self.assertIn("141 MiB", planned)
+            self.assertIn("download ", planned)
+            self.assertFalse(planned.startswith("copy "))
+            self.assertFalse(dest.exists())
+            with patch(
+                "weights.urllib.request.urlopen",
+                side_effect=urllib.error.URLError("offline"),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ensure_weight(model, target)
+            text = str(ctx.exception)
+            self.assertIn("Skipped", text)
+            self.assertIn("100 KiB", text)
+            self.assertIn("141 MiB", text)
+            self.assertFalse(dest.exists())
+            self.assertEqual(partial.read_bytes(), b"p" * (100 * 1024))
+            self.assertFalse(dest.with_name(dest.name + ".part").exists())
+
+    def test_found_file_must_match_catalog_checksum(self) -> None:
+        payload = b"g" * (128 * 1024)
+        digest = hashlib.sha256(payload).hexdigest()
+        model = CatalogWeight(
+            id="hashed",
+            title="Hashed",
+            summary="",
+            subdir="gguf",
+            filename="hashed.gguf",
+            url="https://example.invalid/hashed.gguf",
+            bytes=len(payload),
+            workflows=(),
+            hash_algo="sha256",
+            hash_hex=digest,
+        )
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra = home / "Downloads"
+            extra.mkdir()
+            bad = extra / model.filename
+            bad.write_bytes(b"x" * len(payload))
+            store = home / "AI models"
+            dest = store / model.subdir / model.filename
+            dest.parent.mkdir(parents=True)
+            dest.write_bytes(payload)
+            target = UserTarget(
+                name="tester",
+                uid=os.getuid(),
+                gid=os.getgid(),
+                home=home,
+                model_root=store,
+            )
+            msg = ensure_weight(model, target)
+            self.assertTrue(msg.startswith("already"), msg)
+            self.assertEqual(dest.read_bytes(), payload)
+            dest.unlink()
+            with patch(
+                "weights.urllib.request.urlopen",
+                side_effect=urllib.error.URLError("offline"),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ensure_weight(model, target)
+            self.assertIn("checksum", str(ctx.exception).lower())
+            self.assertFalse(dest.exists())
+            self.assertEqual(bad.read_bytes(), b"x" * len(payload))
+
+    def test_space_refusal_keeps_existing_file(self) -> None:
+        nbytes = 128 * 1024
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            extra, blob, payload, store, target = self._place(home, nbytes)
+            model = self._model(nbytes)
+            dest = store / "gguf" / model.filename
+            dest.parent.mkdir(parents=True)
+            kept = b"keep" * 4000
+            dest.write_bytes(kept)
+
+            class Stat:
+                f_bavail = 128
+                f_frsize = 4096
+
+            with patch("weights.os.statvfs", return_value=Stat()):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ensure_weight(model, target, (extra,))
+            self.assertIn("Could not copy this model.", str(ctx.exception))
+            self.assertIn("free space", str(ctx.exception))
+            self.assertEqual(dest.read_bytes(), kept)
+            self.assertEqual(blob.read_bytes(), payload)
+            self.assertFalse(dest.with_name(dest.name + ".part").exists())
+
+    def test_download_failure_keeps_qwen_file(self) -> None:
+        model = next(w for w in load_catalog() if w.id == "qwen3-0.6b-q8_0")
+        self.assertEqual(model.filename, "Qwen3-0.6B-Q8_0.gguf")
+        with TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            dest = store / model.subdir / model.filename
+            dest.parent.mkdir(parents=True)
+            payload = b"user-file" * 10000
+            dest.write_bytes(payload)
+            with patch(
+                "weights.urllib.request.urlopen",
+                side_effect=urllib.error.URLError("offline"),
+            ):
+                with self.assertRaises(urllib.error.URLError):
+                    download(model, store)
+            self.assertEqual(dest.read_bytes(), payload)
+            self.assertFalse(dest.with_name(dest.name + ".part").exists())
+
+            dest.write_bytes(b"")
+            os.truncate(dest, model.bytes)
+            with patch(
+                "weights.urllib.request.urlopen",
+                side_effect=urllib.error.URLError("offline"),
+            ):
+                with self.assertRaises(urllib.error.URLError):
+                    download(model, store, force=True)
+            self.assertEqual(dest.stat().st_size, model.bytes)
+            self.assertFalse(dest.with_name(dest.name + ".part").exists())
 
 
 if __name__ == "__main__":

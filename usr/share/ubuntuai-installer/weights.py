@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -14,9 +15,12 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from domain import CatalogWeight, FileHash, FoundWeight, UserTarget
-from paths import WEIGHTS_FILE
+from paths import DEFAULT_MODEL_DIRNAME, LEGACY_MODEL_DIRNAME, WEIGHTS_FILE
 
 MIN_BYTES = 64 * 1024
+# One percent, and at least 1 MiB, so a copy that barely fits still has room to finish.
+COPY_FREE_MARGIN_MIN = 1024 * 1024
+COPY_PART_SUFFIX = ".part"
 SKIP_NAMES = {"desktop.ini", "thumbs.db", ".ds_store"}
 SKIP_WALK_DIRS = {".git", "__pycache__", "blobs", ".cache"}
 WEIGHT_SUFFIXES = {
@@ -552,7 +556,8 @@ def _dir_size(path: Path) -> int:
 
 def builtin_scan_roots(home: Path, model_root: Path) -> tuple[Path, ...]:
     return (
-        home / "AI models",
+        home / DEFAULT_MODEL_DIRNAME,
+        home / LEGACY_MODEL_DIRNAME,
         home / "Downloads",
         home / ".cache" / "huggingface" / "hub",
         home / "Projects" / "AI Apps" / "ComfyUI" / "models",
@@ -948,19 +953,171 @@ def _remove_source(path: Path, kind: str) -> None:
     path.unlink()
 
 
-def _copy_into_store(item: FoundWeight, dest: Path, uid: int | None, gid: int | None) -> None:
-    # A foreign tree must land as real files. Links back to that mount are refused.
-    if item.kind == "dir":
-        shutil.copytree(item.path, dest, symlinks=not foreign_source(item))
-        if uid is not None and gid is not None:
-            for dirpath, _dirnames, filenames in os.walk(dest):
+def _copy_part(dest: Path) -> Path:
+    return dest.with_name(dest.name + COPY_PART_SUFFIX)
+
+
+def _clear_copy_temp(dest: Path) -> None:
+    """Drop a leftover temp. A killed copy must not be treated as the model."""
+    part = _copy_part(dest)
+    try:
+        if part.is_dir() and not part.is_symlink():
+            shutil.rmtree(part)
+        elif part.exists() or part.is_symlink():
+            part.unlink()
+    except OSError:
+        pass
+
+
+def _copy_bytes_needed(size: int) -> int:
+    margin = max(COPY_FREE_MARGIN_MIN, size // 100)
+    return size + margin
+
+
+def _require_copy_space(directory: Path, nbytes: int) -> None:
+    need = _copy_bytes_needed(nbytes)
+    try:
+        st = os.statvfs(directory)
+        free = int(st.f_bavail) * int(st.f_frsize)
+    except OSError as exc:
+        raise RuntimeError(
+            "Could not copy this model. Free space could not be checked."
+        ) from exc
+    if free < need:
+        raise RuntimeError(
+            "Could not copy this model. The disk does not have enough free space. "
+            f"The copy needs {human_bytes(need)} and {human_bytes(free)} is free."
+        )
+
+
+def _fsync_dir(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _finish_store_file(path: Path, uid: int | None, gid: int | None) -> None:
+    # The store file is 0644. The source mode is not kept.
+    os.chmod(path, 0o644)
+    if uid is not None and gid is not None and not path.is_symlink():
+        os.chown(path, uid, gid)
+
+
+def _open_part(part: Path):
+    """Create the temp file without following a symlink or truncating a name that exists."""
+    fd = os.open(
+        part,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o644,
+    )
+    try:
+        os.fchmod(fd, 0o644)
+    except OSError:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "wb")
+
+
+def _transfer_file(src: Path, part: Path) -> None:
+    with open(src, "rb") as rf, _open_part(part) as wf:
+        while True:
+            chunk = rf.read(1024 * 1024)
+            if not chunk:
+                break
+            wf.write(chunk)
+        wf.flush()
+        os.fsync(wf.fileno())
+
+
+def _raise_copy_error(exc: Exception) -> None:
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        raise RuntimeError(
+            "Could not copy this model. The disk filled up during the copy. "
+            "The partial file was removed."
+        ) from exc
+    raise exc
+
+
+def _copy_file_into_store(
+    src: Path,
+    dest: Path,
+    uid: int | None,
+    gid: int | None,
+    algo: str,
+    src_hash: str,
+) -> None:
+    # Temp sits next to the final name so the rename stays on one filesystem.
+    # The final name appears only after the checksum matches.
+    _require_copy_space(dest.parent, src.stat().st_size)
+    part = _copy_part(dest)
+    _clear_copy_temp(dest)
+    try:
+        _transfer_file(src, part)
+        _finish_store_file(part, uid, gid)
+        if hash_path(part, algo) != src_hash:
+            raise RuntimeError(
+                f"checksum mismatch copying {src}. The store file was not kept."
+            )
+        os.replace(part, dest)
+        _fsync_dir(dest.parent)
+    except Exception as exc:
+        _clear_copy_temp(dest)
+        _raise_copy_error(exc)
+
+
+def _copy_tree_into_store(
+    item: FoundWeight,
+    dest: Path,
+    uid: int | None,
+    gid: int | None,
+    algo: str,
+    src_hash: str,
+) -> None:
+    _require_copy_space(dest.parent, _dir_size(item.path))
+    part = _copy_part(dest)
+    _clear_copy_temp(dest)
+    try:
+        # A foreign tree must land as real files. Links back to that mount are refused.
+        shutil.copytree(item.path, part, symlinks=not foreign_source(item))
+        for dirpath, _dirnames, filenames in os.walk(part):
+            if uid is not None and gid is not None:
                 os.chown(dirpath, uid, gid)
-                for name in filenames:
-                    os.chown(Path(dirpath) / name, uid, gid)
-        return
-    shutil.copy2(item.path, dest)
+            for name in filenames:
+                fp = Path(dirpath) / name
+                if fp.is_symlink():
+                    continue
+                _finish_store_file(fp, uid, gid)
+                with open(fp, "rb") as fh:
+                    os.fsync(fh.fileno())
+        if hash_path(part, algo) != src_hash:
+            raise RuntimeError(
+                f"checksum mismatch copying {item.path}. The store file was not kept."
+            )
+        os.replace(part, dest)
+        _fsync_dir(dest.parent)
+    except Exception as exc:
+        _clear_copy_temp(dest)
+        _raise_copy_error(exc)
+
+
+def _copy_into_store(
+    item: FoundWeight,
+    dest: Path,
+    uid: int | None,
+    gid: int | None,
+    *,
+    algo: str,
+    src_hash: str,
+) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
     if uid is not None and gid is not None:
-        os.chown(dest, uid, gid)
+        os.chown(dest.parent, uid, gid)
+    if item.kind == "dir":
+        _copy_tree_into_store(item, dest, uid, gid, algo, src_hash)
+        return
+    _copy_file_into_store(item.path, dest, uid, gid, algo, src_hash)
 
 
 def organize(
@@ -1003,14 +1160,17 @@ def organize(
         parent_writable = os.access(item.path.parent, os.W_OK)
         algo = integrity_algo_for(item)
         src_hash = hash_path(item.path, algo)
-        _copy_into_store(item, dest, uid, gid)
-        dest_hash = hash_path(dest, algo)
-        if dest_hash != src_hash:
-            _remove_source(dest, item.kind)
-            log.append(f"checksum mismatch after {mode} {item.path} -> {dest} ({algo})")
-            continue
+        try:
+            _copy_into_store(item, dest, uid, gid, algo=algo, src_hash=src_hash)
+        except RuntimeError as exc:
+            if "checksum mismatch" in str(exc):
+                log.append(
+                    f"checksum mismatch after {mode} {item.path} -> {dest} ({algo})"
+                )
+                continue
+            raise
         verb = "copied" if mode == "copy" else "moved"
-        log.append(f"{verb} {item.path} -> {dest} {algo}={dest_hash[:12]}")
+        log.append(f"{verb} {item.path} -> {dest} {algo}={src_hash[:12]}")
         if want_remove:
             if not parent_writable:
                 log.append(f"kept source {item.path} (not writable)")
@@ -1024,6 +1184,72 @@ def organize(
 
 def catalog_dest(model: CatalogWeight, model_root: Path) -> Path:
     return model_root / model.subdir / model.filename
+
+
+def _catalog_skip_reason(path: Path, model: CatalogWeight) -> str | None:
+    """Why this file cannot fill the catalog entry. None when it matches.
+
+    Size is checked first. A published checksum is checked when the catalog has one.
+    A short file left by a killed copy does not match.
+    """
+    if path.is_symlink() or not path.is_file():
+        return f"Skipped {path}. It is not a regular file."
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return f"Skipped {path}. It could not be read."
+    if size <= 0:
+        return f"Skipped {path}. It is empty."
+    if model.bytes > 0 and size != model.bytes:
+        return (
+            f"Skipped {path}. It is {human_bytes(size)} and the catalog "
+            f"wants {human_bytes(model.bytes)}."
+        )
+    published = model.published_hash()
+    if published:
+        try:
+            digest = hash_file(path, published.algo)
+        except (OSError, ValueError):
+            return f"Skipped {path}. Its checksum could not be read."
+        if digest != published.hexdigest.lower():
+            return f"Skipped {path}. Its checksum does not match the catalog."
+    if model.bytes <= 0 and published is None:
+        return f"Skipped {path}. The catalog has no size or checksum to trust."
+    return None
+
+
+def _catalog_file_complete(path: Path, model: CatalogWeight) -> bool:
+    """True when the file matches the catalog size and published checksum."""
+    return _catalog_skip_reason(path, model) is None
+
+
+def _acceptable_source(
+    model: CatalogWeight,
+    target: UserTarget,
+    extra: tuple[Path, ...],
+    dest: Path,
+) -> tuple[FoundWeight | None, str]:
+    """A found file that matches the catalog, plus why the first miss was skipped."""
+    roots = scan_roots(target.home, target.model_root, extra)
+    try:
+        dest_real = dest.resolve() if dest.exists() or dest.is_symlink() else None
+    except OSError:
+        dest_real = None
+    skipped = ""
+    for item in scan(roots, target.model_root):
+        if item.kind != "file" or item.path.name != model.filename:
+            continue
+        try:
+            if dest_real is not None and item.path.resolve() == dest_real:
+                continue
+        except OSError:
+            continue
+        reason = _catalog_skip_reason(item.path, model)
+        if reason is None:
+            return item, ""
+        if not skipped:
+            skipped = reason
+    return None, skipped
 
 
 def verify_download(
@@ -1068,19 +1294,17 @@ def download(
     expected: FileHash | None = None,
 ) -> str:
     dest = catalog_dest(model, model_root)
+    _clear_copy_temp(dest)
     if (dest.exists() or dest.is_symlink()) and not force:
-        return f"already {dest}"
+        if _catalog_file_complete(dest, model):
+            return f"already {dest}"
     if dry_run:
         return f"download {model.id} -> {dest} ({human_bytes(model.bytes)})"
-    if force and (dest.exists() or dest.is_symlink()):
-        if dest.is_dir() and not dest.is_symlink():
-            shutil.rmtree(dest)
-        else:
-            dest.unlink()
+    # The final name stays until the temp file has been verified.
     dest.parent.mkdir(parents=True, exist_ok=True)
     if uid is not None and gid is not None:
         os.chown(dest.parent, uid, gid)
-    part = dest.with_name(dest.name + ".part")
+    part = _copy_part(dest)
     req = urllib.request.Request(model.url, headers={"User-Agent": UA})
     written = 0
     content_length = 0
@@ -1088,7 +1312,7 @@ def download(
         with urllib.request.urlopen(req, timeout=60) as resp:
             content_length = int(resp.headers.get("Content-Length") or 0)
             total = content_length or model.bytes
-            with open(part, "wb") as fh:
+            with _open_part(part) as fh:
                 while True:
                     chunk = resp.read(256 * 1024)
                     if not chunk:
@@ -1097,6 +1321,8 @@ def download(
                     written += len(chunk)
                     if on_progress:
                         on_progress(written, total)
+                fh.flush()
+                os.fsync(fh.fileno())
         want = expected or model.published_hash()
         published_size = 0
         if want is None:
@@ -1105,11 +1331,12 @@ def download(
         # Content-Length last. A truncated Xet body can advertise its own short length.
         want_size = published_size or model.bytes or content_length
         verify_download(part, model, expected=want, expected_size=want_size)
+        os.replace(part, dest)
+        _fsync_dir(dest.parent)
     except Exception:
-        part.unlink(missing_ok=True)
+        _clear_copy_temp(dest)
         raise
-    part.replace(dest)
-    if uid is not None and gid is not None:
+    if uid is not None and gid is not None and not dest.is_symlink():
         os.chown(dest, uid, gid)
     return f"downloaded {dest} ({human_bytes(written)})"
 
@@ -1123,37 +1350,33 @@ def ensure_weight(
     dry_run: bool = False,
 ) -> str:
     dest = catalog_dest(model, target.model_root)
-    if dest.exists() or dest.is_symlink():
+    _clear_copy_temp(dest)
+    # The catalog is the check. A shorter file found on disk must not replace it.
+    if _catalog_file_complete(dest, model):
         return f"already {dest}"
-    roots = scan_roots(target.home, target.model_root, extra)
-    for item in scan(roots, target.model_root):
-        if item.path.name != model.filename:
-            continue
-        try:
-            if item.path.resolve() == dest.resolve():
-                return f"already {dest}"
-        except OSError:
-            pass
-        if dry_run:
-            verb = "copy" if foreign_source(item) else "link"
-            return f"{verb} {item.path} -> {dest}"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if target.uid is not None:
-            os.chown(dest.parent, target.uid, target.gid)
-        if foreign_source(item):
-            algo = integrity_algo_for(item)
-            src_hash = hash_path(item.path, algo)
-            _copy_into_store(item, dest, target.uid, target.gid)
-            if hash_path(dest, algo) != src_hash:
-                _remove_source(dest, item.kind)
-                raise RuntimeError(
-                    f"checksum mismatch copying {item.path}. The store file was not kept."
-                )
-            return f"copied {item.path} -> {dest}"
-        dest.symlink_to(item.path)
-        if target.uid is not None:
-            os.lchown(dest, target.uid, target.gid)
-        return f"linked {item.path} -> {dest}"
+    source, skipped = _acceptable_source(model, target, extra, dest)
+    # Copy or move places a real file in the store. A symlink is not offered.
+    # Move removes the original and always asks, so Apply copies.
+    if dry_run:
+        if source is None:
+            planned = download(
+                model,
+                target.model_root,
+                uid=target.uid,
+                gid=target.gid,
+                dry_run=True,
+            )
+            if skipped:
+                return f"{skipped} {planned}"
+            return planned
+        return f"copy {source.path} -> {dest}"
+    if source is not None:
+        algo = integrity_algo_for(source)
+        src_hash = hash_path(source.path, algo)
+        _copy_into_store(
+            source, dest, target.uid, target.gid, algo=algo, src_hash=src_hash
+        )
+        return f"copied {source.path} -> {dest}"
 
     def prog(done: int, total: int) -> None:
         if on_progress:
@@ -1161,11 +1384,18 @@ def ensure_weight(
                 f"Downloading {model.filename}: {human_bytes(done)} / {human_bytes(total)}"
             )
 
-    return download(
-        model,
-        target.model_root,
-        on_progress=prog,
-        uid=target.uid,
-        gid=target.gid,
-        dry_run=dry_run,
-    )
+    try:
+        got = download(
+            model,
+            target.model_root,
+            on_progress=prog,
+            uid=target.uid,
+            gid=target.gid,
+        )
+    except Exception as exc:
+        if skipped:
+            raise RuntimeError(f"{skipped} {exc}") from exc
+        raise
+    if skipped:
+        return f"{skipped} {got}"
+    return got

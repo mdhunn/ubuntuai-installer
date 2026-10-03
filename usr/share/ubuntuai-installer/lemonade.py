@@ -1,6 +1,6 @@
 """Publish installer GGUF trees to Lemonade.
 
-The snap cannot follow ~/Models symlinks and cannot read /home as
+The snap cannot follow symlinks and cannot read /home as
 extra_models_dir. Bind the real trees into SNAP_LEMONADE_MODELS and set
 extra_models_dir to that snap-common path.
 
