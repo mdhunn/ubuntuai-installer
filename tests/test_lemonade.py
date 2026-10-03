@@ -48,6 +48,7 @@ from lemonade import (
     extra_dir,
     gguf_sources,
     is_owned_lemonade_where,
+    lemonade_extra_ids,
     largest_gguf_bytes,
     leftover_owned_binds,
     model_gguf_bytes,
@@ -2498,6 +2499,7 @@ class LemonadePublishTests(unittest.TestCase):
             root = home / "models"
             emb = root / "embeddings"
             kept = _write_gguf(emb / "embed.gguf")
+            expected = kept.read_bytes()
             _write_gguf(root / "chat.gguf")
             dest = Path(tmp) / "ubuntuai-models"
             text = (
@@ -2526,7 +2528,7 @@ class LemonadePublishTests(unittest.TestCase):
             self.assertIn("stays as it is", message)
             self.assertNotIn("Traceback", message)
             self.assertFalse(any(cmd and cmd[0] == "umount" for cmd in cmds))
-            self.assertEqual(kept.read_bytes(), b"G" * 2048)
+            self.assertEqual(kept.read_bytes(), expected)
 
     def test_leak_with_a_cover_location_peer_is_removed(self) -> None:
         import lemonade
@@ -2590,6 +2592,7 @@ class LemonadePublishTests(unittest.TestCase):
             root = home / "models"
             emb = root / "embeddings"
             kept = _write_gguf(emb / "embed.gguf")
+            expected = kept.read_bytes()
             _write_gguf(root / "chat.gguf")
             dest = Path(tmp) / "ubuntuai-models"
             cases = {
@@ -2633,7 +2636,7 @@ class LemonadePublishTests(unittest.TestCase):
                     self.assertIn("not the empty cover", message)
                     self.assertIn("stays as it is", message)
                     self.assertFalse(any(cmd and cmd[0] == "umount" for cmd in cmds))
-                    self.assertEqual(kept.read_bytes(), b"G" * 2048)
+                    self.assertEqual(kept.read_bytes(), expected)
 
     def test_publish_twice_on_tmpfs_model_root_does_not_remount(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -4244,7 +4247,9 @@ class ChatClassifyTests(unittest.TestCase):
             direct = {
                 mount.what
                 for mount in plan
-                if mount.options == "bind,nofail" and mount.where.parent == dest / "chat"
+                if mount.options == "bind,nofail"
+                and mount.where.parent == dest / "chat"
+                and not mount.where.name.lower().endswith(".gguf")
             }
             self.assertEqual(
                 direct,
@@ -4315,7 +4320,7 @@ class ChatClassifyTests(unittest.TestCase):
             self.assertIn("vision companion", text)
             self.assertIn("not recognised as chat by this version", text)
             self.assertIn("hidden from chat", text)
-            kept = dest / "chat" / "chat" / paths["mixed_chat"].name
+            kept = dest / "chat" / "chat-2.gguf"
             self.assertIn(f"Where={kept}", text)
             for key in ("llama", "qwen", "gemma", "mmproj", "root_emb", "mixed_chat"):
                 self.assertNotIn(f"Left out {paths[key].resolve()}.", text, key)
@@ -4527,7 +4532,7 @@ class ChatClassifyTests(unittest.TestCase):
             plan = _snap_mount_plan(target, dest, gguf_sources(target))
             file_binds = [mount for mount in plan if mount.what == chat.resolve()]
             self.assertEqual(len(file_binds), 1)
-            self.assertEqual(file_binds[0].where, dest / "chat" / "chat" / "chat.gguf")
+            self.assertEqual(file_binds[0].where, dest / "chat" / "chat-2.gguf")
             self.assertEqual(file_binds[0].options, "bind,nofail")
             self.assertNotIn(root.resolve(), gguf_sources(target))
             self.assertFalse(any(mount.what == speech.resolve() for mount in plan))
@@ -4539,7 +4544,7 @@ class ChatClassifyTests(unittest.TestCase):
                 report = publish_plan(target)
             self.assertIn(f"Left out {speech.resolve()}.", report)
             self.assertNotIn(f"Left out {chat.resolve()}.", report)
-            self.assertIn(f"Where={dest / 'chat' / 'chat' / 'chat.gguf'}", report)
+            self.assertIn(f"Where={dest / 'chat' / 'chat-2.gguf'}", report)
 
     def test_loose_chat_gguf_in_a_mixed_root_is_kept(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -4551,8 +4556,7 @@ class ChatClassifyTests(unittest.TestCase):
             target = _target(home, extra=(), model_root=root)
             plan = _snap_mount_plan(target, dest, gguf_sources(target))
             binds = [mount for mount in plan if mount.what == loose.resolve()]
-            self.assertEqual(binds[0].where.parent, dest / "chat" / "loose")
-            self.assertEqual(binds[0].where.name, "loose.gguf")
+            self.assertEqual(binds[0].where, dest / "chat" / "loose.gguf")
             self.assertFalse(binds[0].where.is_symlink())
 
     def test_split_shards_and_mmproj_share_one_target(self) -> None:
@@ -4621,7 +4625,8 @@ class ChatClassifyTests(unittest.TestCase):
                 found = set()
                 for mount in plan:
                     if mount.where.parent == dest / "chat":
-                        found.add(mount.where.name)
+                        name = mount.where.name
+                        found.add(mount.where.stem if name.lower().endswith(".gguf") else name)
                     elif mount.where.parent.parent == dest / "chat":
                         found.add(mount.where.parent.name)
                 return found
@@ -4665,7 +4670,8 @@ class ChatClassifyTests(unittest.TestCase):
             for mount in plan:
                 if mount.options.startswith("bind") and "chat" in mount.where.parts:
                     if mount.where.parent == dest / "chat":
-                        names.add(mount.where.name)
+                        name = mount.where.name
+                        names.add(mount.where.stem if name.lower().endswith(".gguf") else name)
                     elif mount.where.parent.parent == dest / "chat":
                         names.add(mount.where.parent.name)
             self.assertEqual(names, {"model", "model-2"})
@@ -4673,6 +4679,46 @@ class ChatClassifyTests(unittest.TestCase):
             self.assertEqual(
                 [mount.where for mount in plan],
                 [mount.where for mount in again],
+            )
+
+    def test_lemonade_ids_are_the_single_clean_name(self) -> None:
+        folder = "Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-MTP"
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "AI models"
+            _write_gguf(root / folder / f"{folder}.gguf", "gemma4")
+            _write_gguf(root / "loose.gguf", "qwen2")
+            _write_gguf(root / "voice" / "moss.gguf", "magpie")
+            mixed = root / "bundle"
+            _write_gguf(mixed / "model-00001-of-00002.gguf", "llama")
+            shard2 = mixed / "model-00002-of-00002.gguf"
+            shard2.parent.mkdir(parents=True, exist_ok=True)
+            from weights import gguf_split_header
+
+            shard2.write_bytes(gguf_split_header(2, 2))
+            _write_gguf(mixed / "mmproj-model.gguf", "clip")
+            _write_gguf(mixed / "speech.gguf", "magpie")
+            dest = Path(tmp) / "ubuntuai-models"
+            target = _target(home, extra=(), model_root=root)
+            plan = _snap_mount_plan(target, dest, gguf_sources(target))
+            ids = lemonade_extra_ids(dest, plan)
+            self.assertEqual(
+                ids,
+                (
+                    "extra.loose",
+                    f"extra.{folder}",
+                    "extra.model",
+                ),
+            )
+            doubled = f"extra.{folder}-{folder}"
+            self.assertNotIn(doubled, ids)
+            self.assertNotIn("extra.loose-loose", ids)
+            self.assertNotIn("extra.model-model", ids)
+            self.assertIn(dest / "chat" / "loose.gguf", [mount.where for mount in plan])
+            self.assertIn(dest / "chat" / folder, [mount.where for mount in plan])
+            self.assertIn(
+                dest / "chat" / "model" / "model-00001-of-00002.gguf",
+                [mount.where for mount in plan],
             )
 
     def test_deep_and_broken_headers_stay_bounded(self) -> None:

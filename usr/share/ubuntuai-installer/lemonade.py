@@ -5,10 +5,15 @@ extra_models_dir. Bind the real trees into SNAP_LEMONADE_MODELS and set
 extra_models_dir to that snap-common path.
 
 A mixed model folder is not one bind. A chat-only directory is mounted
-at dest/chat/<folder name>. A chat GGUF in a mixed folder, or loose in
-the model folder, is a file bind at dest/chat/<file stem>. Lemonade
-labels a model from that directory name. Embedding GGUFs also bind at
-dest/embeddings. A chat directory that contains an embeddings folder
+at dest/chat/<folder name>. One chat GGUF in a mixed folder, or loose
+in the model folder, is a file bind at dest/chat/<name>.gguf. Shards
+and a vision companion share dest/chat/<name>/. Lemonade reads the
+model id from that directory name, or from the filename stem when the
+file sits in chat/ itself. A directory named the same as the file makes
+a later clash id <name>-<name>. The short ids chat, embeddings, and
+reranking are reserved, so publish does not use them. Embedding GGUFs
+also bind at dest/embeddings. A chat directory that contains an
+embeddings folder
 gets an empty read-only tmpfs on a private staging bind under
 /var/lib/ubuntuai. A source with no embeddings folder stays a direct
 bind. A cover on the shared dest mount would propagate back onto the
@@ -695,13 +700,19 @@ def _groups_under(files: list[Path]) -> tuple[_GgufGroup, ...]:
     return tuple(found)
 
 
+# Lemonade refuses these as extra.<name>. Qualifying them repeats the word.
+_RESERVED_CHAT_NAMES = frozenset({"chat", "embeddings", "reranking"})
+
+
 def _assign_chat_names(items: list[tuple[str, str]]) -> dict[str, str]:
     """Map a stable key to a Lemonade directory name.
 
     Sort by the key, not by discovery order. The first claimant keeps the
     bare name. Later claimants of that name get name-2, name-3, and so on.
+    chat, embeddings, and reranking are already taken, so they start at
+    name-2.
     """
-    used: set[str] = set()
+    used: set[str] = set(_RESERVED_CHAT_NAMES)
     assigned: dict[str, str] = {}
     for desired, key in sorted(items, key=lambda item: item[1]):
         base = desired.strip()
@@ -1732,9 +1743,10 @@ def _peer_ids(row: _MountRow) -> set[str]:
 
 
 def _is_installer_cover_where(dest: Path, where: Path) -> bool:
-    """True for dest/chat/srcN/embeddings or the stage cover stage/srcN/embeddings.
+    """True for dest/chat/<name>/embeddings or the stage cover stage/srcN/embeddings.
 
     dest/embeddings is the real embeddings bind. A peer there is not a cover.
+    <name> is the chat directory. An older srcN slot still counts.
     """
     where = _resolve(where)
     if where.name != "embeddings":
@@ -1746,7 +1758,11 @@ def _is_installer_cover_where(dest: Path, where: Path) -> bool:
         rel = where.relative_to(dest)
     except ValueError:
         return False
-    return len(rel.parts) == 3 and rel.parts[0] == "chat" and _is_srcn(rel.parts[1])
+    return (
+        len(rel.parts) == 3
+        and rel.parts[0] == "chat"
+        and rel.parts[1] not in {"", ".", ".."}
+    )
 
 
 def _cover_peer_is_ours(row: _MountRow, dest: Path, rows: tuple[_MountRow, ...]) -> bool:
@@ -2235,6 +2251,87 @@ def _write_cover_unit(where: Path, parent_unit: str) -> str:
     return unit
 
 
+def _direct_chat_file(group: _GgufGroup) -> bool:
+    """One non-shard GGUF binds as chat/<name>.gguf.
+
+    discover_extra_models_in_directory names a subdirectory after the
+    directory. add_extra_model qualifies a taken short id as
+    <folder>-<name>. When the folder and the name are the same string the
+    id is <name>-<name>. A file directly in chat/ qualifies as chat-<name>
+    instead, so the short id stays the single name.
+    """
+    if len(group.files) != 1:
+        return False
+    return _shard_parts(group.files[0])[1] is None
+
+
+def _claim_extra_id(base: str, folder: str, discovered: dict[str, str]) -> str:
+    """Lemonade add_extra_model. The first short id wins."""
+    ident = f"extra.{base}"
+    if ident in discovered or base in _RESERVED_CHAT_NAMES:
+        ident = f"extra.{folder}-{base}"
+        number = 2
+        while ident in discovered:
+            ident = f"extra.{folder}-{base}-{number}"
+            number += 1
+    discovered[ident] = base
+    return ident
+
+
+def lemonade_extra_ids(dest: Path, mounts: tuple[BindMount, ...]) -> tuple[str, ...]:
+    """Canonical extra.* ids for the chat binds in one publish plan.
+
+    Files directly in chat/ are claimed first, in path order. A shard
+    series is one id, the shared prefix. A directory under chat/ is one
+    id, the directory name, claimed after those files. The result is the
+    id Lemonade lists, including the extra. prefix.
+    """
+    chat = dest / "chat"
+    direct: list[Path] = []
+    directories: list[str] = []
+    seen_dirs: set[str] = set()
+    for mount in mounts:
+        where = mount.where
+        try:
+            rel = where.relative_to(chat)
+        except ValueError:
+            continue
+        if ".." in rel.parts or not rel.parts:
+            continue
+        if len(rel.parts) == 1 and where.name.lower().endswith(".gguf"):
+            direct.append(where)
+            continue
+        name = rel.parts[0]
+        if len(rel.parts) == 1 or where.name.lower().endswith(".gguf"):
+            if name in seen_dirs or name in {"", ".", ".."}:
+                continue
+            seen_dirs.add(name)
+            directories.append(name)
+    discovered: dict[str, str] = {}
+    ids: list[str] = []
+    grouped: dict[str, Path] = {}
+    singles: list[tuple[str, Path]] = []
+    for path in direct:
+        prefix, number = _shard_parts(path)
+        if number is not None:
+            previous = grouped.get(prefix)
+            if previous is None or str(path) < str(previous):
+                grouped[prefix] = path
+            continue
+        singles.append((path.stem, path))
+    claimants: list[tuple[str, str, str]] = []
+    for prefix, path in grouped.items():
+        claimants.append((prefix, "chat", str(path)))
+    for stem, path in singles:
+        claimants.append((stem, "chat", str(path)))
+    claimants.sort(key=lambda item: item[2])
+    for base, folder, _path in claimants:
+        ids.append(_claim_extra_id(base, folder, discovered))
+    for name in sorted(directories):
+        ids.append(_claim_extra_id(name, name, discovered))
+    return tuple(ids)
+
+
 def _directory_and_file_mounts(
     target: UserTarget, dest: Path, sources: tuple[Path, ...]
 ) -> tuple[tuple[BindMount, ...], tuple[BindMount, ...]]:
@@ -2250,7 +2347,13 @@ def _directory_and_file_mounts(
     )
     files: list[BindMount] = []
     for group in groups:
-        folder = dest / "chat" / names[group.key]
+        assigned = names[group.key]
+        if _direct_chat_file(group):
+            files.append(
+                BindMount(_resolve(group.files[0]), dest / "chat" / f"{assigned}.gguf")
+            )
+            continue
+        folder = dest / "chat" / assigned
         for path in group.files:
             files.append(BindMount(_resolve(path), folder / path.name))
     return directories, tuple(files)
@@ -2480,7 +2583,12 @@ def _visible_tree_count(mounts: tuple[BindMount, ...]) -> int:
         where = _resolve(mount.where)
         if where == _stage_root() or _is_stage_src(where):
             continue
-        key = where.parent if _is_file_what(mount.what) else where
+        # A file directly in chat/ is its own model. Files that share a
+        # subdirectory are one model, so they count once.
+        if _is_file_what(mount.what) and where.parent.name != "chat":
+            key = where.parent
+        else:
+            key = where
         if key in seen:
             continue
         seen.add(key)
