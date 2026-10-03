@@ -7,7 +7,9 @@ extra_models_dir to that snap-common path.
 Chat trees always land at dest/chat/srcN. Embedding GGUFs also bind at
 dest/embeddings. Lemonade labels a GGUF from the first directory under
 extra_models_dir. The model_root chat bind would still show embeddings
-as chat, so an empty read-only tmpfs covers that one srcN/embeddings.
+as chat, so an empty read-only tmpfs covers that folder. The cover sits
+on a private staging bind under /var/lib/ubuntuai. A cover on the shared
+dest mount would propagate back onto the user's embeddings folder.
 
 Apply runs helper verb lemonade-publish after weights. That verb calls
 publish(target_for(USER)). CLI --publish-lemonade is the same verb.
@@ -48,6 +50,11 @@ APPLY_TUNE_VERB = "lemonade-tune"
 OWNED_UNIT_DESC = "Ubuntu AI models for Lemonade"
 SYSTEM_UNIT_DIR = Path("/etc/systemd/system")
 DAEMON_UNIT = "snap.lemonade-server.daemon"
+# Private staging lives next to the tuning ledger. It is outside /var/snap
+# and outside /home, so a cover there cannot join the user's peer group.
+STAGE_DIR = DEFAULT_STAGE_DIR = Path("/var/lib/ubuntuai/stage")
+UNIT_BACKUP_DIR = Path("/var/lib/ubuntuai/unit-backups")
+UNIT_BACKUP_KEEP = 10
 
 # Mark HITL. This PR warns only. Flip the string if a later change should refuse.
 LOAD_RISK_POLICY = "warn_only"
@@ -80,6 +87,7 @@ CLI_TUNING_KEYS = {
 class BindMount:
     what: Path
     where: Path
+    options: str = "bind,nofail"
 
 
 def detect() -> str:
@@ -139,11 +147,13 @@ def embeddings_mount(target: UserTarget, dest: Path) -> BindMount | None:
 def embeddings_cover(
     model_root: Path, mounts: tuple[BindMount, ...]
 ) -> BindMount | None:
-    """Empty tmpfs over embeddings inside the model_root chat bind.
+    """Empty tmpfs over embeddings on the private stage, not on the user's tree.
 
     One cover follows that srcN. Extra per-directory binds would renumber srcN.
     A symlink is skipped. tmpfs on that path would follow the link and hide
-    the real folder for the whole host.
+    the real folder for the whole host. The cover is also not placed on
+    dest/chat/srcN. That dest lives on shared /var, and a shared bind of a
+    /home tree would copy the cover back onto the source.
     """
     try:
         if (model_root / "embeddings").is_symlink():
@@ -156,7 +166,8 @@ def embeddings_cover(
             continue
         if not _is_srcn(mount.where.name):
             continue
-        return BindMount(Path("tmpfs"), mount.where / "embeddings")
+        where = _stage_src(mount.where.name) / "embeddings"
+        return BindMount(Path("tmpfs"), where, _mount_options(Path("tmpfs"), where))
     return None
 
 
@@ -164,7 +175,11 @@ def is_owned_lemonade_where(dest: Path, where: Path) -> bool:
     """True for dest, dest/embeddings, dest/chat/srcN, or that srcN embeddings cover.
 
     dest itself is a legacy single-source bind. Cleanup still recognizes it.
+    The private stage and a cover left on dest/chat/srcN/embeddings are owned
+    too, so a later publish can drop them.
     """
+    if _is_owned_stage_where(where):
+        return True
     dest = _resolve(dest)
     where = _resolve(where)
     if where == dest:
@@ -192,13 +207,20 @@ def leftover_owned_binds(
     unit_dir: Path,
     mounted: tuple[Path, ...] = (),
 ) -> tuple[Path, ...]:
-    """ubuntuai-owned dest / dest/chat/srcN binds that the collapsed plan no longer uses."""
+    """ubuntuai-owned dest / dest/chat/srcN binds that the collapsed plan no longer uses.
+
+    An rbind onto dest/chat/srcN carries the stage cover along. That copy is
+    not a mount of its own, and unmounting it strips the cover in every namespace.
+    """
     planned = {_resolve(mount.where) for mount in plan}
-    leftovers = [
-        where
-        for where in owned_bind_wheres(dest, unit_dir, mounted)
-        if _resolve(where) not in planned
-    ]
+    leftovers = []
+    for where in owned_bind_wheres(dest, unit_dir, mounted):
+        resolved = _resolve(where)
+        if resolved in planned:
+            continue
+        if _is_carried_rbind_mount(resolved, plan):
+            continue
+        leftovers.append(where)
     leftovers.sort(key=lambda path: (-len(_resolve(path).parts), str(_resolve(path))))
     return tuple(leftovers)
 
@@ -254,21 +276,31 @@ def mount_unit_path(path: Path) -> str:
     return str(path).replace("%", "%%")
 
 
-def mount_unit_text(what: Path, where: Path) -> str:
+def mount_unit_text(
+    what: Path,
+    where: Path,
+    *,
+    options: str = "bind,nofail",
+    after: tuple[str, ...] = (),
+    before: tuple[str, ...] = ("snap.lemonade-server.daemon.service",),
+) -> str:
     # DefaultDependencies orders a /var mount Before=local-fs.target.
     # After=local-fs.target cycles with that. RequiresMountsFor waits for the source path.
     # nofail avoids a cycle on NFS or SMB and a long stall when a nofail disk is absent.
+    after_lines = "".join(f"After={name}\n" for name in after)
+    before_lines = "".join(f"Before={name}\n" for name in before)
     return (
         "[Unit]\n"
         f"Description={OWNED_UNIT_DESC}\n"
         f"RequiresMountsFor={quote_unit_path(what)}\n"
-        "Before=snap.lemonade-server.daemon.service\n"
+        f"{after_lines}"
+        f"{before_lines}"
         "\n"
         "[Mount]\n"
         f"What={mount_unit_path(what)}\n"
         f"Where={mount_unit_path(where)}\n"
         "Type=none\n"
-        "Options=bind,nofail\n"
+        f"Options={options}\n"
         "\n"
         "[Install]\n"
         "WantedBy=multi-user.target\n"
@@ -512,6 +544,60 @@ def _is_cover(mount: BindMount) -> bool:
     return mount.what == Path("tmpfs")
 
 
+def _stage_root() -> Path:
+    return _resolve(STAGE_DIR)
+
+
+def _stage_src(name: str) -> Path:
+    return _stage_root() / name
+
+
+def _is_stage_src(path: Path) -> bool:
+    path = _resolve(path)
+    return path.parent == _stage_root() and _is_srcn(path.name)
+
+
+def _is_owned_stage_where(where: Path) -> bool:
+    where = _resolve(where)
+    if where == _stage_root() or _is_stage_src(where):
+        return True
+    return _is_stage_src(where.parent) and where.name == "embeddings"
+
+
+def _mount_options(what: Path, where: Path) -> str:
+    if what == Path("tmpfs"):
+        return "ro,nosuid,nodev,noexec,size=64k,mode=0555,nofail"
+    where_r = _resolve(where)
+    what_r = _resolve(what)
+    # A new bind of a shared source joins that peer group until it is made private.
+    # rprivate on the stage directory alone is not enough.
+    if where_r == _stage_root() or _is_stage_src(where_r):
+        return "bind,rprivate,nofail"
+    if _is_stage_src(what_r):
+        return "rbind,nofail"
+    return "bind,nofail"
+
+
+def _counts_as_tree(mount: BindMount) -> bool:
+    if _is_cover(mount):
+        return False
+    where = _resolve(mount.where)
+    if where == _stage_root() or _is_stage_src(where):
+        return False
+    return True
+
+
+def _needs_embeddings_cover(target: UserTarget) -> bool:
+    if _embeddings_source(target) is None:
+        return False
+    try:
+        if (target.model_root / "embeddings").is_symlink():
+            return False
+    except OSError:
+        return False
+    return True
+
+
 def _unit_is_ours(path: Path) -> bool:
     try:
         text = path.read_text(encoding="utf-8")
@@ -558,19 +644,26 @@ def _owned_unit_path(where: Path) -> Path | None:
 
 
 def _mounted_wheres() -> tuple[Path, ...]:
-    info = Path("/proc/self/mountinfo")
-    try:
-        text = info.read_text(encoding="utf-8")
-    except OSError:
-        return ()
-    found: list[Path] = []
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) < 5:
-            continue
-        mountpoint = parts[4].replace("\\040", " ").replace("\\011", "\t")
-        found.append(Path(mountpoint))
-    return tuple(found)
+    return tuple(row.mountpoint for row in _mount_rows())
+
+
+def _umount_mountpoint(where: Path) -> None:
+    child = where / "embeddings"
+    removed_cover = False
+    if child != where and _is_mountpoint(child):
+        row = _row_at(child)
+        removed_cover = row is not None and _is_cover_signature(row)
+        _run(["umount", str(child)])
+        if _is_mountpoint(child):
+            raise RuntimeError(_still_mounted_message(child))
+    _run(["umount", str(where)])
+    if not removed_cover or not _is_mountpoint(where) or _is_mountpoint(child):
+        return
+    restored = _run(list(propagation_command(BindMount(Path("tmpfs"), child))))
+    if restored.returncode != 0 or not _is_mountpoint(child):
+        raise RuntimeError(
+            _still_mounted_message(where) + " " + _cover_removed_message(child)
+        )
 
 
 def _drop_bind_unit(where: Path, dest: Path) -> None:
@@ -586,11 +679,13 @@ def _drop_bind_unit(where: Path, dest: Path) -> None:
             unit = ""
         if unit:
             _run(["systemctl", "disable", "--now", unit])
-    _run(["umount", str(where)])
+    _umount_mountpoint(where)
     if _is_mountpoint(where):
         # Keep the unit. A later publish has to be able to stop this mount.
         raise RuntimeError(_still_mounted_message(where))
-    if path is not None:
+    if path is not None and path.exists():
+        # Backup first. A failed copy must not delete the unit file.
+        _backup_unit_file(path)
         path.unlink(missing_ok=True)
         _run(["systemctl", "daemon-reload"])
 
@@ -598,12 +693,38 @@ def _drop_bind_unit(where: Path, dest: Path) -> None:
 def _drop_obsolete_owned_binds(
     dest: Path, plan: tuple[BindMount, ...]
 ) -> tuple[Path, ...]:
+    _release_carried_units(plan)
     leftovers = leftover_owned_binds(
         dest, plan, unit_dir=SYSTEM_UNIT_DIR, mounted=_mounted_wheres()
     )
     for where in leftovers:
         _drop_bind_unit(where, dest)
     return leftovers
+
+
+def _release_carried_units(plan: tuple[BindMount, ...]) -> None:
+    """Disable a unit whose Where is only the cover an rbind already carries.
+
+    disable --now would unmount that copy and strip the cover everywhere.
+    """
+    if not SYSTEM_UNIT_DIR.is_dir():
+        return
+    for path in sorted(SYSTEM_UNIT_DIR.glob("*.mount")):
+        if not _unit_is_ours(path):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        where = _where_from_unit(text)
+        if where is None or not _is_carried_rbind_mount(where, plan):
+            continue
+        _run(["systemctl", "disable", path.name])
+        if not path.exists():
+            continue
+        _backup_unit_file(path)
+        path.unlink(missing_ok=True)
+        _run(["systemctl", "daemon-reload"])
 
 
 def _missing_tool_message(tool: str) -> str:
@@ -624,11 +745,34 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 
 
 def _escape_mount(where: Path) -> str:
-    p = _run(["systemd-escape", "-p", "--suffix=mount", str(where)])
-    name = (p.stdout or "").strip()
-    if p.returncode != 0 or not name:
-        raise RuntimeError(f"systemd-escape failed for {where}")
-    return name
+    """systemd-escape --path --suffix=mount, without calling the binary.
+
+    Slash-replacement dashes stay literal. Every other byte outside ASCII
+    letters, digits, and :_. is \\xHH of its UTF-8 encoding. ".." is rejected.
+    """
+    raw = str(where)
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    parts: list[str] = []
+    for part in raw.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise RuntimeError(f"systemd-escape failed for {where}")
+        parts.append(part)
+    if not parts:
+        return "-.mount"
+    chunks: list[str] = []
+    for index, part in enumerate(parts):
+        if index:
+            chunks.append("-")
+        for ch in part:
+            if ch.isascii() and (ch.isalnum() or ch in ":_."):
+                chunks.append(ch)
+                continue
+            for byte in ch.encode("utf-8"):
+                chunks.append(f"\\x{byte:02x}")
+    return "".join(chunks) + ".mount"
 
 
 def _is_mountpoint(where: Path) -> bool:
@@ -696,13 +840,14 @@ def _refresh_changed_whats(plan: tuple[BindMount, ...]) -> None:
         if current is None or current == _planned_what(mount):
             continue
         _run(["systemctl", "stop", path.name])
-        _run(["umount", str(mount.where)])
+        _umount_mountpoint(mount.where)
         if _is_mountpoint(mount.where):
             raise RuntimeError(_still_mounted_message(mount.where))
 
 
 # /internal/config has to answer before extra_models_dir or tuning. Both need a live server.
-CONFIG_READY_TIMEOUT = 15.0
+# A cold Lemonade has answered after 15s. The wait has to outlast that or tuning is skipped.
+CONFIG_READY_TIMEOUT = 90.0
 CONFIG_READY_INTERVAL = 0.25
 
 
@@ -741,6 +886,8 @@ def _config_answers() -> bool:
 
 
 def _wait_for_config() -> None:
+    # Helper stdout is the progress channel. Apply and the CLI stream it.
+    print("Waiting for Lemonade to answer.", flush=True)
     deadline = time.monotonic() + CONFIG_READY_TIMEOUT
     while True:
         if _config_answers():
@@ -812,21 +959,657 @@ def _mkdir_nofollow(path: Path) -> None:
             os.close(parent_fd)
 
 
-def _write_bind_unit(what: Path, where: Path) -> str:
-    dest = _bind_dest(where)
-    ancestor = _owned_ancestor_mount(where, dest)
-    if ancestor is not None:
-        raise RuntimeError(_still_mounted_message(ancestor))
-    _mkdir_nofollow(where)
-    unit = _escape_mount(where)
-    text = mount_unit_text(what, where)
-    path = Path("/etc/systemd/system") / unit
-    path.write_text(text, encoding="utf-8")
+_action_notes: list[str] = []
+_before_units: dict[Path, tuple[str, ...]] = {}
+_after_units: dict[Path, tuple[str, ...]] = {}
+
+
+def _note(text: str) -> None:
+    if text:
+        _action_notes.append(text)
+
+
+def _state_dir_unsafe() -> str:
+    return (
+        "The Ubuntu AI state folder is not safe to use. "
+        "Publish stopped so your files stay unchanged."
+    )
+
+
+def _ensure_state_dir(directory: Path) -> None:
+    fd = _ensure_ledger_dir(directory, refuse=_state_dir_unsafe)
+    os.close(fd)
+
+
+def _prepare_state_dirs() -> None:
+    """Create the state parent, the stage, and the unit-backup folder.
+
+    Each level is the same no-follow root-owned check as the tuning ledger.
+    Callers that are about to unmount must do this first, and must stop if
+    it fails.
+    """
+    parents: list[Path] = []
+    for directory in (STAGE_DIR, UNIT_BACKUP_DIR):
+        parent = directory.parent
+        if parent not in parents:
+            parents.append(parent)
+    for directory in (*parents, STAGE_DIR, UNIT_BACKUP_DIR):
+        _ensure_state_dir(directory)
+
+
+def _prepare_stage_dir() -> None:
+    _prepare_state_dirs()
+
+
+def _set_unit_order(mounts: tuple[BindMount, ...]) -> dict[Path, str]:
+    names = {_resolve(mount.where): _escape_mount(mount.where) for mount in mounts}
+    _before_units.clear()
+    _after_units.clear()
+    cover_names = tuple(
+        names[_resolve(mount.where)] for mount in mounts if _is_cover(mount)
+    )
+    for mount in mounts:
+        key = _resolve(mount.where)
+        if _is_cover(mount):
+            parent = _resolve(mount.where.parent)
+            if parent in names:
+                _after_units[key] = (names[parent],)
+            continue
+        if mount.options.startswith("rbind"):
+            rel: list[str] = []
+            src = _resolve(mount.what)
+            if src in names:
+                rel.append(names[src])
+            cover_where = _resolve(src / "embeddings")
+            if cover_where in names:
+                rel.append(names[cover_where])
+            if rel:
+                _after_units[key] = tuple(rel)
+            continue
+        if "rprivate" in mount.options and _resolve(mount.what) != _resolve(mount.where):
+            parent = _resolve(mount.where.parent)
+            if parent in names:
+                _after_units[key] = (names[parent],)
+            continue
+        if mount.where.name == "embeddings" and cover_names:
+            # The embeddings bind is never ordered after a cover.
+            _before_units[key] = cover_names
+    return names
+
+
+def _render_unit(mount: BindMount) -> str:
+    key = _resolve(mount.where)
+    if _is_cover(mount):
+        parent = _after_units.get(key, ("",))[0]
+        return cover_unit_text(mount.where, parent)
+    before = (*_before_units.get(key, ()), "snap.lemonade-server.daemon.service")
+    return mount_unit_text(
+        mount.what,
+        mount.where,
+        options=mount.options,
+        after=_after_units.get(key, ()),
+        before=before,
+    )
+
+
+def propagation_command(mount: BindMount) -> tuple[str, ...]:
+    """mount(8) argv for one planned step. systemd Options= uses the same flags."""
+    if _is_cover(mount):
+        return (
+            "mount",
+            "-t",
+            "tmpfs",
+            "-o",
+            "ro,nosuid,nodev,noexec,size=64k,mode=0555",
+            "tmpfs",
+            str(mount.where),
+        )
+    what = str(mount.what)
+    where = str(mount.where)
+    if mount.options.startswith("rbind"):
+        return ("mount", "--rbind", what, where)
+    if "rprivate" in mount.options:
+        return ("mount", "-o", "bind,rprivate", what, where)
+    return ("mount", "--bind", what, where)
+
+
+def propagation_commands(
+    mounts: tuple[BindMount, ...],
+) -> tuple[tuple[str, ...], ...]:
+    return tuple(propagation_command(mount) for mount in mounts)
+
+
+def unmount_commands(mounts: tuple[BindMount, ...]) -> tuple[tuple[str, ...], ...]:
+    """Reverse order. The rbind carries the cover, so that submount goes first."""
+    cmds: list[tuple[str, ...]] = []
+    for mount in reversed(mounts):
+        if mount.options.startswith("rbind"):
+            cmds.append(("umount", str(mount.where / "embeddings")))
+        cmds.append(("umount", str(mount.where)))
+    return tuple(cmds)
+
+
+def apply_propagation(mounts: tuple[BindMount, ...]) -> None:
+    """Run the mount sequence with mount(8). Publish uses the same commands as a fallback."""
+    for mount in mounts:
+        if not _is_cover(mount):
+            if _resolve(mount.where) == _stage_root():
+                _prepare_stage_dir()
+            _mkdir_nofollow(mount.where)
+        elif not mount.where.is_dir():
+            raise RuntimeError(
+                f"The embeddings cover has no folder at {mount.where}. "
+                "Publish stopped so your model files stay where they are."
+            )
+        mounted = _mount_with_command(mount.what, mount.where, mount.options)
+        if mounted is None:
+            continue
+        if mounted.returncode != 0:
+            detail = (mounted.stderr or mounted.stdout or "").strip()
+            raise RuntimeError(
+                f"Could not mount {mount.where}. "
+                "Publish stopped so your model files stay where they are. "
+                f"{detail}".rstrip()
+            )
+
+
+def _read_mountinfo_text() -> str:
+    try:
+        return Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+@dataclass(frozen=True)
+class _MountRow:
+    mount_id: int
+    parent_id: int
+    dev: str
+    root: str
+    mountpoint: Path
+    options: tuple[str, ...]
+    optional: tuple[str, ...]
+    fstype: str
+    source: str
+    super_options: tuple[str, ...]
+
+
+def _unescape_mount(raw: str) -> str:
+    return (
+        raw.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+    )
+
+
+def _parse_mountinfo(text: str) -> tuple[_MountRow, ...]:
+    found: list[_MountRow] = []
+    for line in text.splitlines():
+        parts = line.split()
+        if "-" not in parts:
+            continue
+        sep = parts.index("-")
+        if sep < 6 or len(parts) < sep + 2:
+            continue
+        try:
+            mount_id = int(parts[0])
+            parent_id = int(parts[1])
+        except ValueError:
+            continue
+        super_raw = parts[sep + 3] if len(parts) > sep + 3 else ""
+        found.append(
+            _MountRow(
+                mount_id=mount_id,
+                parent_id=parent_id,
+                dev=parts[2],
+                root=_unescape_mount(parts[3]),
+                mountpoint=Path(_unescape_mount(parts[4])),
+                options=tuple(parts[5].split(",")),
+                optional=tuple(parts[6:sep]),
+                fstype=parts[sep + 1],
+                source=_unescape_mount(parts[sep + 2] if len(parts) > sep + 2 else ""),
+                super_options=tuple(super_raw.split(",")) if super_raw else (),
+            )
+        )
+    return tuple(found)
+
+
+def _mount_rows() -> tuple[_MountRow, ...]:
+    return _parse_mountinfo(_read_mountinfo_text())
+
+
+def _row_at(where: Path, rows: tuple[_MountRow, ...] | None = None) -> _MountRow | None:
+    rows = _mount_rows() if rows is None else rows
+    wanted = {_resolve(where)}
+    found: _MountRow | None = None
+    for row in rows:
+        point = row.mountpoint
+        if point in wanted or _resolve(point) in wanted:
+            found = row
+    return found
+
+
+def _option_tokens(row: _MountRow) -> set[str]:
+    return {token for token in (*row.options, *row.super_options) if token}
+
+
+def _is_cover_signature(row: _MountRow) -> bool:
+    """The empty cover an older publish mounted. mode=0555 is stored as mode=555."""
+    if row.fstype != "tmpfs":
+        return False
+    tokens = _option_tokens(row)
+    if "ro" not in tokens or "rw" in tokens:
+        return False
+    if "size=64k" not in tokens:
+        return False
+    return "mode=0555" in tokens or "mode=555" in tokens
+
+
+def _peer_ids(row: _MountRow) -> set[str]:
+    found: set[str] = set()
+    for token in row.optional:
+        if token.startswith("shared:") or token.startswith("master:"):
+            found.add(token.split(":", 1)[1])
+    return found
+
+
+def _cover_peer_is_ours(row: _MountRow, dest: Path, rows: tuple[_MountRow, ...]) -> bool:
+    """A shared cover must have an installer mount in the same peer group.
+
+    No peer tag, or a peer group with only this mount, is the last remnant
+    of our cover. A peer group shared only with someone else's mounts is not.
+    """
+    ids = _peer_ids(row)
+    if not ids:
+        return True
+    others = [
+        other
+        for other in rows
+        if other.mount_id != row.mount_id and _peer_ids(other) & ids
+    ]
+    if not others:
+        return True
+    for other in others:
+        if _is_owned_stage_where(other.mountpoint) or is_owned_lemonade_where(
+            dest, other.mountpoint
+        ):
+            return True
+    return False
+
+
+def _foreign_tmpfs_message(folder: Path) -> str:
+    return (
+        f"A temporary filesystem is mounted on {folder}. "
+        "It is not the empty cover from an older publish. "
+        "Publish stopped so that folder stays as it is."
+    )
+
+
+def _cover_removed_message(folder: Path) -> str:
+    return (
+        f"The embeddings cover at {folder} was removed. "
+        "Run publish again to put it back."
+    )
+
+
+def _embeddings_tmpfs_row(folder: Path) -> _MountRow | None:
+    try:
+        if folder.is_symlink():
+            return None
+    except OSError:
+        return None
+    row = _row_at(folder)
+    if row is None or row.fstype != "tmpfs":
+        return None
+    return row
+
+
+def _clear_embeddings_leak(model_root: Path, dest: Path) -> str:
+    """Drop the empty cover an older publish left on the user's embeddings folder.
+
+    Any other tmpfs stays mounted. Removing it would destroy the files inside.
+    """
+    folder = model_root / "embeddings"
+    row = _embeddings_tmpfs_row(folder)
+    if row is None:
+        return ""
+    rows = _mount_rows()
+    if not _is_cover_signature(row) or not _cover_peer_is_ours(row, dest, rows):
+        raise RuntimeError(_foreign_tmpfs_message(folder))
+    _run(["umount", str(folder)])
+    if _embeddings_tmpfs_row(folder) is not None:
+        raise RuntimeError(
+            f"A temporary filesystem is still hiding {folder}. "
+            "Publish stopped so your model files stay where they are."
+        )
+    return f"Removed a temporary filesystem that was hiding {folder}."
+
+
+def _leak_plan_line(model_root: Path, dest: Path) -> str:
+    folder = model_root / "embeddings"
+    row = _embeddings_tmpfs_row(folder)
+    if row is None:
+        return ""
+    if _is_cover_signature(row) and _cover_peer_is_ours(row, dest, _mount_rows()):
+        return f"Remove the empty cover that is hiding {folder}."
+    return _foreign_tmpfs_message(folder)
+
+
+def _same_directory(left: Path, right: Path) -> bool | None:
+    try:
+        a = os.stat(left)
+        b = os.stat(right)
+    except OSError:
+        return None
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _is_carried_rbind_mount(where: Path, plan: tuple[BindMount, ...]) -> bool:
+    """True when where is the replica an rbind in plan already carries.
+
+    The replica and the stage cover share a superblock. A cover mounted on
+    dest/chat/srcN before that rbind has a different device and is still removed.
+    """
+    resolved = _resolve(where)
+    rows = _mount_rows()
+    here = _row_at(resolved, rows)
+    if here is None:
+        return False
+    for mount in plan:
+        if not str(mount.options).startswith("rbind"):
+            continue
+        target = _resolve(mount.where)
+        if resolved == target or target not in resolved.parents:
+            continue
+        if _row_at(target, rows) is None:
+            continue
+        try:
+            rel = resolved.relative_to(target)
+        except ValueError:
+            continue
+        origin = _row_at(_resolve(mount.what) / rel, rows)
+        if origin is not None and origin.dev == here.dev and origin.fstype == here.fstype:
+            return True
+    return False
+
+
+def _mount_is_current(what: Path, where: Path, options: str) -> bool:
+    if not _is_mountpoint(where):
+        return False
+    if what == Path("tmpfs"):
+        row = _row_at(where)
+        return row is not None and _is_cover_signature(row)
+    if _same_directory(where, what) is not True:
+        return False
+    if not options.startswith("rbind"):
+        return True
+    origin = _resolve(what) / "embeddings"
+    cover = _resolve(where) / "embeddings"
+    if _is_mountpoint(origin):
+        return _is_carried_rbind_mount(cover, (BindMount(what, where, options),))
+    return not _is_mountpoint(cover)
+
+
+def _mount_with_command(
+    what: Path, where: Path, options: str
+) -> subprocess.CompletedProcess | None:
+    """Mount what onto where. None when that mount is already in place.
+
+    A second mount(8) on a live mountpoint stacks. A wrong mount is removed
+    first so the new one is the only one.
+    """
+    if _mount_is_current(what, where, options):
+        return None
+    if _is_mountpoint(where):
+        if options.startswith("rbind"):
+            child = where / "embeddings"
+            if _is_mountpoint(child):
+                _run(["umount", str(child)])
+                if _is_mountpoint(child):
+                    raise RuntimeError(_still_mounted_message(child))
+        _run(["umount", str(where)])
+        if _is_mountpoint(where):
+            raise RuntimeError(_still_mounted_message(where))
+    return _run(list(propagation_command(BindMount(what, where, options))))
+
+
+def _embeddings_bind_is_stale(mount: BindMount) -> bool:
+    if _is_cover(mount) or mount.where.name != "embeddings":
+        return False
+    if _is_owned_stage_where(mount.where):
+        return False
+    if not _is_mountpoint(mount.where):
+        return False
+    row = _row_at(mount.where)
+    if row is not None and row.fstype == "tmpfs":
+        return True
+    same = _same_directory(mount.where, mount.what)
+    if same is not None:
+        return not same
+    if row is None:
+        return False
+    there = _row_at(mount.what)
+    if there is None:
+        return False
+    return (row.dev, row.root, row.source) != (there.dev, there.root, there.source)
+
+
+def _stop_mount_unit(where: Path) -> None:
+    path = _owned_unit_path(where)
+    if path is not None:
+        _run(["systemctl", "stop", path.name])
+        return
+    try:
+        unit = _escape_mount(where)
+    except RuntimeError:
+        return
+    _run(["systemctl", "stop", unit])
+
+
+def _remount_stale_embeddings(plan: tuple[BindMount, ...]) -> None:
+    """Stop and unmount dest/embeddings when it is not the real embeddings folder.
+
+    enable --now does not replace an active mount, and a unit whose What= is
+    already the real path is not rewritten. The later enable mounts it again.
+    """
+    for mount in plan:
+        if not _embeddings_bind_is_stale(mount):
+            continue
+        _stop_mount_unit(mount.where)
+        _run(["umount", str(mount.where)])
+        if _is_mountpoint(mount.where):
+            raise RuntimeError(_still_mounted_message(mount.where))
+
+
+def _backup_stamp() -> str:
+    seconds = time.time()
+    micros = int((seconds - int(seconds)) * 1_000_000)
+    return time.strftime("%Y%m%dT%H%M%S", time.gmtime(seconds)) + f"{micros:06d}Z"
+
+
+def _backup_unit_file(path: Path) -> Path:
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError(_state_dir_unsafe()) from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise RuntimeError(
+            f"The unit file {path} is a symlink. "
+            "Publish stopped so that file stays unchanged."
+        )
+    try:
+        src = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise RuntimeError(_state_dir_unsafe()) from exc
+    try:
+        data = _read_fd(src)
+    finally:
+        os.close(src)
+    dir_fd = _ensure_ledger_dir(UNIT_BACKUP_DIR, refuse=_state_dir_unsafe)
+    name = f"{path.name}.{_backup_stamp()}"
+    try:
+        out = os.open(
+            name,
+            os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY | os.O_CLOEXEC,
+            0o644,
+            dir_fd=dir_fd,
+        )
+        try:
+            os.write(out, data)
+            os.fsync(out)
+        finally:
+            os.close(out)
+        _prune_unit_backups(dir_fd, path.name)
+    except OSError as exc:
+        raise RuntimeError(_state_dir_unsafe()) from exc
+    finally:
+        os.close(dir_fd)
+    saved = UNIT_BACKUP_DIR / name
+    _note(f"Saved the previous unit file at {saved}.")
+    return saved
+
+
+def _prune_unit_backups(dir_fd: int, unit_name: str) -> None:
+    prefix = unit_name + "."
+    names: list[str] = []
+    for entry in os.scandir(dir_fd):
+        try:
+            if entry.name.startswith(prefix) and entry.is_file(follow_symlinks=False):
+                names.append(entry.name)
+        except OSError:
+            continue
+    names.sort()
+    for old in names[:-UNIT_BACKUP_KEEP]:
+        try:
+            os.unlink(old, dir_fd=dir_fd)
+        except OSError:
+            continue
+
+
+def _read_unit_nofollow(path: Path) -> str | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        return _read_fd(fd).decode("utf-8")
+    except UnicodeError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _daemon_wants_dir() -> Path:
+    return SYSTEM_UNIT_DIR / f"{DAEMON_UNIT}.service.wants"
+
+
+def _wants_target(link: Path) -> Path | None:
+    try:
+        raw = os.readlink(link)
+    except OSError:
+        return None
+    target = Path(raw)
+    if not target.is_absolute():
+        target = link.parent / target
+    try:
+        if not target.is_file() or target.is_symlink():
+            return None
+    except OSError:
+        return None
+    return target
+
+
+def _clean_daemon_wants(plan: tuple[BindMount, ...]) -> None:
+    wants = _daemon_wants_dir()
+    if not wants.is_dir():
+        return
+    planned = {_resolve(mount.where) for mount in plan}
+    for link in sorted(wants.iterdir(), key=lambda item: item.name):
+        try:
+            if not link.is_symlink():
+                continue
+        except OSError:
+            continue
+        target = _wants_target(link)
+        if target is None:
+            _note(
+                f"Left a broken Lemonade service link {link.name} "
+                "because the unit file is missing."
+            )
+            continue
+        text = _read_unit_nofollow(target)
+        if text is None or f"Description={OWNED_UNIT_DESC}" not in text:
+            _note(
+                f"Left a Lemonade service link this installer does not own. {link.name}"
+            )
+            continue
+        where = _where_from_unit(text)
+        if where is not None and _resolve(where) in planned:
+            continue
+        try:
+            link.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not remove the old Lemonade mount link {link.name}. "
+                "Publish stopped so that link stays in place."
+            ) from exc
+        _note(f"Removed an old Lemonade mount link {link.name}.")
+
+
+def _unit_file(unit: str) -> Path:
+    return SYSTEM_UNIT_DIR / unit
+
+
+def _install_unit(path: Path, text: str, unit: str) -> subprocess.CompletedProcess | None:
+    """None when systemd started the mount. Otherwise the failed enable result."""
+    previous = None
+    try:
+        if path.is_symlink():
+            raise RuntimeError(
+                f"The unit file {path} is a symlink. "
+                "Publish stopped so that file stays unchanged."
+            )
+        if path.is_file():
+            previous = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(_state_dir_unsafe()) from exc
+    if previous is not None and previous != text:
+        _backup_unit_file(path)
+    if previous != text:
+        path.write_text(text, encoding="utf-8")
     _run(["systemctl", "daemon-reload"])
     enabled = _run(["systemctl", "enable", "--now", unit])
     if enabled.returncode != 0:
-        mounted = _run(["mount", "--bind", str(what), str(where)])
-        if mounted.returncode != 0:
+        return enabled
+    return None
+
+
+def _write_bind_unit(what: Path, where: Path) -> str:
+    if _is_owned_stage_where(where):
+        if _resolve(where) == _stage_root():
+            _prepare_stage_dir()
+    else:
+        dest = _bind_dest(where)
+        ancestor = _owned_ancestor_mount(where, dest)
+        if ancestor is not None:
+            raise RuntimeError(_still_mounted_message(ancestor))
+    _mkdir_nofollow(where)
+    unit = _escape_mount(where)
+    options = _mount_options(what, where)
+    before = (*_before_units.get(_resolve(where), ()), "snap.lemonade-server.daemon.service")
+    text = mount_unit_text(
+        what,
+        where,
+        options=options,
+        after=_after_units.get(_resolve(where), ()),
+        before=before,
+    )
+    path = _unit_file(unit)
+    enabled = _install_unit(path, text, unit)
+    if enabled is not None:
+        mounted = _mount_with_command(what, where, options)
+        if mounted is not None and mounted.returncode != 0:
             raise RuntimeError(
                 (enabled.stderr or enabled.stdout or "")
                 + (mounted.stderr or mounted.stdout or "")
@@ -835,7 +1618,7 @@ def _write_bind_unit(what: Path, where: Path) -> str:
 
 
 def _write_cover_unit(where: Path, parent_unit: str) -> str:
-    # The parent bind already exposes this directory. Never mkdir it.
+    # The staged bind already exposes this directory. Never mkdir it.
     try:
         if where.is_symlink():
             return ""
@@ -848,23 +1631,13 @@ def _write_cover_unit(where: Path, parent_unit: str) -> str:
         )
     unit = _escape_mount(where)
     text = cover_unit_text(where, parent_unit)
-    path = Path("/etc/systemd/system") / unit
-    path.write_text(text, encoding="utf-8")
-    _run(["systemctl", "daemon-reload"])
-    enabled = _run(["systemctl", "enable", "--now", unit])
-    if enabled.returncode != 0:
-        mounted = _run(
-            [
-                "mount",
-                "-t",
-                "tmpfs",
-                "-o",
-                "ro,nosuid,nodev,noexec,size=64k,mode=0555",
-                "tmpfs",
-                str(where),
-            ]
+    path = _unit_file(unit)
+    enabled = _install_unit(path, text, unit)
+    if enabled is not None:
+        mounted = _mount_with_command(
+            Path("tmpfs"), where, _mount_options(Path("tmpfs"), where)
         )
-        if mounted.returncode != 0:
+        if mounted is not None and mounted.returncode != 0:
             raise RuntimeError(
                 (enabled.stderr or enabled.stdout or "")
                 + (mounted.stderr or mounted.stdout or "")
@@ -876,16 +1649,43 @@ def _snap_mount_plan(
     target: UserTarget, dest: Path, sources: tuple[Path, ...]
 ) -> tuple[BindMount, ...]:
     mounts = list(bind_mounts(sources, dest))
-    cover = None
-    if _embeddings_source(target) is not None:
-        cover = embeddings_cover(target.model_root, tuple(mounts))
-    ordered: list[BindMount] = []
-    for mount in mounts:
-        ordered.append(mount)
-        if cover is not None and _resolve(mount.where) == _resolve(cover.where.parent):
-            ordered.append(cover)
+    cover = (
+        embeddings_cover(target.model_root, tuple(mounts))
+        if _needs_embeddings_cover(target)
+        else None
+    )
+    if cover is None:
+        ordered = list(mounts)
+        emb = embeddings_mount(target, dest)
+        if emb is not None:
+            ordered.append(emb)
+        return tuple(ordered)
+    root = _resolve(target.model_root)
+    stage = _stage_root()
+    ordered = [BindMount(stage, stage, _mount_options(stage, stage))]
     emb = embeddings_mount(target, dest)
-    if emb is not None:
+    emb_done = False
+    for mount in mounts:
+        covered = (
+            cover is not None
+            and _resolve(mount.what) == root
+            and mount.where.name == cover.where.parent.name
+        )
+        if not covered:
+            ordered.append(mount)
+            continue
+        stage_src = cover.where.parent
+        ordered.append(
+            BindMount(mount.what, stage_src, _mount_options(mount.what, stage_src))
+        )
+        if emb is not None and not emb_done:
+            ordered.append(emb)
+            emb_done = True
+        ordered.append(cover)
+        ordered.append(
+            BindMount(stage_src, mount.where, _mount_options(stage_src, mount.where))
+        )
+    if emb is not None and not emb_done:
         ordered.append(emb)
     return tuple(ordered)
 
@@ -902,6 +1702,9 @@ def _apply_snap_mounts(
     try:
         if was_running:
             _stop_daemon()
+        if any(_is_cover(mount) or mount.options != "bind,nofail" for mount in mounts):
+            _set_unit_order(mounts)
+        _remount_stale_embeddings(mounts)
         _refresh_changed_whats(mounts)
         _drop_obsolete_owned_binds(dest, mounts)
         written: dict[Path, str] = {}
@@ -913,6 +1716,7 @@ def _apply_snap_mounts(
             else:
                 label = _write_bind_unit(mount.what, mount.where)
                 written[_resolve(mount.where)] = label
+        _clean_daemon_wants(mounts)
         # Binds are in place. The server has to be up before config writes.
         _start_daemon()
         started = True
@@ -1312,8 +2116,11 @@ def _ledger_dir_is_trusted(st: os.stat_result) -> bool:
     return st.st_uid == 0 and st.st_gid == 0
 
 
-def _ensure_ledger_dir(directory: Path) -> int:
-    """Return a dir fd for a real root-owned ledger directory. Caller closes it."""
+def _ensure_ledger_dir(
+    directory: Path, *, refuse: Callable[[], str] | None = None
+) -> int:
+    """Return a dir fd for a real root-owned directory. Caller closes it."""
+    message = refuse or _ledger_dir_unsafe
     parent = directory.parent
     try:
         parent_fd = os.open(
@@ -1321,7 +2128,7 @@ def _ensure_ledger_dir(directory: Path) -> int:
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
         )
     except OSError as exc:
-        raise RuntimeError(_ledger_dir_unsafe()) from exc
+        raise RuntimeError(message()) from exc
     try:
         try:
             os.mkdir(directory.name, 0o755, dir_fd=parent_fd)
@@ -1335,11 +2142,11 @@ def _ensure_ledger_dir(directory: Path) -> int:
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
         )
     except OSError as exc:
-        raise RuntimeError(_ledger_dir_unsafe()) from exc
+        raise RuntimeError(message()) from exc
     try:
         st = os.fstat(dir_fd)
         if not stat.S_ISDIR(st.st_mode) or not _ledger_dir_is_trusted(st):
-            raise RuntimeError(_ledger_dir_unsafe())
+            raise RuntimeError(message())
         os.fchmod(dir_fd, 0o755)
     except Exception:
         os.close(dir_fd)
@@ -1759,6 +2566,69 @@ def check_model_updates() -> str:
     return ((p.stdout or "") + (p.stderr or "")).strip()
 
 
+def _tuning_lines(target: UserTarget) -> tuple[str, ...]:
+    settings = load_tuning(probe(), largest_gguf_bytes(target))
+    lines: list[str] = []
+    for key in (
+        "ctx_size",
+        "global_timeout",
+        "max_loaded_models",
+        "llamacpp_backend",
+        "llamacpp_args",
+        "llamacpp_vulkan_args",
+    ):
+        if key in settings:
+            lines.append(f"{key}={settings[key]}")
+    return tuple(lines)
+
+
+def _format_plan_mounts(mounts: tuple[BindMount, ...]) -> tuple[str, ...]:
+    if not mounts:
+        return ()
+    _set_unit_order(mounts)
+    lines: list[str] = []
+    for mount in mounts:
+        lines.append(_render_unit(mount).rstrip("\n"))
+        lines.append(f"What={_planned_what(mount)}")
+        lines.append(f"Where={mount.where}")
+        lines.append(" ".join(propagation_command(mount)))
+    return tuple(lines)
+
+
+def publish_plan(target: UserTarget) -> str:
+    """Planned units, mounts, and load settings. Does not write or call systemctl."""
+    kind = detect()
+    if not kind:
+        return "lemonade not installed"
+    sources = gguf_sources(target)
+    lines: list[str] = []
+    if kind == "snap":
+        dest = extra_dir(kind)
+        if dest == Path() or is_home_path(dest):
+            raise RuntimeError(
+                "snap extra_models_dir must be under /var/snap/lemonade-server/common"
+            )
+        mounts = _snap_mount_plan(target, dest, sources)
+        lines.append(f"lemonade extra_models_dir={dest}")
+        leak = _leak_plan_line(target.model_root, dest)
+        if leak:
+            lines.append(leak)
+        if not mounts:
+            lines.append(
+                "no real GGUF files to publish (Lemonade cannot follow store symlinks)"
+            )
+        else:
+            lines.extend(_format_plan_mounts(mounts))
+    elif not sources:
+        lines.append(
+            "no real GGUF files to publish (Lemonade cannot follow store symlinks)"
+        )
+    else:
+        lines.append(f"lemonade extra_models_dir={sources[0]}")
+    lines.extend(_tuning_lines(target))
+    return "\n".join(lines)
+
+
 def publish(target: UserTarget) -> str:
     """Bind real GGUF trees and set extra_models_dir. Snap dest is never /home."""
     kind = detect()
@@ -1767,30 +2637,41 @@ def publish(target: UserTarget) -> str:
     sources = gguf_sources(target)
     if kind == "snap":
         dest = extra_dir(kind)
-        mounts = _snap_mount_plan(target, dest, sources)
-        if not mounts:
-            return "no real GGUF files to publish (Lemonade cannot follow store symlinks)"
         if dest == Path() or is_home_path(dest):
             raise RuntimeError(
                 "snap extra_models_dir must be under /var/snap/lemonade-server/common"
             )
+        _action_notes.clear()
+        _before_units.clear()
+        _after_units.clear()
+        # The backup folder has to exist before any unmount. A failure here
+        # leaves every mount where it is.
+        _prepare_state_dirs()
+        repair = _clear_embeddings_leak(target.model_root, dest)
+        if repair:
+            _note(repair)
+        mounts = _snap_mount_plan(target, dest, sources)
+        if not mounts:
+            prefix = "no real GGUF files to publish (Lemonade cannot follow store symlinks)"
+            extra = "\n".join(_action_notes)
+            return f"{prefix}\n{extra}" if extra else prefix
         # Stop the daemon before replacing binds. A busy dest mount would
         # mkdir chat/ inside the user's model tree.
-        notes: list[str] = []
+        tuning: list[str] = []
 
         def _ready() -> None:
             text = report_load_tuning(target)
             if text:
-                notes.append(text)
+                tuning.append(text)
 
         unit = _apply_snap_mounts(dest, mounts, on_ready=_ready)
-        visible = sum(1 for mount in mounts if not _is_cover(mount))
+        visible = sum(1 for mount in mounts if _counts_as_tree(mount))
         if visible == 1:
             prefix = f"lemonade extra_models_dir={dest} via {unit}"
         else:
             prefix = f"lemonade extra_models_dir={dest} ({visible} trees)"
-        extra = notes[0] if notes else ""
-        return f"{prefix}\n{extra}" if extra else prefix
+        parts = [prefix, *tuning, *_action_notes]
+        return "\n".join(part for part in parts if part)
     if not sources:
         return "no real GGUF files to publish (Lemonade cannot follow store symlinks)"
     dest = sources[0]

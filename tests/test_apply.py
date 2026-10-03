@@ -348,11 +348,26 @@ class ApplyTests(unittest.TestCase):
         with patch(
             "apply.run_privileged", return_value=(0, "lemonade extra_models_dir=/var/snap")
         ) as rp:
-            log = execute_plan(actions, self.target, hw=_hw_strix(), dry_run=True)
+            log = execute_plan(actions, self.target, hw=_hw_strix(), dry_run=False)
         rp.assert_called_once()
         self.assertEqual(rp.call_args[0][0], APPLY_PUBLISH_VERB)
         self.assertEqual(rp.call_args[0][1], [self.target.name])
         self.assertTrue(any("lemonade" in line.lower() for line in log))
+
+    def test_execute_lemonade_dry_run_lists_plan(self) -> None:
+        actions = (
+            Action("lemonade", "publish GGUF files to Lemonade", (self.target.name,)),
+        )
+        plan = "What=/models\nWhere=/var/snap/lemonade\nctx_size=2048\n"
+        with (
+            patch("lemonade.publish_plan", return_value=plan) as listed,
+            patch("apply.run_privileged", side_effect=AssertionError("helper")) as rp,
+        ):
+            log = execute_plan(actions, self.target, hw=_hw_strix(), dry_run=True)
+        listed.assert_called_once()
+        rp.assert_not_called()
+        self.assertTrue(any("ctx_size=2048" in line for line in log))
+        self.assertTrue(any("What=/models" in line for line in log))
 
     def test_execute_plan_creates_log_owned_by_target(self) -> None:
         with TemporaryDirectory() as tmp:

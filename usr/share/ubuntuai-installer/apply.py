@@ -498,17 +498,22 @@ def execute_plan(
                         raise ApplyError(english, detail) from exc
                     log.append(msg)
             elif action.kind == "lemonade":
-                rc, out = run_privileged(
-                    APPLY_PUBLISH_VERB,
-                    [target.name],
-                    dry_run=dry_run,
-                )
-                if rc != 0:
-                    raise ApplyError(
-                        "Could not make downloaded models visible to Lemonade.",
-                        out,
+                if dry_run:
+                    from lemonade import publish_plan
+
+                    log.append(publish_plan(target).strip())
+                else:
+                    rc, out = run_privileged(
+                        APPLY_PUBLISH_VERB,
+                        [target.name],
+                        on_line=lambda line: relay(line, line),
                     )
-                log.append((out or "published models to Lemonade").strip())
+                    if rc != 0:
+                        raise ApplyError(
+                            "Could not make downloaded models visible to Lemonade.",
+                            out,
+                        )
+                    log.append((out or "published models to Lemonade").strip())
             else:
                 raise ApplyError(
                     f"The installer does not know how to run step {action.kind}."
