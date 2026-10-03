@@ -1,6 +1,6 @@
 """Publish installer GGUF trees to Lemonade.
 
-The snap cannot follow ~/Models symlinks and cannot read /home as
+The snap cannot follow symlinks and cannot read /home as
 extra_models_dir. Bind the real trees into SNAP_LEMONADE_MODELS and set
 extra_models_dir to that snap-common path.
 
@@ -261,6 +261,19 @@ def owned_bind_wheres(
     for where in mounted:
         add(where)
     return tuple(found)
+
+
+def quote_systemd_exec(argv: list[str]) -> str:
+    """One ExecStart value. systemd splits on spaces and expands % specifiers."""
+    return " ".join(_quote_systemd_word(word) for word in argv)
+
+
+def _quote_systemd_word(text: str) -> str:
+    needs_quote = any(ch.isspace() for ch in text) or any(ch in text for ch in '"\\%')
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    if needs_quote:
+        return f'"{escaped}"'
+    return escaped
 
 
 def quote_unit_path(path: Path) -> str:

@@ -36,7 +36,7 @@
     {
       "id": "ubuntuai-chat",
       "title": "Chat",
-      "summary": "llama.cpp for GGUF. Hugging Face safetensors directories go in ~/Models/hf.",
+      "summary": "llama.cpp for GGUF. Hugging Face safetensors directories go in ~/AI models/hf.",
       "default": true,
       "always": false,
       "requires": ["ubuntuai-core"],
@@ -141,7 +141,7 @@
       "needs_any_backend": [],
       "hide_unless_backend": [],
       "ports": [],
-      "notes": "Installs whisper-cli from Ubuntu and fetches ggml-base.en.bin into ~/Models/whisper if no whisper model is found."
+      "notes": "Installs whisper-cli from Ubuntu and fetches ggml-base.en.bin into ~/AI models/whisper if no whisper model is found."
     },
     {
       "id": "ubuntuai-image",

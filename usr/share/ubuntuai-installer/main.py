@@ -17,6 +17,7 @@ from configstore import remove_scan_folder
 from configstore import record_installed
 from configstore import save as save_config
 from configstore import saved_scan_folders
+from paths import DEFAULT_MODEL_DIRNAME
 from probe import probe
 from users import guess_user, target_for
 from validate import collect, format_checks, worst
@@ -372,7 +373,10 @@ def cmd_config_set(
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ubuntuai-installer",
-        description="Add local-AI workstation packages to this Ubuntu flavor.",
+        description=(
+            "Add local-AI workstation packages to this Ubuntu flavor. "
+            f"A new install uses ~/{DEFAULT_MODEL_DIRNAME} as the model folder."
+        ),
     )
     p.add_argument(
         "--user",
@@ -556,7 +560,13 @@ def config_main(argv: list[str] | None = None) -> int:
         help="plain-language view of installed apps and health",
     )
     p.add_argument("--bind", choices=("127.0.0.1", "0.0.0.0"))
-    p.add_argument("--model-root")
+    p.add_argument(
+        "--model-root",
+        help=(
+            "model folder. a saved folder is kept. "
+            f"a new install uses ~/{DEFAULT_MODEL_DIRNAME}"
+        ),
+    )
     p.add_argument("--chat-model")
     p.add_argument("--backend")
     p.add_argument("--tts")

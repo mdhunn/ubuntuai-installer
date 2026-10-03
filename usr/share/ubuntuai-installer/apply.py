@@ -594,6 +594,26 @@ def _write_user_config(target: UserTarget, model_root: Path) -> None:
     os.chown(cfg.parent, target.uid, target.gid)
 
 
+def quote_desktop_exec(argv: list[str]) -> str:
+    """Exec value per the desktop entry spec. A space stays inside quotes."""
+    return " ".join(_quote_desktop_arg(word) for word in argv)
+
+
+def _quote_desktop_arg(arg: str) -> str:
+    # % is a field code. A literal percent is %%.
+    text = arg.replace("%", "%%")
+    reserved = set(" \t\n\"'\\><~|&;$*?#()`")
+    if not any(ch in reserved for ch in text):
+        return text
+    out = ['"']
+    for ch in text:
+        if ch in {'"', "\\", "`", "$"}:
+            out.append("\\")
+        out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
 def write_core_files(user: str, model_root: str, bind: str) -> None:
     """Called as root from the helper."""
     _assert_user(user)

@@ -11,7 +11,7 @@ import urllib.request
 from pathlib import Path
 
 from domain import Hardware, UserTarget
-from paths import VENDORS_FILE
+from paths import DEFAULT_MODEL_DIRNAME, VENDORS_FILE
 from weights import UA, hash_file, human_bytes, lookup_published_hash
 
 WRAPPER = """#!/bin/sh
@@ -22,7 +22,7 @@ exec "$DIR/{binary}" "$@"
 
 LAUNCHER = """#!/bin/sh
 DIR="{libdir}"
-MODELS="${{UBUNTUAI_MODELS:-$HOME/Models}}/openmoss"
+MODELS="${{UBUNTUAI_MODELS:-$HOME/{models_dir}}}/openmoss"
 MODEL=""
 for f in "$MODELS"/moss-tts-local*.gguf "$MODELS"/*.gguf; do
   case "$f" in
@@ -184,7 +184,11 @@ def install_vendor(
     if launcher:
         script = bindir / launcher
         script.write_text(
-            LAUNCHER.format(libdir=str(libdir), port=int(spec.get("port") or 8081)),
+            LAUNCHER.format(
+                libdir=str(libdir),
+                port=int(spec.get("port") or 8081),
+                models_dir=DEFAULT_MODEL_DIRNAME,
+            ),
             encoding="utf-8",
         )
         os.chmod(script, 0o755)

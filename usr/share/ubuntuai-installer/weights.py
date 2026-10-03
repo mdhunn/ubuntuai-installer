@@ -14,7 +14,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from domain import CatalogWeight, FileHash, FoundWeight, UserTarget
-from paths import WEIGHTS_FILE
+from paths import DEFAULT_MODEL_DIRNAME, LEGACY_MODEL_DIRNAME, WEIGHTS_FILE
 
 MIN_BYTES = 64 * 1024
 SKIP_NAMES = {"desktop.ini", "thumbs.db", ".ds_store"}
@@ -552,7 +552,8 @@ def _dir_size(path: Path) -> int:
 
 def builtin_scan_roots(home: Path, model_root: Path) -> tuple[Path, ...]:
     return (
-        home / "AI models",
+        home / DEFAULT_MODEL_DIRNAME,
+        home / LEGACY_MODEL_DIRNAME,
         home / "Downloads",
         home / ".cache" / "huggingface" / "hub",
         home / "Projects" / "AI Apps" / "ComfyUI" / "models",
