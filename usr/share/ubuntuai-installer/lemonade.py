@@ -4,14 +4,15 @@ The snap cannot follow symlinks and cannot read /home as
 extra_models_dir. Bind the real trees into SNAP_LEMONADE_MODELS and set
 extra_models_dir to that snap-common path.
 
-Chat trees land at dest/chat/srcN. A mixed model folder is not one bind.
-Each chat-only directory is its own source. Embedding GGUFs also bind at
-dest/embeddings. Lemonade labels a GGUF from the first directory under
-extra_models_dir. A chat source that contains an embeddings folder would
-still show those files as chat, so an empty read-only tmpfs covers that
-folder. The cover sits on a private staging bind under /var/lib/ubuntuai.
-A source with no embeddings folder stays a direct bind. A cover on the
-shared dest mount would propagate back onto the user's embeddings folder.
+A mixed model folder is not one bind. A chat-only directory is mounted
+at dest/chat/<folder name>. A chat GGUF in a mixed folder, or loose in
+the model folder, is a file bind at dest/chat/<file stem>. Lemonade
+labels a model from that directory name. Embedding GGUFs also bind at
+dest/embeddings. A chat directory that contains an embeddings folder
+gets an empty read-only tmpfs on a private staging bind under
+/var/lib/ubuntuai. A source with no embeddings folder stays a direct
+bind. A cover on the shared dest mount would propagate back onto the
+user's embeddings folder.
 
 Apply runs helper verb lemonade-publish after weights. That verb calls
 publish(target_for(USER)). CLI --publish-lemonade is the same verb.
@@ -42,7 +43,14 @@ from paths import (
     is_home_path,
     lemonade_extra_models_dir,
 )
-from weights import UA, gguf_publish_role, human_bytes, is_foreign_mount, read_gguf_info
+from weights import (
+    UA,
+    SHARD_RE,
+    gguf_publish_role,
+    human_bytes,
+    is_foreign_mount,
+    read_gguf_info,
+)
 
 SNAP_COMMON = SNAP_LEMONADE_COMMON
 SNAP_EXTRA = SNAP_LEMONADE_MODELS
@@ -120,16 +128,21 @@ def gguf_sources(target: UserTarget) -> tuple[Path, ...]:
 
 
 def bind_mounts(sources: tuple[Path, ...], dest: Path) -> tuple[BindMount, ...]:
-    """Map real trees onto dest/chat/srcN. Nested sources bind once via the outer tree.
+    """Map each chat directory onto dest/chat/<folder name>.
 
-    One source uses src0 too. A later tree must not move an existing vulkan_bin
-    off dest/chat/src0, and a single tree must not land on dest itself.
+    The folder name is the Lemonade model id. Two directories with the
+    same name get a stable numeric suffix. Nested sources bind once via
+    the outer tree. One source does not land on dest itself.
     """
     sources = _collapse(sources)
     if not sources:
         return ()
+    names = _assign_chat_names(
+        [(source.name, str(_resolve(source))) for source in sources]
+    )
     return tuple(
-        BindMount(src, dest / "chat" / f"src{i}") for i, src in enumerate(sources)
+        BindMount(_resolve(source), dest / "chat" / names[str(_resolve(source))])
+        for source in sources
     )
 
 
@@ -151,32 +164,37 @@ def embeddings_cover(
 ) -> BindMount | None:
     """Empty tmpfs over embeddings on the private stage, not on the user's tree.
 
-    The cover follows the srcN whose source is model_root, and only when that
-    folder contains an embeddings tree. A symlink is skipped. tmpfs on that
-    path would follow the link and hide the real folder for the whole host.
-    The cover is also not placed on dest/chat/srcN. That dest lives on shared
-    /var, and a shared bind of a /home tree would copy the cover back onto
-    the source.
+    The stage slot follows the covered source whose files are model_root.
+    A symlink is skipped. tmpfs on that path would follow the link and hide
+    the real folder for the whole host. The cover is not placed on the
+    snap dest. That dest lives on shared /var, and a shared bind of a
+    /home tree would copy the cover back onto the source.
     """
     if not _source_needs_cover(model_root):
         return None
     root = _resolve(model_root)
+    slot = 0
     for mount in mounts:
-        if _is_cover(mount) or _resolve(mount.what) != root:
+        if _is_cover(mount) or _is_file_what(mount.what):
             continue
-        if not _is_srcn(mount.where.name):
+        where = _resolve(mount.where)
+        if where == _stage_root() or _is_stage_src(where) or where.name == "embeddings":
             continue
-        where = _stage_src(mount.where.name) / "embeddings"
-        return BindMount(Path("tmpfs"), where, _mount_options(Path("tmpfs"), where))
+        if not _source_needs_cover(mount.what):
+            continue
+        if _resolve(mount.what) == root:
+            cover = _stage_src(f"src{slot}") / "embeddings"
+            return BindMount(Path("tmpfs"), cover, _mount_options(Path("tmpfs"), cover))
+        slot += 1
     return None
 
 
 def is_owned_lemonade_where(dest: Path, where: Path) -> bool:
-    """True for dest, dest/embeddings, dest/chat/srcN, or that srcN embeddings cover.
+    """True for dest, dest/embeddings, a chat model dir, a chat file bind, or stage.
 
     dest itself is a legacy single-source bind. Cleanup still recognizes it.
-    The private stage and a cover left on dest/chat/srcN/embeddings are owned
-    too, so a later publish can drop them.
+    dest/chat/srcN remains owned so an older layout can be removed. A file
+    bind ends in .gguf. Anything nested beside those paths is left alone.
     """
     if _is_owned_stage_where(where):
         return True
@@ -190,6 +208,8 @@ def is_owned_lemonade_where(dest: Path, where: Path) -> bool:
         return False
     if rel.parts == ("embeddings",):
         return True
+    if len(rel.parts) == 2 and rel.parts[0] == "chat" and rel.parts[1] not in {"", ".", ".."}:
+        return True
     if (
         len(rel.parts) == 3
         and rel.parts[0] == "chat"
@@ -197,7 +217,11 @@ def is_owned_lemonade_where(dest: Path, where: Path) -> bool:
         and rel.parts[2] == "embeddings"
     ):
         return True
-    return len(rel.parts) == 2 and rel.parts[0] == "chat" and _is_srcn(rel.parts[1])
+    return (
+        len(rel.parts) == 3
+        and rel.parts[0] == "chat"
+        and rel.parts[2].lower().endswith(".gguf")
+    )
 
 
 def leftover_owned_binds(
@@ -471,18 +495,19 @@ def _is_chat_source(root: Path) -> bool:
 
     Files under the top-level embeddings directory are hidden by the cover,
     so they do not count and they do not block. mmproj and clip companions
-    do not count and do not block. A diffusers tree is not a chat bind.
+    do not count and do not block. Later shards inherit shard 1. A diffusers
+    tree is not a chat bind.
     """
     if _contains_diffusers(root):
         return False
+    files = [path for path in _real_ggufs(root) if not _under_top_embeddings(path, root)]
+    if not files:
+        return False
     saw_chat = False
-    for path in _real_ggufs(root):
-        if _under_top_embeddings(path, root):
+    for group in _groups_under(files):
+        if group.role == "companion":
             continue
-        role = gguf_publish_role(path)
-        if role == "companion":
-            continue
-        if role != "chat":
+        if group.role != "chat":
             return False
         saw_chat = True
     return saw_chat
@@ -524,6 +549,224 @@ def _contains_diffusers(root: Path) -> bool:
         except OSError:
             continue
     return False
+
+
+@dataclass(frozen=True)
+class _GgufGroup:
+    directory: Path
+    stem: str
+    files: tuple[Path, ...]
+    role: str
+    primary: Path | None
+
+    @property
+    def key(self) -> str:
+        path = self.primary or self.files[0]
+        return str(_resolve(path))
+
+
+def _shard_parts(path: Path) -> tuple[str, int | None]:
+    match = SHARD_RE.search(path.name)
+    if match is None:
+        return path.stem, None
+    return path.name[: match.start()], int(match.group(1))
+
+
+def _split_no(path: Path) -> int | None:
+    info = read_gguf_info(path)
+    if info is None:
+        return None
+    return info.split_no
+
+
+def _is_companion_file(path: Path) -> bool:
+    if "mmproj" in path.name.lower():
+        return True
+    return gguf_publish_role(path) == "companion"
+
+
+def _shard_group_role(members: list[Path]) -> tuple[str, Path | None]:
+    """Role of shard 1. Later shards do not carry general.architecture."""
+    numbered: list[tuple[int, str, Path]] = []
+    for path in members:
+        number = _shard_parts(path)[1]
+        split = _split_no(path)
+        if split == 1 or number == 1:
+            numbered.append((0 if split == 1 else 1, str(_resolve(path)), path))
+    if not numbered:
+        for path in members:
+            info = read_gguf_info(path)
+            if info is None or not info.architecture:
+                continue
+            number = _shard_parts(path)[1]
+            if number is None:
+                number = _split_no(path) or 0
+            numbered.append((number, str(_resolve(path)), path))
+        if not numbered:
+            return "missing-shard", None
+    numbered.sort()
+    primary = numbered[0][2]
+    return gguf_publish_role(primary), primary
+
+
+def _with_file(group: _GgufGroup, path: Path) -> _GgufGroup:
+    files = tuple(sorted((*group.files, path), key=lambda item: item.name))
+    return _GgufGroup(group.directory, group.stem, files, group.role, group.primary)
+
+
+def _single_group(path: Path, role: str) -> _GgufGroup:
+    return _GgufGroup(path.parent, path.stem, (path,), role, path)
+
+
+def _best_companion_host(path: Path, groups: list[_GgufGroup]) -> _GgufGroup:
+    if len(groups) == 1:
+        return groups[0]
+    name = path.name.lower()
+    best = groups[0]
+    best_key: tuple[int, str] | None = None
+    for group in groups:
+        stem = group.stem.lower()
+        score = len(stem) if stem and stem in name else 0
+        key = (-score, group.key)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = group
+    return best
+
+
+def _groups_in_directory(files: list[Path]) -> tuple[_GgufGroup, ...]:
+    """One chat target per model. Shards and mmproj share that target."""
+    companions: list[Path] = []
+    buckets: dict[str, list[Path]] = {}
+    deferred: list[Path] = []
+    singles: list[Path] = []
+    ordered = sorted(files, key=lambda path: str(_resolve(path)))
+    for path in ordered:
+        if _is_companion_file(path):
+            companions.append(path)
+            continue
+        prefix, number = _shard_parts(path)
+        split = _split_no(path)
+        if number is not None:
+            buckets.setdefault(prefix, []).append(path)
+            continue
+        if split is not None and split > 0:
+            deferred.append(path)
+            continue
+        singles.append(path)
+    if len(buckets) == 1 and deferred:
+        only = next(iter(buckets))
+        buckets[only].extend(deferred)
+        deferred = []
+    groups: list[_GgufGroup] = []
+    for prefix, members in sorted(buckets.items()):
+        role, primary = _shard_group_role(members)
+        files_sorted = tuple(sorted(members, key=lambda item: item.name))
+        groups.append(
+            _GgufGroup(members[0].parent, prefix, files_sorted, role, primary)
+        )
+    for path in deferred:
+        role, primary = _shard_group_role([path])
+        groups.append(_GgufGroup(path.parent, path.stem, (path,), role, primary))
+    for path in singles:
+        groups.append(_single_group(path, gguf_publish_role(path)))
+    if not companions:
+        return tuple(groups)
+    chat_groups = [group for group in groups if group.role == "chat"]
+    if not chat_groups:
+        for path in companions:
+            groups.append(_single_group(path, "companion"))
+        return tuple(groups)
+    for path in companions:
+        host = _best_companion_host(path, chat_groups)
+        index = groups.index(host)
+        groups[index] = _with_file(host, path)
+        chat_groups = [group for group in groups if group.role == "chat"]
+    return tuple(groups)
+
+
+def _groups_under(files: list[Path]) -> tuple[_GgufGroup, ...]:
+    by_dir: dict[Path, list[Path]] = {}
+    for path in files:
+        by_dir.setdefault(_resolve(path.parent), []).append(path)
+    found: list[_GgufGroup] = []
+    for members in by_dir.values():
+        found.extend(_groups_in_directory(members))
+    return tuple(found)
+
+
+def _assign_chat_names(items: list[tuple[str, str]]) -> dict[str, str]:
+    """Map a stable key to a Lemonade directory name.
+
+    Sort by the key, not by discovery order. The first claimant keeps the
+    bare name. Later claimants of that name get name-2, name-3, and so on.
+    """
+    used: set[str] = set()
+    assigned: dict[str, str] = {}
+    for desired, key in sorted(items, key=lambda item: item[1]):
+        base = desired.strip()
+        if not base or base in {".", ".."} or "/" in base or "\\" in base:
+            base = "chat-model"
+        if base not in used:
+            chosen = base
+        else:
+            number = 2
+            while f"{base}-{number}" in used:
+                number += 1
+            chosen = f"{base}-{number}"
+        used.add(chosen)
+        assigned[key] = chosen
+    return assigned
+
+
+def _chat_file_groups(
+    target: UserTarget, sources: tuple[Path, ...]
+) -> tuple[_GgufGroup, ...]:
+    """Chat files that are not already inside a published chat directory."""
+    try:
+        root_embeddings = (target.model_root / "embeddings").resolve()
+    except OSError:
+        root_embeddings = target.model_root / "embeddings"
+    loose: list[Path] = []
+    for path in _candidate_ggufs(target):
+        if _under_dir(path, root_embeddings):
+            continue
+        if _published_source(path, sources) is not None:
+            continue
+        parent = _resolve(path.parent)
+        if _too_wide(parent, target.home) or is_foreign_mount(parent):
+            continue
+        loose.append(path)
+    found = [group for group in _groups_under(loose) if group.role == "chat"]
+    found.sort(key=lambda group: group.key)
+    return tuple(found)
+
+
+def _loose_groups(target: UserTarget, sources: tuple[Path, ...]) -> dict[Path, _GgufGroup]:
+    try:
+        root_embeddings = (target.model_root / "embeddings").resolve()
+    except OSError:
+        root_embeddings = target.model_root / "embeddings"
+    loose: list[Path] = []
+    for path in _candidate_ggufs(target):
+        if _under_dir(path, root_embeddings):
+            continue
+        if _published_source(path, sources) is not None:
+            continue
+        loose.append(path)
+    index: dict[Path, _GgufGroup] = {}
+    for group in _groups_under(loose):
+        for path in group.files:
+            index[_resolve(path)] = group
+    return index
+
+
+def _has_gguf_magic(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(4) == b"GGUF"
+    except OSError:
+        return False
 
 
 def _source_needs_cover(source: Path) -> bool:
@@ -581,13 +824,15 @@ def _published_source(path: Path, sources: tuple[Path, ...]) -> Path | None:
     return None
 
 
-def _left_out_reason(path: Path, *, covered: bool) -> str:
+def _left_out_reason(path: Path, *, covered: bool, group_role: str | None = None) -> str:
     if covered:
         return (
             "It is in an embeddings folder that is hidden from chat. "
             "It is not the embeddings folder Lemonade is given."
         )
-    role = gguf_publish_role(path)
+    if group_role == "missing-shard":
+        return "It is a later shard and shard 1 is missing."
+    role = group_role or gguf_publish_role(path)
     info = read_gguf_info(path)
     arch = info.architecture if info is not None and info.architecture else "unknown"
     if role == "tts":
@@ -606,6 +851,8 @@ def _left_out_reason(path: Path, *, covered: bool) -> str:
             "Lemonade is not given a reranking folder from this header."
         )
     if role == "truncated":
+        if not _has_gguf_magic(path):
+            return "It is not a GGUF file. It is not a chat ggml model."
         return "The GGUF header is unreadable."
     if role == "companion":
         return "It is a vision companion with no chat model beside it."
@@ -614,32 +861,61 @@ def _left_out_reason(path: Path, *, covered: bool) -> str:
             "It shares a folder with a file that is not chat, "
             "so that folder is not published."
         )
-    return f"The architecture is {arch}. It is not a chat model."
+    return f"The architecture is {arch}. It is not recognised as chat by this version."
 
 
 def left_out_lines(target: UserTarget) -> tuple[str, ...]:
     """Plain-English lines for every GGUF that publish does not expose.
 
-    Files inside a published chat tree stay quiet. Files inside
-    model_root/embeddings stay quiet because dest/embeddings still binds
-    that folder. A covered embeddings tree on some other chat source is named.
+    Files inside a published chat tree stay quiet. A chat file kept as its
+    own file bind stays quiet too. Files inside model_root/embeddings stay
+    quiet because dest/embeddings still binds that folder. A covered
+    embeddings tree on some other chat source is named.
     """
     sources = gguf_sources(target)
+    published = {
+        _resolve(path)
+        for group in _chat_file_groups(target, sources)
+        for path in group.files
+    }
+    reasons = _loose_groups(target, sources)
     try:
         root_embeddings = (target.model_root / "embeddings").resolve()
     except OSError:
         root_embeddings = target.model_root / "embeddings"
     lines: list[str] = []
+    seen: set[Path] = set()
     for path in _candidate_ggufs(target):
+        resolved = _resolve(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
         if _under_dir(path, root_embeddings):
             continue
         container = _published_source(path, sources)
         covered = container is not None and _under_top_embeddings(path, container)
         if container is not None and not covered:
             continue
-        reason = _left_out_reason(path, covered=covered)
-        lines.append(f"Left out {path}. {reason}")
+        if resolved in published and not covered:
+            continue
+        group = reasons.get(resolved)
+        described = path
+        group_role = None if group is None else group.role
+        if (
+            group is not None
+            and group.primary is not None
+            and group_role not in {"missing-shard", "companion"}
+        ):
+            described = group.primary
+        reason = _left_out_reason(described, covered=covered, group_role=group_role)
+        lines.append(f"Left out {resolved}. {reason}")
     return tuple(lines)
+
+
+def _emit_left_out(lines: tuple[str, ...]) -> None:
+    # Helper stdout is the progress channel. The same lines stay in the result.
+    for line in lines:
+        print(line, flush=True)
 
 
 def _lift(real_file: Path, search_root: Path, target: UserTarget) -> Path:
@@ -735,6 +1011,13 @@ def _is_srcn(name: str) -> bool:
 
 def _is_cover(mount: BindMount) -> bool:
     return mount.what == Path("tmpfs")
+
+
+def _is_file_what(what: Path) -> bool:
+    try:
+        return what.is_file() and not what.is_symlink()
+    except OSError:
+        return False
 
 
 def _stage_root() -> Path:
@@ -881,6 +1164,7 @@ def _drop_obsolete_owned_binds(
     )
     for where in leftovers:
         _drop_bind_unit(where, dest)
+    _remove_empty_stage_dirs(plan)
     return leftovers
 
 
@@ -977,8 +1261,10 @@ def _bind_dest(where: Path) -> Path:
         and where.parent.parent.name == "chat"
     ):
         return where.parent.parent.parent
-    if _is_srcn(where.name) and where.parent.name == "chat":
+    if where.parent.name == "chat":
         return where.parent.parent
+    if where.parent.parent.name == "chat" and where.name.lower().endswith(".gguf"):
+        return where.parent.parent.parent
     if where.name == "embeddings":
         return where.parent
     return where
@@ -1148,6 +1434,45 @@ def _mkdir_nofollow(path: Path) -> None:
             os.close(parent_fd)
 
 
+def _prepare_file_mountpoint(where: Path) -> None:
+    """Create an empty file under the snap dest. The user's tree is not touched.
+
+    mount(8) needs a regular file as the target of a file bind. A symlink
+    is refused. Publish never creates a symlink.
+    """
+    _mkdir_nofollow(where.parent)
+    parent = where.parent
+    try:
+        parent_fd = os.open(
+            parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            f"A folder on the way to {where} is a symlink. "
+            "Publish stopped so your files stay where they are."
+        ) from exc
+    try:
+        try:
+            st = os.lstat(where.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            fd = os.open(
+                where.name,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o644,
+                dir_fd=parent_fd,
+            )
+            os.close(fd)
+            return
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(
+                f"The mount point {where} is not a regular file. "
+                "Publish stopped so your files stay where they are."
+            )
+    finally:
+        os.close(parent_fd)
+
+
 _action_notes: list[str] = []
 _before_units: dict[Path, tuple[str, ...]] = {}
 _after_units: dict[Path, tuple[str, ...]] = {}
@@ -1284,7 +1609,10 @@ def apply_propagation(mounts: tuple[BindMount, ...]) -> None:
         if not _is_cover(mount):
             if _resolve(mount.where) == _stage_root():
                 _prepare_stage_dir()
-            _mkdir_nofollow(mount.where)
+            if _is_file_what(mount.what):
+                _prepare_file_mountpoint(mount.where)
+            else:
+                _mkdir_nofollow(mount.where)
         elif not mount.where.is_dir():
             raise RuntimeError(
                 f"The embeddings cover has no folder at {mount.where}. "
@@ -1853,7 +2181,10 @@ def _write_bind_unit(what: Path, where: Path) -> str:
         ancestor = _owned_ancestor_mount(where, dest)
         if ancestor is not None:
             raise RuntimeError(_still_mounted_message(ancestor))
-    _mkdir_nofollow(where)
+    if _is_file_what(what):
+        _prepare_file_mountpoint(where)
+    else:
+        _mkdir_nofollow(where)
     unit = _escape_mount(where)
     options = _mount_options(what, where)
     before = (*_before_units.get(_resolve(where), ()), "snap.lemonade-server.daemon.service")
@@ -1904,29 +2235,52 @@ def _write_cover_unit(where: Path, parent_unit: str) -> str:
     return unit
 
 
+def _directory_and_file_mounts(
+    target: UserTarget, dest: Path, sources: tuple[Path, ...]
+) -> tuple[tuple[BindMount, ...], tuple[BindMount, ...]]:
+    sources = _collapse(sources)
+    groups = _chat_file_groups(target, sources)
+    names = _assign_chat_names(
+        [(source.name, str(_resolve(source))) for source in sources]
+        + [(group.stem, group.key) for group in groups]
+    )
+    directories = tuple(
+        BindMount(_resolve(source), dest / "chat" / names[str(_resolve(source))])
+        for source in sources
+    )
+    files: list[BindMount] = []
+    for group in groups:
+        folder = dest / "chat" / names[group.key]
+        for path in group.files:
+            files.append(BindMount(_resolve(path), folder / path.name))
+    return directories, tuple(files)
+
+
 def _snap_mount_plan(
     target: UserTarget, dest: Path, sources: tuple[Path, ...]
 ) -> tuple[BindMount, ...]:
-    mounts = list(bind_mounts(sources, dest))
-    covers: dict[str, BindMount] = {}
-    for mount in mounts:
+    directories, files = _directory_and_file_mounts(target, dest, sources)
+    mounts = list(directories)
+    covers: dict[int, BindMount] = {}
+    slot = 0
+    for index, mount in enumerate(mounts):
         if not _source_needs_cover(mount.what):
             continue
-        where = _stage_src(mount.where.name) / "embeddings"
-        covers[mount.where.name] = BindMount(
-            Path("tmpfs"), where, _mount_options(Path("tmpfs"), where)
-        )
+        where = _stage_src(f"src{slot}") / "embeddings"
+        slot += 1
+        covers[index] = BindMount(Path("tmpfs"), where, _mount_options(Path("tmpfs"), where))
     emb = embeddings_mount(target, dest)
     if not covers:
         ordered = list(mounts)
         if emb is not None:
             ordered.append(emb)
+        ordered.extend(files)
         return tuple(ordered)
     stage = _stage_root()
     ordered = [BindMount(stage, stage, _mount_options(stage, stage))]
     emb_done = False
-    for mount in mounts:
-        cover = covers.get(mount.where.name)
+    for index, mount in enumerate(mounts):
+        cover = covers.get(index)
         if cover is None:
             ordered.append(mount)
             continue
@@ -1943,7 +2297,64 @@ def _snap_mount_plan(
         )
     if emb is not None and not emb_done:
         ordered.append(emb)
+    ordered.extend(files)
     return tuple(ordered)
+
+
+def _cover_path_is_ours(where: Path) -> bool:
+    where = _resolve(where)
+    if _is_owned_stage_where(where):
+        return True
+    return where.name == "embeddings" and where.parent.parent.name == "chat"
+
+
+def _snapshot_cover_mounts() -> tuple[BindMount, ...]:
+    """Cover mounts that are up now. systemd stop drops the carried copy."""
+    found: list[BindMount] = []
+    for row in _mount_rows():
+        if not _is_cover_signature(row) or not _cover_path_is_ours(row.mountpoint):
+            continue
+        where = row.mountpoint
+        found.append(BindMount(Path("tmpfs"), where, _mount_options(Path("tmpfs"), where)))
+    return tuple(found)
+
+
+def _restore_cover_mounts(covers: tuple[BindMount, ...]) -> None:
+    for cover in covers:
+        if _is_mountpoint(cover.where):
+            continue
+        try:
+            if not cover.where.parent.is_dir():
+                continue
+        except OSError:
+            continue
+        _run(list(propagation_command(cover)))
+
+
+def _remove_empty_stage_dirs(plan: tuple[BindMount, ...]) -> None:
+    root = _stage_root()
+    try:
+        if not root.is_dir() or root.is_symlink():
+            return
+        children = list(root.iterdir())
+    except OSError:
+        return
+    planned = {_resolve(mount.where) for mount in plan}
+    for child in children:
+        try:
+            if child.is_symlink() or not child.is_dir() or not _is_srcn(child.name):
+                continue
+            if _resolve(child) in planned or _is_mountpoint(child):
+                continue
+            emb = child / "embeddings"
+            if not emb.is_symlink() and emb.is_dir() and not _is_mountpoint(emb):
+                try:
+                    emb.rmdir()
+                except OSError:
+                    pass
+            child.rmdir()
+        except OSError:
+            continue
 
 
 def _apply_snap_mounts(
@@ -1953,6 +2364,7 @@ def _apply_snap_mounts(
     on_ready: Callable[[], None] | None = None,
 ) -> str:
     was_running = _daemon_was_running()
+    covers = _snapshot_cover_mounts() if was_running else ()
     label = ""
     started = False
     try:
@@ -1984,6 +2396,7 @@ def _apply_snap_mounts(
         if started and not was_running:
             _stop_daemon()
         elif was_running and not started:
+            _restore_cover_mounts(covers)
             _start_daemon()
     return label
 
@@ -2058,10 +2471,44 @@ def model_gguf_bytes(path: Path) -> int:
     return 0
 
 
+def _visible_tree_count(mounts: tuple[BindMount, ...]) -> int:
+    seen: set[Path] = set()
+    count = 0
+    for mount in mounts:
+        if _is_cover(mount):
+            continue
+        where = _resolve(mount.where)
+        if where == _stage_root() or _is_stage_src(where):
+            continue
+        key = where.parent if _is_file_what(mount.what) else where
+        if key in seen:
+            continue
+        seen.add(key)
+        count += 1
+    return count
+
+
 def largest_gguf_bytes(target: UserTarget) -> int:
     biggest = 0
-    for root in gguf_sources(target):
+    sources = gguf_sources(target)
+    for root in sources:
         biggest = max(biggest, gguf_tree_bytes(root))
+    for group in _chat_file_groups(target, sources):
+        total = 0
+        best = 0
+        sharded = False
+        for path in group.files:
+            if "mmproj" in path.name.lower():
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            best = max(best, size)
+            if _shard_parts(path)[1] is not None:
+                sharded = True
+                total += size
+        biggest = max(biggest, total if sharded else best)
     return biggest
 
 
@@ -2909,6 +3356,7 @@ def publish(target: UserTarget) -> str:
             _note(repair)
         mounts = _snap_mount_plan(target, dest, sources)
         omitted = left_out_lines(target)
+        _emit_left_out(omitted)
         if not mounts:
             prefix = "no real GGUF files to publish (Lemonade cannot follow store symlinks)"
             parts = [prefix, *omitted, *_action_notes]
@@ -2923,7 +3371,7 @@ def publish(target: UserTarget) -> str:
                 tuning.append(text)
 
         unit = _apply_snap_mounts(dest, mounts, on_ready=_ready)
-        visible = sum(1 for mount in mounts if _counts_as_tree(mount))
+        visible = _visible_tree_count(mounts)
         if visible == 1:
             prefix = f"lemonade extra_models_dir={dest} via {unit}"
         else:
@@ -2931,6 +3379,7 @@ def publish(target: UserTarget) -> str:
         parts = [prefix, *tuning, *_action_notes, *omitted]
         return "\n".join(part for part in parts if part)
     omitted = left_out_lines(target)
+    _emit_left_out(omitted)
     if not sources:
         prefix = "no real GGUF files to publish (Lemonade cannot follow store symlinks)"
         parts = [prefix, *omitted]

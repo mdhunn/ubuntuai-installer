@@ -549,6 +549,7 @@ class GgufInfo:
     architecture: str | None
     model_type: str | None
     pooling: int | None
+    split_no: int | None = None
 
 
 def gguf_architecture_header(
@@ -579,6 +580,44 @@ def gguf_architecture_header(
     return b"".join(parts)
 
 
+def gguf_split_header(split_no: int, split_count: int) -> bytes:
+    """Shard header with split.no and split.count and no architecture."""
+    parts = [b"GGUF", struct.pack("<I", 3), struct.pack("<Q", 0), struct.pack("<Q", 2)]
+    for key, value in (("split.no", split_no), ("split.count", split_count)):
+        key_b = key.encode("utf-8")
+        parts.append(struct.pack("<Q", len(key_b)))
+        parts.append(key_b)
+        parts.append(struct.pack("<I", 4))
+        parts.append(struct.pack("<I", value))
+    return b"".join(parts)
+
+
+def _clean_gguf_text(text: str) -> str | None:
+    """Drop escapes and control bytes before a header string is stored or logged."""
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        if ch == "\x1b":
+            index += 1
+            if index < len(text) and text[index] == "[":
+                index += 1
+                while index < len(text) and not (text[index].isalpha() or text[index] in "@`}"):
+                    index += 1
+                if index < len(text):
+                    index += 1
+            continue
+        if ord(ch) < 32 or ord(ch) == 127:
+            index += 1
+            continue
+        out.append(ch)
+        index += 1
+    cleaned = "".join(out).strip()
+    if len(cleaned) > 64:
+        cleaned = cleaned[:64]
+    return cleaned or None
+
+
 def _gguf_string(blob: bytes, off: int) -> tuple[str | None, int | None]:
     if off + 8 > len(blob):
         return None, None
@@ -593,7 +632,13 @@ def _gguf_string(blob: bytes, off: int) -> tuple[str | None, int | None]:
     return text, off + n
 
 
-def _gguf_skip(blob: bytes, off: int, vtype: int) -> int | None:
+_GGUF_MAX_DEPTH = 64
+
+
+def _gguf_skip(blob: bytes, off: int, vtype: int, depth: int = 0) -> int | None:
+    # A few thousand nested arrays is a valid header shape and blows the stack.
+    if depth > _GGUF_MAX_DEPTH:
+        return None
     if vtype == _GGUF_STRING:
         _, nxt = _gguf_string(blob, off)
         return nxt
@@ -606,7 +651,7 @@ def _gguf_skip(blob: bytes, off: int, vtype: int) -> int | None:
         if count > 1_000_000:
             return None
         for _ in range(count):
-            nxt = _gguf_skip(blob, off, et)
+            nxt = _gguf_skip(blob, off, et, depth + 1)
             if nxt is None:
                 return None
             off = nxt
@@ -640,6 +685,7 @@ def read_gguf_info(path: Path) -> GgufInfo | None:
     architecture: str | None = None
     model_type: str | None = None
     pooling: int | None = None
+    split_no: int | None = None
     for _ in range(n_kv):
         key, off = _gguf_string(blob, off)
         if key is None or off is None or off + 4 > len(blob):
@@ -650,13 +696,17 @@ def read_gguf_info(path: Path) -> GgufInfo | None:
             value, off = _gguf_string(blob, off)
             if value is None or off is None:
                 break
-            architecture = value.strip().lower() or None
+            architecture = _clean_gguf_text(value.lower())
             continue
         if key == "general.type" and vtype == _GGUF_STRING:
             value, off = _gguf_string(blob, off)
             if value is None or off is None:
                 break
-            model_type = value.strip().lower() or None
+            model_type = _clean_gguf_text(value.lower())
+            continue
+        if key == "split.no" and vtype == 4 and off + 4 <= len(blob):
+            split_no = struct.unpack_from("<I", blob, off)[0]
+            off += 4
             continue
         if (
             architecture
@@ -671,11 +721,9 @@ def read_gguf_info(path: Path) -> GgufInfo | None:
         if nxt is None:
             break
         off = nxt
-        if architecture and model_type is not None and pooling is not None:
-            break
-    if not architecture:
+    if architecture is None and split_no is None:
         return None
-    return GgufInfo(architecture, model_type, pooling)
+    return GgufInfo(architecture, model_type, pooling, split_no)
 
 
 def gguf_architecture(path: Path) -> str | None:

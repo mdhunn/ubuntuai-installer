@@ -46,7 +46,7 @@ def _observer_script() -> str:
             source = base / "AI models" / "embeddings"
             text = (
                 f"SLAVE_{tag}_SOURCE={listing(source)}\\n"
-                f"SLAVE_{tag}_COVER={listing(base / 'dest' / 'chat' / 'src0' / 'embeddings')}\\n"
+                f"SLAVE_{tag}_COVER={listing(base / 'dest' / 'chat' / 'AI models' / 'embeddings')}\\n"
                 f"SLAVE_{tag}_DESTEMB={listing(base / 'dest' / 'embeddings')}\\n"
                 f"SLAVE_{tag}_KEEP={keep_text(source)}\\n"
             )
@@ -195,7 +195,7 @@ def namespace_child() -> None:
             "    return file.read_bytes().decode()\n"
             "source = base / 'AI models' / 'embeddings'\n"
             f"print('FRESH_{tag}_SOURCE=' + listing(source))\n"
-            f"print('FRESH_{tag}_COVER=' + listing(base / 'dest' / 'chat' / 'src0' / 'embeddings'))\n"
+            f"print('FRESH_{tag}_COVER=' + listing(base / 'dest' / 'chat' / 'AI models' / 'embeddings'))\n"
             f"print('FRESH_{tag}_DESTEMB=' + listing(base / 'dest' / 'embeddings'))\n"
             f"print('FRESH_{tag}_KEEP=' + keep_text(source))\n"
         )
@@ -212,7 +212,7 @@ def namespace_child() -> None:
 
     def snapshot(tag: str) -> None:
         print(f"HOST_{tag}_SOURCE={listing(emb)}")
-        print(f"HOST_{tag}_COVER={listing(dest / 'chat' / 'src0' / 'embeddings')}")
+        print(f"HOST_{tag}_COVER={listing(dest / 'chat' / 'AI models' / 'embeddings')}")
         print(f"HOST_{tag}_DESTEMB={listing(dest / 'embeddings')}")
         print(f"HOST_{tag}_EMB_MOUNT={int(mounted(emb))}")
         print(f"HOST_{tag}_KEEP={keep_text(emb)}")
@@ -243,7 +243,7 @@ def namespace_child() -> None:
 
         print(f"EMB_ID={one_id(dest / 'embeddings')}")
         print(f"COVER_ID={one_id(lemonade.STAGE_DIR / 'src0' / 'embeddings')}")
-        print(f"DEST_COVER_ID={one_id(dest / 'chat' / 'src0' / 'embeddings')}")
+        print(f"DEST_COVER_ID={one_id(dest / 'chat' / 'AI models' / 'embeddings')}")
         source_text = real_run(
             ["findmnt", "-n", "-o", "SOURCE", str(dest / "embeddings")],
             check=False,
@@ -259,15 +259,15 @@ def namespace_child() -> None:
         ).stdout.strip()
         print(f"STAGE_SRC_PROP={prop}")
 
-        before = len(mount_ids(dest / "chat" / "src0"))
+        before = len(mount_ids(dest / "chat" / "AI models"))
         lemonade.publish(target)
-        after = len(mount_ids(dest / "chat" / "src0"))
+        after = len(mount_ids(dest / "chat" / "AI models"))
         print(f"P2_SRC0_BEFORE={before}")
         print(f"P2_SRC0_AFTER={after}")
         snapshot("p2")
 
         clear_plan(plan)
-        chat = dest / "chat" / "src0"
+        chat = dest / "chat" / "AI models"
         chat.mkdir(parents=True, exist_ok=True)
         mount_ok(["mount", "--bind", str(source), str(chat)])
         mount_ok(
@@ -694,7 +694,7 @@ def namespace_migrate_child() -> None:
     print(f"MIG_HOST_EMB={listing(emb)}")
     print(f"MIG_HOST_EMB_MOUNT={int(mounted(emb))}")
     print(f"MIG_DEST_EMB={listing(dest / 'embeddings')}")
-    print(f"MIG_CHAT={listing(dest / 'chat' / 'src0')}")
+    print(f"MIG_CHAT={listing(dest / 'chat' / 'gemma')}")
     print(f"MIG_VOICE_EXISTS={int(voice.is_file())}")
     print(f"MIG_GEMMA_EXISTS={int(gemma.is_file())}")
     print(f"MIG_STAGE_MOUNTED={int(mounted(stage))}")

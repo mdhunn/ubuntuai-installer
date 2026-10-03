@@ -333,7 +333,7 @@ class LemonadePublishTests(unittest.TestCase):
             dest = extra_dir("snap")
             self.assertEqual(
                 bind_mounts(src, dest),
-                (BindMount(extra.resolve(), dest / "chat" / "src0"),),
+                (BindMount(extra.resolve(), dest / "chat" / "AI models"),),
             )
 
     def test_ai_models_root_outside_gguf_is_one_source(self) -> None:
@@ -353,7 +353,7 @@ class LemonadePublishTests(unittest.TestCase):
             mounts = bind_mounts(first, dest)
             self.assertEqual(
                 mounts,
-                (BindMount(root.resolve(), dest / "chat" / "src0"),),
+                (BindMount(root.resolve(), dest / "chat" / "AI models"),),
             )
             self.assertEqual(bind_mounts(second, dest), mounts)
 
@@ -403,8 +403,8 @@ class LemonadePublishTests(unittest.TestCase):
             self.assertEqual(
                 tuple((m.what, m.where.name) for m in mounts),
                 (
-                    (other.resolve(), "src0"),
-                    (extra.resolve(), "src1"),
+                    (other.resolve(), "bucket"),
+                    (extra.resolve(), "AI models"),
                 ),
             )
             self.assertEqual(bind_mounts(gguf_sources(target), dest), mounts)
@@ -467,12 +467,12 @@ class LemonadePublishTests(unittest.TestCase):
             common.is_dir.return_value = True
             self.assertEqual(detect(), "snap")
 
-    def test_bind_mounts_single_source_uses_srcn(self) -> None:
+    def test_bind_mounts_single_source_uses_the_folder_name(self) -> None:
         dest = SNAP_LEMONADE_MODELS
         src = Path("/var/tmp/ai-models")
         self.assertEqual(
             bind_mounts((src,), dest),
-            (BindMount(src.resolve(), dest / "chat" / "src0"),),
+            (BindMount(src.resolve(), dest / "chat" / "ai-models"),),
         )
 
     def test_bind_mounts_many_sources_under_chat(self) -> None:
@@ -482,8 +482,8 @@ class LemonadePublishTests(unittest.TestCase):
         self.assertEqual(
             bind_mounts((a, b), dest),
             (
-                BindMount(a.resolve(), dest / "chat" / "src0"),
-                BindMount(b.resolve(), dest / "chat" / "src1"),
+                BindMount(a.resolve(), dest / "chat" / "a"),
+                BindMount(b.resolve(), dest / "chat" / "b"),
             ),
         )
 
@@ -496,7 +496,7 @@ class LemonadePublishTests(unittest.TestCase):
             nested.mkdir(parents=True)
             mounts = bind_mounts((extra, nested), dest)
             self.assertEqual(
-                mounts, (BindMount(extra.resolve(), dest / "chat" / "src0"),)
+                mounts, (BindMount(extra.resolve(), dest / "chat" / "AI models"),)
             )
             self.assertFalse(any(part == "src1" for m in mounts for part in m.where.parts))
 
@@ -510,10 +510,10 @@ class LemonadePublishTests(unittest.TestCase):
             models.symlink_to(extra)
             mounts = bind_mounts((extra, models / "gguf"), dest)
             self.assertEqual(
-                mounts, (BindMount(extra.resolve(), dest / "chat" / "src0"),)
+                mounts, (BindMount(extra.resolve(), dest / "chat" / "AI models"),)
             )
             self.assertEqual(len(mounts), 1)
-            self.assertEqual(mounts[0].where, dest / "chat" / "src0")
+            self.assertEqual(mounts[0].where, dest / "chat" / "AI models")
 
     def test_bind_mounts_sibling_trees_keep_srcn(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -526,8 +526,8 @@ class LemonadePublishTests(unittest.TestCase):
             self.assertEqual(
                 mounts,
                 (
-                    BindMount(extra.resolve(), dest / "chat" / "src0"),
-                    BindMount(store.resolve(), dest / "chat" / "src1"),
+                    BindMount(extra.resolve(), dest / "chat" / "AI models"),
+                    BindMount(store.resolve(), dest / "chat" / "gguf"),
                 ),
             )
 
@@ -648,7 +648,7 @@ class LemonadePublishTests(unittest.TestCase):
                 patch("lemonade.report_load_tuning", return_value=""),
             ):
                 msg = publish(_target(home))
-            self.assertEqual(binds, [(real.resolve(), dest / "chat" / "src0")])
+            self.assertEqual(binds, [(real.resolve(), dest / "chat" / "AI models")])
             self.assertEqual(extras, [dest])
             self.assertNotEqual(extras[0], real.resolve())
             self.assertTrue(str(extras[0]).endswith("ubuntuai-models"))
@@ -678,7 +678,7 @@ class LemonadePublishTests(unittest.TestCase):
                 patch("lemonade.report_load_tuning", return_value=""),
             ):
                 msg = publish(_target(home, extra=(extra,), model_root=store))
-            self.assertEqual(binds, [(extra.resolve(), dest / "chat" / "src0")])
+            self.assertEqual(binds, [(extra.resolve(), dest / "chat" / "AI models")])
             self.assertFalse(any("src1" in str(where) for _, where in binds))
             self.assertIn(str(dest), msg)
             self.assertNotIn("2 trees", msg)
@@ -710,8 +710,8 @@ class LemonadePublishTests(unittest.TestCase):
             self.assertEqual(
                 binds,
                 [
-                    (store.resolve(), dest / "chat" / "src0"),
-                    (extra.resolve(), dest / "chat" / "src1"),
+                    (store.resolve(), dest / "chat" / "gguf"),
+                    (extra.resolve(), dest / "chat" / "AI models"),
                 ],
             )
             self.assertIn("2 trees", msg)
@@ -745,8 +745,9 @@ class LemonadePublishTests(unittest.TestCase):
         self.assertTrue(is_owned_lemonade_where(dest, dest / "chat" / "src12"))
         self.assertFalse(is_owned_lemonade_where(dest, dest / "embeddings" / "nested"))
         self.assertFalse(is_owned_lemonade_where(dest, dest / "chat"))
-        self.assertFalse(is_owned_lemonade_where(dest, dest / "chat" / "src"))
-        self.assertFalse(is_owned_lemonade_where(dest, dest / "chat" / "custom"))
+        self.assertTrue(is_owned_lemonade_where(dest, dest / "chat" / "src"))
+        self.assertTrue(is_owned_lemonade_where(dest, dest / "chat" / "custom"))
+        self.assertTrue(is_owned_lemonade_where(dest, dest / "chat" / "custom" / "model.gguf"))
         self.assertFalse(is_owned_lemonade_where(dest, dest / "chat" / "src0" / "nested"))
         self.assertTrue(
             is_owned_lemonade_where(dest, dest / "chat" / "src0" / "embeddings")
@@ -778,14 +779,14 @@ class LemonadePublishTests(unittest.TestCase):
             _seed_unit(unit_dir, nested, src1, "src1.mount")
             plan = bind_mounts((extra, nested), dest)
             self.assertEqual(
-                plan, (BindMount(extra.resolve(), dest / "chat" / "src0"),)
+                plan, (BindMount(extra.resolve(), dest / "chat" / "AI models"),)
             )
             leftovers = leftover_owned_binds(
                 dest, plan, unit_dir=unit_dir, mounted=(src0, src1)
             )
-            self.assertEqual(leftovers, (src1.resolve(),))
+            self.assertEqual(leftovers, (src0.resolve(), src1.resolve()))
             self.assertNotIn(dest.resolve(), leftovers)
-            self.assertNotIn(src0.resolve(), leftovers)
+            self.assertNotIn((dest / "chat" / "AI models").resolve(), leftovers)
 
     def test_leftover_not_in_plan_goes_away(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -828,11 +829,16 @@ class LemonadePublishTests(unittest.TestCase):
             leftovers = leftover_owned_binds(
                 dest, plan, unit_dir=unit_dir, mounted=mounted
             )
-            self.assertEqual(leftovers, (src1.resolve(),))
+            self.assertEqual(leftovers, (custom.resolve(), src1.resolve()))
             owned = owned_bind_wheres(dest, unit_dir, mounted)
             self.assertNotIn(other.resolve(), owned)
             self.assertNotIn(foreign.resolve(), owned)
-            self.assertNotIn(custom.resolve(), owned)
+            self.assertIn(custom.resolve(), owned)
+            nested = dest / "chat" / "custom" / "nested"
+            self.assertNotIn(
+                nested.resolve(),
+                owned_bind_wheres(dest, unit_dir, mounted=(nested,)),
+            )
 
     def test_leftover_fallback_mount_without_unit(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -920,15 +926,18 @@ class LemonadePublishTests(unittest.TestCase):
                 patch("lemonade.report_load_tuning", return_value=""),
             ):
                 publish(_target(home, extra=(extra,), model_root=store))
-            self.assertEqual(binds, [(extra.resolve(), dest / "chat" / "src0")])
+            self.assertEqual(binds, [(extra.resolve(), dest / "chat" / "AI models")])
             self.assertEqual(
                 [path.resolve() for path in dropped],
-                [src1.resolve()],
+                [
+                    (dest / "chat" / "custom").resolve(),
+                    src0.resolve(),
+                    src1.resolve(),
+                ],
             )
             self.assertNotIn(dest.resolve(), {path.resolve() for path in dropped})
             self.assertNotIn(Path("/mnt/other"), dropped)
             self.assertFalse(any(path.name == "src9" for path in dropped))
-            self.assertFalse(any(path.name == "custom" for path in dropped))
 
     def test_publish_snap_keeps_sibling_srcn_drops_extra(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -940,11 +949,11 @@ class LemonadePublishTests(unittest.TestCase):
             dest = Path(tmp) / "snap-common" / "ubuntuai-models"
             unit_dir = Path(tmp) / "units"
             unit_dir.mkdir()
-            src0 = dest / "chat" / "src0"
-            src1 = dest / "chat" / "src1"
+            kept_store = dest / "chat" / "gguf"
+            kept_extra = dest / "chat" / "AI models"
             src2 = dest / "chat" / "src2"
-            _seed_unit(unit_dir, store, src0, "src0.mount")
-            _seed_unit(unit_dir, extra, src1, "src1.mount")
+            _seed_unit(unit_dir, store, kept_store, "gguf.mount")
+            _seed_unit(unit_dir, extra, kept_extra, "extra.mount")
             _seed_unit(unit_dir, home / "Downloads", src2, "src2.mount")
             dropped: list[Path] = []
 
@@ -955,7 +964,10 @@ class LemonadePublishTests(unittest.TestCase):
                 patch("lemonade.detect", return_value="snap"),
                 patch("lemonade.extra_dir", return_value=dest),
                 patch("lemonade.SYSTEM_UNIT_DIR", unit_dir),
-                patch("lemonade._mounted_wheres", return_value=(src0, src1, src2)),
+                patch(
+                    "lemonade._mounted_wheres",
+                    return_value=(kept_store, kept_extra, src2),
+                ),
                 patch("lemonade._drop_bind_unit", side_effect=record_drop),
                 patch("lemonade._write_bind_unit", return_value="unit.mount"),
                 patch("lemonade._set_extra_models_dir"),
@@ -965,8 +977,8 @@ class LemonadePublishTests(unittest.TestCase):
             ):
                 publish(_target(home, extra=(extra,), model_root=home / "Models"))
             self.assertEqual([path.resolve() for path in dropped], [src2.resolve()])
-            self.assertNotIn(src0.resolve(), {path.resolve() for path in dropped})
-            self.assertNotIn(src1.resolve(), {path.resolve() for path in dropped})
+            self.assertNotIn(kept_store.resolve(), {path.resolve() for path in dropped})
+            self.assertNotIn(kept_extra.resolve(), {path.resolve() for path in dropped})
 
     def test_publish_snap_drops_obsolete_dest_when_siblings(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1006,8 +1018,8 @@ class LemonadePublishTests(unittest.TestCase):
             self.assertEqual(
                 binds,
                 [
-                    (store.resolve(), dest / "chat" / "src0"),
-                    (extra.resolve(), dest / "chat" / "src1"),
+                    (store.resolve(), dest / "chat" / "gguf"),
+                    (extra.resolve(), dest / "chat" / "AI models"),
                 ],
             )
 
@@ -1078,7 +1090,7 @@ class LemonadePublishTests(unittest.TestCase):
                 patch("lemonade.report_load_tuning", return_value=""),
             ):
                 publish(_target(home))
-            self.assertEqual(binds, [(real.resolve(), dest / "chat" / "src0")])
+            self.assertEqual(binds, [(real.resolve(), dest / "chat" / "AI models")])
             self.assertEqual([path.resolve() for path in dropped], [dest.resolve()])
             self.assertTrue(is_owned_lemonade_where(dest, dest))
 
@@ -1141,7 +1153,7 @@ class LemonadePublishTests(unittest.TestCase):
                     (stage, stage),
                     (root.resolve(), stage / "src0"),
                     ((root / "embeddings").resolve(), dest / "embeddings"),
-                    (stage / "src0", dest / "chat" / "src0"),
+                    (stage / "src0", dest / "chat" / "AI models"),
                 ],
             )
             self.assertIn("2 trees", msg)
@@ -1150,7 +1162,7 @@ class LemonadePublishTests(unittest.TestCase):
                 [(stage / "src0" / "embeddings", "unit.mount")],
             )
             self.assertLess(order.index("bind:embeddings"), order.index("cover"))
-            self.assertLess(order.index("cover"), order.index("bind:src0", order.index("cover")))
+            self.assertLess(order.index("cover"), order.index("bind:AI models"))
             self.assertTrue(is_owned_lemonade_where(dest, dest / "embeddings"))
             self.assertTrue(is_owned_lemonade_where(dest, stage / "src0" / "embeddings"))
             cover = embeddings_cover(root, bind_mounts(gguf_sources(target), dest))
@@ -1162,7 +1174,7 @@ class LemonadePublishTests(unittest.TestCase):
                     "ro,nosuid,nodev,noexec,size=64k,mode=0555,nofail",
                 ),
             )
-            self.assertNotEqual(cover.where, dest / "chat" / "src0" / "embeddings")
+            self.assertNotEqual(cover.where, dest / "chat" / "AI models" / "embeddings")
 
     def test_embeddings_cover_unit_text_orders_after_parent(self) -> None:
         dest = SNAP_LEMONADE_MODELS
@@ -1230,7 +1242,7 @@ class LemonadePublishTests(unittest.TestCase):
             self.assertEqual(emb.what, (root / "embeddings").resolve())
             self.assertEqual(emb.where, dest / "embeddings")
             self.assertEqual(cover.where, STAGE_DIR.resolve() / "src0" / "embeddings")
-            self.assertEqual(direct.where, dest / "chat" / "src1")
+            self.assertEqual(direct.where, dest / "chat" / "other")
             self.assertEqual(direct.options, "bind,nofail")
             self.assertIn("bind,rprivate", stage_src.options)
             self.assertEqual(
@@ -1370,7 +1382,10 @@ class LemonadePublishTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     publish(_target(home))
                 msg = publish(_target(home))
-            self.assertEqual(binds, [dest / "chat" / "src0", dest / "chat" / "src0"])
+            self.assertEqual(
+                binds,
+                [dest / "chat" / "AI models", dest / "chat" / "AI models"],
+            )
             self.assertEqual(events, ["set", "tune"])
             self.assertIn("load settings updated", msg)
 
@@ -1632,10 +1647,10 @@ class LemonadePublishTests(unittest.TestCase):
             dest = Path(tmp) / "snap-common" / "ubuntuai-models"
             unit_dir = Path(tmp) / "units"
             unit_dir.mkdir()
-            src0 = dest / "chat" / "src0"
+            chat = dest / "chat" / "AI models"
             old = home / "Models" / "lemonade" / "chat"
-            _seed_unit(unit_dir, old, src0, "src0.mount")
-            mounted = {src0.resolve()}
+            _seed_unit(unit_dir, old, chat, "src0.mount")
+            mounted = {chat.resolve()}
             events: list[str] = []
             binds: list[tuple[Path, Path]] = []
 
@@ -1679,7 +1694,7 @@ class LemonadePublishTests(unittest.TestCase):
                 patch("lemonade.report_load_tuning", return_value=""),
             ):
                 publish(_target(home, extra=(), model_root=root))
-            self.assertEqual(binds, [(root.resolve(), src0)])
+            self.assertEqual(binds, [(root.resolve(), chat)])
             self.assertLess(events.index("stop-daemon"), events.index("umount"))
             self.assertLess(events.index("stop-unit"), events.index("umount"))
             self.assertLess(events.index("umount"), events.index("rewrite"))
@@ -2073,7 +2088,7 @@ class LemonadePublishTests(unittest.TestCase):
                 patch("lemonade.report_load_tuning", return_value=""),
             ):
                 publish(target)
-            self.assertEqual(binds, [(root.resolve(), dest / "chat" / "src0")])
+            self.assertEqual(binds, [(root.resolve(), dest / "chat" / "AI models")])
 
     def test_foreign_embeddings_are_not_bound(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2202,7 +2217,8 @@ class LemonadePublishTests(unittest.TestCase):
             unit_dir.mkdir()
             backup = Path(tmp) / "backups"
             stage = STAGE_DIR.resolve()
-            dest_cover = dest / "chat" / "src0" / "embeddings"
+            chat = dest / "chat" / "AI models"
+            dest_cover = chat / "embeddings"
             stage_cover = stage / "src0" / "embeddings"
             carried = "\n".join(
                 (
@@ -2212,9 +2228,10 @@ class LemonadePublishTests(unittest.TestCase):
                         f"12 11 0:46 / {stage_cover} ro,nosuid,nodev,noexec shared:5 - "
                         "tmpfs tmpfs ro,size=64k,mode=555"
                     ),
-                    f"13 1 0:1 / {dest / 'chat' / 'src0'} rw - ext4 /dev/sda1 rw",
+                    f"13 1 0:1 / {str(chat).replace(' ', '\\040')} rw - ext4 /dev/sda1 rw",
                     (
-                        f"14 13 0:46 / {dest_cover} ro,nosuid,nodev,noexec master:5 - "
+                        f"14 13 0:46 / {str(dest_cover).replace(' ', '\\040')} "
+                        "ro,nosuid,nodev,noexec master:5 - "
                         "tmpfs tmpfs ro,size=64k,mode=555"
                     ),
                 )
@@ -4227,7 +4244,7 @@ class ChatClassifyTests(unittest.TestCase):
             direct = {
                 mount.what
                 for mount in plan
-                if mount.options == "bind,nofail" and mount.where.parent.name == "chat"
+                if mount.options == "bind,nofail" and mount.where.parent == dest / "chat"
             }
             self.assertEqual(
                 direct,
@@ -4286,7 +4303,6 @@ class ChatClassifyTests(unittest.TestCase):
                 "truncated",
                 "rerank",
                 "clip",
-                "mixed_chat",
                 "mixed_tts",
                 "gemma_emb",
             )
@@ -4297,16 +4313,21 @@ class ChatClassifyTests(unittest.TestCase):
             self.assertIn("reranker", text)
             self.assertIn("unreadable", text)
             self.assertIn("vision companion", text)
-            self.assertIn("shares a folder with a file that is not chat", text)
-            self.assertIn("not a chat model", text)
+            self.assertIn("not recognised as chat by this version", text)
             self.assertIn("hidden from chat", text)
-            for key in ("llama", "qwen", "gemma", "mmproj", "root_emb"):
+            kept = dest / "chat" / "chat" / paths["mixed_chat"].name
+            self.assertIn(f"Where={kept}", text)
+            for key in ("llama", "qwen", "gemma", "mmproj", "root_emb", "mixed_chat"):
                 self.assertNotIn(f"Left out {paths[key].resolve()}.", text, key)
             self.assertEqual(_file_snapshot(paths["root"]), before)
 
             def bind(what: Path, where: Path) -> str:
                 return "unit.mount"
 
+            from io import StringIO
+            from contextlib import redirect_stdout
+
+            buf = StringIO()
             with (
                 patch("lemonade.detect", return_value="snap"),
                 patch("lemonade.extra_dir", return_value=dest),
@@ -4315,12 +4336,16 @@ class ChatClassifyTests(unittest.TestCase):
                 patch("lemonade._set_extra_models_dir"),
                 _quiet_daemon(),
                 patch("lemonade.report_load_tuning", return_value=""),
+                redirect_stdout(buf),
             ):
                 first = publish(target)
                 second = publish(target)
+            self.assertTrue(first.splitlines()[0].startswith("lemonade extra_models_dir="))
+            log = buf.getvalue()
             for key in named:
                 self.assertIn(f"Left out {paths[key].resolve()}.", first, key)
                 self.assertIn(f"Left out {paths[key].resolve()}.", second, key)
+                self.assertIn(f"Left out {paths[key].resolve()}.", log, key)
             self.assertEqual(gguf_sources(target), gguf_sources(target))
             self.assertEqual(_file_snapshot(paths["root"]), before)
             self.assertIn("trees", first)
@@ -4413,11 +4438,22 @@ class ChatClassifyTests(unittest.TestCase):
             self.assertLess(at(dest_src / "embeddings"), at(dest_src))
             self.assertLess(at(stage / "src0" / "embeddings"), at(stage / "src0"))
             self.assertLess(at(stage / "src0"), at(stage))
-            for name in ("stage.mount", "stage-src.mount", "cover.mount", "carried.mount"):
+            for name in (
+                "stage.mount",
+                "stage-src.mount",
+                "cover.mount",
+                "carried.mount",
+                "rbind.mount",
+            ):
                 self.assertTrue(list(backup.glob(name + ".*")), name)
                 self.assertFalse((unit_dir / name).exists(), name)
-            self.assertTrue((unit_dir / "rbind.mount").is_file())
             self.assertTrue((unit_dir / "emb.mount").is_file())
+            wheres = []
+            for path in unit_dir.glob("*.mount"):
+                parsed = _where_from_unit(path.read_text(encoding="utf-8"))
+                if parsed is not None:
+                    wheres.append(parsed.resolve())
+            self.assertIn((dest / "chat" / "gemma").resolve(), wheres)
             self.assertTrue(voice.is_file())
             self.assertEqual(_file_snapshot(root), before)
 
@@ -4437,13 +4473,14 @@ class ChatClassifyTests(unittest.TestCase):
             stage_cover = rbind.what / "embeddings"
             text = "\n".join(
                 (
-                    f"13 1 0:1 / {rbind.where} rw - ext4 /dev/sda1 rw",
+                    f"13 1 0:1 / {str(rbind.where).replace(' ', '\\040')} rw - ext4 /dev/sda1 rw",
                     (
                         f"12 11 0:46 / {stage_cover} ro,nosuid,nodev,noexec shared:5 - "
                         "tmpfs tmpfs ro,size=64k,mode=555"
                     ),
                     (
-                        f"14 13 0:46 / {dest_cover} ro,nosuid,nodev,noexec master:5 - "
+                        f"14 13 0:46 / {str(dest_cover).replace(' ', '\\040')} "
+                        "ro,nosuid,nodev,noexec master:5 - "
                         "tmpfs tmpfs ro,size=64k,mode=555"
                     ),
                 )
@@ -4478,6 +4515,312 @@ class ChatClassifyTests(unittest.TestCase):
             umounted = [cmd[1] for cmd in cmds if cmd and cmd[0] == "umount"]
             self.assertNotIn(str(dest_cover), umounted)
             self.assertIn(str(rbind.where), umounted)
+
+    def test_mixed_folder_keeps_its_chat_model(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "AI models"
+            chat = _write_gguf(root / "mixed" / "chat.gguf", "llama")
+            speech = _write_gguf(root / "mixed" / "speech.gguf", "magpie-tts")
+            dest = Path(tmp) / "ubuntuai-models"
+            target = _target(home, extra=(), model_root=root)
+            plan = _snap_mount_plan(target, dest, gguf_sources(target))
+            file_binds = [mount for mount in plan if mount.what == chat.resolve()]
+            self.assertEqual(len(file_binds), 1)
+            self.assertEqual(file_binds[0].where, dest / "chat" / "chat" / "chat.gguf")
+            self.assertEqual(file_binds[0].options, "bind,nofail")
+            self.assertNotIn(root.resolve(), gguf_sources(target))
+            self.assertFalse(any(mount.what == speech.resolve() for mount in plan))
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade.load_tuning", return_value={}),
+            ):
+                report = publish_plan(target)
+            self.assertIn(f"Left out {speech.resolve()}.", report)
+            self.assertNotIn(f"Left out {chat.resolve()}.", report)
+            self.assertIn(f"Where={dest / 'chat' / 'chat' / 'chat.gguf'}", report)
+
+    def test_loose_chat_gguf_in_a_mixed_root_is_kept(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "AI models"
+            loose = _write_gguf(root / "loose.gguf", "qwen2")
+            _write_gguf(root / "voice" / "moss.gguf", "moss-tts-delay")
+            dest = Path(tmp) / "ubuntuai-models"
+            target = _target(home, extra=(), model_root=root)
+            plan = _snap_mount_plan(target, dest, gguf_sources(target))
+            binds = [mount for mount in plan if mount.what == loose.resolve()]
+            self.assertEqual(binds[0].where.parent, dest / "chat" / "loose")
+            self.assertEqual(binds[0].where.name, "loose.gguf")
+            self.assertFalse(binds[0].where.is_symlink())
+
+    def test_split_shards_and_mmproj_share_one_target(self) -> None:
+        from weights import gguf_publish_role, gguf_split_header
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "AI models"
+            pure = root / "Qwen3"
+            shard1 = _write_gguf(pure / "qwen-00001-of-00002.gguf", "qwen3")
+            shard2 = pure / "qwen-00002-of-00002.gguf"
+            shard2.write_bytes(gguf_split_header(2, 2))
+            mmproj = _write_gguf(pure / "mmproj-qwen.gguf", "clip")
+            mixed = root / "bundle"
+            mix1 = _write_gguf(mixed / "model-00001-of-00002.gguf", "llama")
+            mix2 = mixed / "model-00002-of-00002.gguf"
+            mix2.write_bytes(gguf_split_header(2, 2))
+            mix_mm = _write_gguf(mixed / "mmproj-model.gguf", "clip")
+            speech = _write_gguf(mixed / "speech.gguf", "magpie")
+            missing = root / "tail" / "only-00002-of-00002.gguf"
+            missing.parent.mkdir(parents=True)
+            missing.write_bytes(gguf_split_header(2, 2))
+            self.assertEqual(gguf_publish_role(shard2), "truncated")
+            self.assertEqual(gguf_publish_role(shard1), "chat")
+            target = _target(home, extra=(), model_root=root)
+            sources = gguf_sources(target)
+            self.assertIn(pure.resolve(), sources)
+            self.assertNotIn(mixed.resolve(), sources)
+            dest = Path(tmp) / "ubuntuai-models"
+            plan = _snap_mount_plan(target, dest, sources)
+            pure_mounts = [mount for mount in plan if mount.what == pure.resolve()]
+            self.assertEqual([mount.where.name for mount in pure_mounts], ["Qwen3"])
+            mixed_wheres = {
+                mount.what: mount.where
+                for mount in plan
+                if mount.what in {mix1.resolve(), mix2.resolve(), mix_mm.resolve()}
+            }
+            self.assertEqual(set(mixed_wheres), {mix1.resolve(), mix2.resolve(), mix_mm.resolve()})
+            parents = {path.parent for path in mixed_wheres.values()}
+            self.assertEqual(parents, {dest / "chat" / "model"})
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade.load_tuning", return_value={}),
+            ):
+                report = publish_plan(target)
+            for path in (shard1, shard2, mmproj, mix1, mix2, mix_mm):
+                self.assertNotIn(f"Left out {path.resolve()}.", report)
+            self.assertIn(f"Left out {speech.resolve()}.", report)
+            self.assertIn(f"Left out {missing.resolve()}.", report)
+            self.assertIn("shard 1 is missing", report)
+            self.assertNotIn("symlink", " ".join(mount.options for mount in plan))
+
+    def test_adding_a_folder_or_file_keeps_existing_ids(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "AI models"
+            _write_gguf(root / "chat-llama" / "model.gguf", "llama")
+            loose = _write_gguf(root / "loose.gguf", "qwen2")
+            _write_gguf(root / "voice" / "moss.gguf", "magpie")
+            dest = Path(tmp) / "ubuntuai-models"
+            target = _target(home, extra=(), model_root=root)
+
+            def ids() -> set[str]:
+                plan = _snap_mount_plan(target, dest, gguf_sources(target))
+                found = set()
+                for mount in plan:
+                    if mount.where.parent == dest / "chat":
+                        found.add(mount.where.name)
+                    elif mount.where.parent.parent == dest / "chat":
+                        found.add(mount.where.parent.name)
+                return found
+
+            before = ids()
+            self.assertIn("chat-llama", before)
+            self.assertIn("loose", before)
+            _write_gguf(root / "aaa" / "early.gguf", "gemma")
+            _write_gguf(root / "aaa-file.gguf", "llama")
+            after = ids()
+            self.assertIn("chat-llama", after)
+            self.assertIn("loose", after)
+            self.assertIn("aaa", after)
+            self.assertIn("aaa-file", after)
+            self.assertEqual(before, after & before)
+            self.assertEqual(loose.resolve().name, "loose.gguf")
+
+    def test_clash_suffix_ignores_discovery_order(self) -> None:
+        import lemonade
+
+        first = lemonade._assign_chat_names(
+            [("model", "/trees/b/model.gguf"), ("model", "/trees/a/model")]
+        )
+        second = lemonade._assign_chat_names(
+            [("model", "/trees/a/model"), ("model", "/trees/b/model.gguf")]
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first["/trees/a/model"], "model")
+        self.assertEqual(first["/trees/b/model.gguf"], "model-2")
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "AI models"
+            _write_gguf(root / "model" / "weights.gguf", "llama")
+            _write_gguf(root / "model.gguf", "qwen2")
+            _write_gguf(root / "voice" / "moss.gguf", "magpie")
+            dest = Path(tmp) / "ubuntuai-models"
+            target = _target(home, extra=(), model_root=root)
+            plan = _snap_mount_plan(target, dest, gguf_sources(target))
+            names = set()
+            for mount in plan:
+                if mount.options.startswith("bind") and "chat" in mount.where.parts:
+                    if mount.where.parent == dest / "chat":
+                        names.add(mount.where.name)
+                    elif mount.where.parent.parent == dest / "chat":
+                        names.add(mount.where.parent.name)
+            self.assertEqual(names, {"model", "model-2"})
+            again = _snap_mount_plan(target, dest, gguf_sources(target))
+            self.assertEqual(
+                [mount.where for mount in plan],
+                [mount.where for mount in again],
+            )
+
+    def test_deep_and_broken_headers_stay_bounded(self) -> None:
+        import random
+        import struct
+
+        from weights import gguf_publish_role, read_gguf_info
+
+        def nested(depth: int) -> bytes:
+            value = struct.pack("<I", 0) + struct.pack("<Q", 1) + bytes([0])
+            for _ in range(depth - 1):
+                value = struct.pack("<I", 9) + struct.pack("<Q", 1) + value
+            key = b"pad"
+            return (
+                b"GGUF"
+                + struct.pack("<I", 3)
+                + struct.pack("<Q", 0)
+                + struct.pack("<Q", 1)
+                + struct.pack("<Q", len(key))
+                + key
+                + struct.pack("<I", 9)
+                + value
+            )
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deep = root / "deep.gguf"
+            deep.write_bytes(nested(3000))
+            self.assertIsNone(read_gguf_info(deep))
+            self.assertEqual(gguf_publish_role(deep), "truncated")
+            rng = random.Random(7)
+            for index in range(30):
+                blob = bytes(rng.getrandbits(8) for _ in range(rng.randint(0, 180)))
+                path = root / f"rand-{index}.gguf"
+                path.write_bytes(blob)
+                self.assertIn(
+                    gguf_publish_role(path),
+                    {"truncated", "unknown", "chat", "companion", "tts", "diffusion", "rerank"},
+                )
+            cut = root / "cut.gguf"
+            cut.write_bytes(b"GGUF" + b"\0" * 8)
+            self.assertEqual(gguf_publish_role(cut), "truncated")
+
+    def test_unknown_arch_text_is_plain_and_ggml_is_named(self) -> None:
+        from weights import gguf_architecture_header
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "AI models"
+            nasty = root / "odd" / "model.gguf"
+            nasty.parent.mkdir(parents=True)
+            nasty.write_bytes(gguf_architecture_header("not-a-model\n\x1b[31mEVIL"))
+            ggml = root / "whisper" / "ggml-tiny.gguf"
+            ggml.parent.mkdir(parents=True)
+            ggml.write_bytes(b"ggml" + b"\0" * 32)
+            _write_gguf(root / "chat-llama" / "model.gguf", "llama")
+            dest = Path(tmp) / "ubuntuai-models"
+            target = _target(home, extra=(), model_root=root)
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade.load_tuning", return_value={}),
+            ):
+                report = publish_plan(target)
+            odd = next(line for line in report.splitlines() if str(nasty.resolve()) in line)
+            self.assertNotIn("\n", odd)
+            self.assertNotIn("\x1b", odd)
+            self.assertIn("not recognised as chat by this version", odd)
+            self.assertIn(f"Left out {ggml.resolve()}.", report)
+            self.assertIn("not a GGUF file", report)
+            self.assertIn("not a chat ggml model", report)
+
+    def test_busy_abort_restores_the_embeddings_cover(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "AI models"
+            _write_gguf(root / "chat.gguf", "llama")
+            _write_gguf(root / "embeddings" / "embed.gguf", "bert")
+            dest = Path(tmp) / "ubuntuai-models"
+            cover = dest / "chat" / "kept" / "embeddings"
+            cover.mkdir(parents=True)
+            state = {"covered": True}
+            cmds: list[list[str]] = []
+
+            def read() -> str:
+                if not state["covered"]:
+                    return ""
+                return (
+                    f"12 11 0:46 / {cover} ro,nosuid,nodev,noexec shared:5 - "
+                    "tmpfs tmpfs ro,size=64k,mode=555\n"
+                )
+
+            def run(cmd: list[str]) -> SimpleNamespace:
+                cmds.append(list(cmd))
+                if cmd[:3] == ["systemctl", "is-active", "--quiet"]:
+                    return SimpleNamespace(returncode=0, stdout="active", stderr="")
+                if cmd[:3] == ["systemctl", "stop", "snap.lemonade-server.daemon"]:
+                    state["covered"] = False
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                if cmd and cmd[0] == "mount" and str(cover) in cmd:
+                    state["covered"] = True
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def fail_write(*_args: object) -> str:
+                raise RuntimeError("The old Lemonade folder is still mounted.")
+
+            with (
+                patch("lemonade.detect", return_value="snap"),
+                patch("lemonade.extra_dir", return_value=dest),
+                patch("lemonade._read_mountinfo_text", side_effect=read),
+                patch("lemonade._mounted_wheres", return_value=()),
+                patch("lemonade._run", side_effect=run),
+                patch("lemonade._write_bind_unit", side_effect=fail_write),
+                patch("lemonade._write_cover_unit", side_effect=fail_write),
+                patch("lemonade._set_extra_models_dir", side_effect=AssertionError("set")),
+                patch("lemonade.report_load_tuning", return_value=""),
+            ):
+                with self.assertRaises(RuntimeError):
+                    publish(_target(home, extra=(), model_root=root))
+            self.assertTrue(state["covered"])
+            flat = [" ".join(cmd) for cmd in cmds]
+            stop_at = flat.index("systemctl stop snap.lemonade-server.daemon")
+            start_at = flat.index("systemctl start snap.lemonade-server.daemon")
+            mount_at = next(
+                index
+                for index, cmd in enumerate(cmds)
+                if cmd and cmd[0] == "mount" and str(cover) in cmd
+            )
+            self.assertLess(stop_at, mount_at)
+            self.assertLess(mount_at, start_at)
+
+    def test_empty_stale_stage_dirs_are_removed(self) -> None:
+        import lemonade
+
+        with TemporaryDirectory() as tmp:
+            stage = Path(tmp) / "stage"
+            empty = stage / "src0"
+            (empty / "embeddings").mkdir(parents=True)
+            kept = stage / "src1"
+            kept.mkdir()
+            (kept / "keep.txt").write_text("stay", encoding="utf-8")
+            link = stage / "src2"
+            link.symlink_to(kept)
+            with patch("lemonade.STAGE_DIR", stage):
+                lemonade._remove_empty_stage_dirs(())
+            self.assertFalse(empty.exists())
+            self.assertTrue((kept / "keep.txt").is_file())
+            self.assertTrue(link.is_symlink())
 
 
 if __name__ == "__main__":
