@@ -4,6 +4,10 @@ The snap cannot follow ~/Models symlinks and cannot read /home as
 extra_models_dir. Bind the real trees into SNAP_LEMONADE_MODELS and set
 extra_models_dir to that snap-common path.
 
+Chat trees always land at dest/chat/srcN. Embedding GGUFs also bind at
+dest/embeddings. Lemonade labels a GGUF as embeddings only when that
+file's first directory under extra_models_dir is embeddings.
+
 Apply runs helper verb lemonade-publish after weights. That verb calls
 publish(target_for(USER)). CLI --publish-lemonade is the same verb.
 Weights owns source resolution and bind targets. Apply owns privilege
@@ -28,7 +32,7 @@ from paths import (
     is_home_path,
     lemonade_extra_models_dir,
 )
-from weights import UA, human_bytes
+from weights import UA, human_bytes, is_foreign_mount
 
 SNAP_COMMON = SNAP_LEMONADE_COMMON
 SNAP_EXTRA = SNAP_LEMONADE_MODELS
@@ -78,7 +82,7 @@ def gguf_sources(target: UserTarget) -> tuple[Path, ...]:
     seen: set[Path] = set()
     for root in _search_roots(target):
         for tree in _trees_in(root, target):
-            if tree in seen or _too_wide(tree, target.home):
+            if tree in seen or _too_wide(tree, target.home) or is_foreign_mount(tree):
                 continue
             seen.add(tree)
             trees.append(tree)
@@ -86,19 +90,36 @@ def gguf_sources(target: UserTarget) -> tuple[Path, ...]:
 
 
 def bind_mounts(sources: tuple[Path, ...], dest: Path) -> tuple[BindMount, ...]:
-    """Map real trees onto dest. Nested sources bind once via the outer tree."""
+    """Map real trees onto dest/chat/srcN. Nested sources bind once via the outer tree.
+
+    One source uses src0 too. A later tree must not move an existing vulkan_bin
+    off dest/chat/src0, and a single tree must not land on dest itself.
+    """
     sources = _collapse(sources)
     if not sources:
         return ()
-    if len(sources) == 1:
-        return (BindMount(sources[0], dest),)
     return tuple(
         BindMount(src, dest / "chat" / f"src{i}") for i, src in enumerate(sources)
     )
 
 
+def embeddings_mount(target: UserTarget, dest: Path) -> BindMount | None:
+    """Bind model_root/embeddings at dest/embeddings when that folder has a GGUF.
+
+    The chat srcN mount hides that folder under chat/. Lemonade reads the
+    embeddings label from the first directory under extra_models_dir.
+    """
+    source = _embeddings_source(target)
+    if source is None:
+        return None
+    return BindMount(source, dest / "embeddings")
+
+
 def is_owned_lemonade_where(dest: Path, where: Path) -> bool:
-    """True for dest itself or dest/chat/srcN. Those are the only bind targets we create."""
+    """True for dest, dest/embeddings, or dest/chat/srcN.
+
+    dest itself is a legacy single-source bind. Cleanup still recognizes it.
+    """
     dest = _resolve(dest)
     where = _resolve(where)
     if where == dest:
@@ -107,6 +128,8 @@ def is_owned_lemonade_where(dest: Path, where: Path) -> bool:
         rel = where.relative_to(dest)
     except ValueError:
         return False
+    if rel.parts == ("embeddings",):
+        return True
     return len(rel.parts) == 2 and rel.parts[0] == "chat" and _is_srcn(rel.parts[1])
 
 
@@ -200,6 +223,12 @@ def mount_unit_text(what: Path, where: Path) -> str:
 
 
 def _search_roots(target: UserTarget) -> tuple[Path, ...]:
+    """Extra paths, then one model_root source.
+
+    GGUFs outside model_root/gguf select the whole model_root. The gguf
+    subdir is not added again, so it cannot become a second bind. A store
+    that already holds every GGUF stays the narrower source.
+    """
     roots: list[Path] = []
     seen: set[Path] = set()
 
@@ -208,18 +237,64 @@ def _search_roots(target: UserTarget) -> tuple[Path, ...]:
             path = raw.resolve()
         except OSError:
             return
-        if not path.is_dir() or path in seen:
+        if not path.is_dir() or path in seen or is_foreign_mount(path):
             return
         seen.add(path)
         roots.append(path)
 
     for extra in target.extra_model_paths:
         add(extra)
-    add(target.model_root / "gguf")
     gguf = target.model_root / "gguf"
-    if not _any_gguf(gguf):
+    if _has_gguf_outside_store(target.model_root):
         add(target.model_root)
+    else:
+        add(gguf)
+        if not _any_gguf(gguf):
+            add(target.model_root)
     return tuple(roots)
+
+
+def _has_gguf_outside_store(model_root: Path) -> bool:
+    """True when a GGUF directory entry lives in model_root but not under gguf/."""
+    try:
+        root = model_root.resolve()
+    except OSError:
+        return False
+    if not root.is_dir():
+        return False
+    try:
+        store = (model_root / "gguf").resolve()
+    except OSError:
+        store = root / "gguf"
+    try:
+        found = root.rglob("*.gguf")
+    except OSError:
+        return False
+    for path in found:
+        try:
+            if not (path.is_file() or path.is_symlink()):
+                continue
+            # The directory entry decides. A symlink inside gguf/ stays in the store.
+            located = path.parent.resolve() / path.name
+        except OSError:
+            continue
+        try:
+            located.relative_to(store)
+        except ValueError:
+            return True
+    return False
+
+
+def _embeddings_source(target: UserTarget) -> Path | None:
+    try:
+        folder = (target.model_root / "embeddings").resolve()
+    except OSError:
+        return None
+    if not folder.is_dir() or _too_wide(folder, target.home) or is_foreign_mount(folder):
+        return None
+    if not _any_gguf(folder):
+        return None
+    return folder
 
 
 def _any_gguf(root: Path) -> bool:
@@ -696,9 +771,42 @@ def read_config() -> dict:
     return out
 
 
+def _is_set(flat: dict, key: str) -> bool:
+    if key not in flat:
+        return False
+    value = flat.get(key)
+    if value is None:
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    return True
+
+
+def _load_mode_set(flat: dict) -> bool:
+    return _is_set(flat, "llamacpp_args") or _is_set(flat, "llamacpp_vulkan_args")
+
+
+def tuning_to_apply(
+    defaults: dict[str, object], current: dict
+) -> dict[str, object]:
+    """Defaults for keys the server has not set. Existing values stay put."""
+    flat = _flatten_config(current) if current else {}
+    chosen: dict[str, object] = {}
+    for key, value in defaults.items():
+        if key == "llamacpp_args":
+            if _load_mode_set(flat):
+                continue
+        elif _is_set(flat, key):
+            continue
+        chosen[key] = value
+    return chosen
+
+
 def verify_tuning(
     expected: dict[str, object], actual: dict
 ) -> tuple[bool, str]:
+    if not expected:
+        return True, ""
     if not actual:
         return False, (
             "Lemonade did not return the load settings the installer wrote. "
@@ -706,7 +814,9 @@ def verify_tuning(
         )
     flat = _flatten_config(actual)
     misses: list[str] = []
-    if _as_int(flat.get("max_loaded_models")) != 1:
+    if "max_loaded_models" in expected and _as_int(
+        flat.get("max_loaded_models")
+    ) != _as_int(expected.get("max_loaded_models")):
         misses.append("max_loaded_models")
     want_ctx = _as_int(expected.get("ctx_size"))
     if want_ctx is not None and _as_int(flat.get("ctx_size")) != want_ctx:
@@ -717,6 +827,9 @@ def verify_tuning(
         and _as_int(flat.get("global_timeout")) != want_timeout
     ):
         misses.append("global_timeout")
+    want_backend = expected.get("llamacpp_backend")
+    if want_backend is not None and flat.get("llamacpp_backend") != want_backend:
+        misses.append("llamacpp_backend")
     if expected.get("llamacpp_args") and _mmap_in_config(actual) is False:
         misses.append("llamacpp_args")
     if misses:
@@ -728,7 +841,11 @@ def verify_tuning(
 
 
 def apply_tuning(settings: dict[str, object]) -> str:
-    body = json.dumps(settings).encode("utf-8")
+    # Read first so a value already on the server is not replaced by a default.
+    chosen = tuning_to_apply(settings, read_config())
+    if not chosen:
+        return "lemonade load settings kept"
+    body = json.dumps(chosen).encode("utf-8")
     req = urllib.request.Request(
         f"{LEMONADE_API}/internal/set",
         data=body,
@@ -746,12 +863,12 @@ def apply_tuning(settings: dict[str, object]) -> str:
         exe = shutil.which("lemonade-server") or shutil.which("lemonade")
         if not exe:
             raise RuntimeError("lemonade-server is not on PATH")
-        p = _run([exe, "config", "set", *cli_tuning_parts(settings)])
+        p = _run([exe, "config", "set", *cli_tuning_parts(chosen)])
         if p.returncode != 0:
             raise RuntimeError(
                 (p.stderr or p.stdout or "lemonade config set failed").strip()
             )
-    ok, miss = verify_tuning(settings, read_config())
+    ok, miss = verify_tuning(chosen, read_config())
     if not ok:
         return miss
     return "lemonade load settings updated"
@@ -792,16 +909,20 @@ def publish(target: UserTarget) -> str:
     if not kind:
         return "lemonade not installed"
     sources = gguf_sources(target)
-    if not sources:
-        return "no real GGUF files to publish (Lemonade cannot follow store symlinks)"
     if kind == "snap":
         dest = extra_dir(kind)
+        mounts = bind_mounts(sources, dest)
+        emb = embeddings_mount(target, dest)
+        if emb is not None:
+            mounts = (*mounts, emb)
+        if not mounts:
+            return "no real GGUF files to publish (Lemonade cannot follow store symlinks)"
         if dest == Path() or is_home_path(dest):
             raise RuntimeError(
                 "snap extra_models_dir must be under /var/snap/lemonade-server/common"
             )
-        mounts = bind_mounts(sources, dest)
-        # Drop dest before writing dest/chat/srcN. A leftover dest bind would write chat/ into the user's tree.
+        # Drop a legacy dest bind before writing dest/chat/srcN.
+        # A leftover dest bind would write chat/ into the user's tree.
         _drop_obsolete_owned_binds(dest, mounts)
         unit = ""
         for mount in mounts:
@@ -814,6 +935,8 @@ def publish(target: UserTarget) -> str:
             prefix = f"lemonade extra_models_dir={dest} ({len(mounts)} trees)"
         extra = report_load_tuning(target)
         return f"{prefix}\n{extra}" if extra else prefix
+    if not sources:
+        return "no real GGUF files to publish (Lemonade cannot follow store symlinks)"
     dest = sources[0]
     _set_extra_models_dir(dest)
     prefix = f"lemonade extra_models_dir={dest}"

@@ -7,6 +7,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -597,7 +598,7 @@ def write_core_files(user: str, model_root: str, bind: str) -> None:
     ETC = ENV_FILE.parent
     ETC.mkdir(parents=True, exist_ok=True)
     env = (
-        f"UBUNTUAI_MODELS={root}\n"
+        f"UBUNTUAI_MODELS={shlex.quote(str(root))}\n"
         f"UBUNTUAI_BIND={bind}\n"
         f"UBUNTUAI_USER={user}\n"
     )
